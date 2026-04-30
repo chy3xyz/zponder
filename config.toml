@@ -1,0 +1,40 @@
+# 全局配置
+[global]
+log_level = "info"          # debug/info/warn/error
+log_file = "./logs/indexer.log"  # 日志文件路径
+snapshot_interval = 3600    # 快照周期（秒），0 表示不开启
+
+# RPC 配置
+[rpc]
+url = "https://eth-mainnet.g.alchemy.com/v2/your-api-key"
+timeout = 10000             # 超时时间（毫秒）
+retry_count = 3             # 重试次数
+
+# 数据库配置（postgresql/sqlite）
+[database]
+type = "sqlite"             # 数据库类型: postgresql | sqlite
+db_name = "eth_indexer.db"  # SQLite 数据库文件名
+max_connections = 10        # 最大连接数
+
+# HTTP 服务配置
+[http]
+port = 8080
+host = "0.0.0.0"
+cors = true                 # 是否允许跨域
+
+# 合约配置（可配置多个合约，数组形式）
+# 每个合约会自动根据其 ABI 中的事件定义创建对应的数据表
+# 表名格式：event_{name}_{EventName}
+[[contracts]]
+name = "dai"                                           # 合约名称（用于表名前缀）
+address = "0x6b175474e89094c44da98b954eedeac495271d0f"  # DAI 合约地址
+abi_path = "./abis/erc20.abi"                            # ABI 文件路径
+from_block = 20000000                                    # 起始区块高度
+events = ["Transfer", "Approval"]                        # 要监听的事件
+
+[[contracts]]
+name = "bayc"
+address = "0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D"
+abi_path = "./abis/erc721.abi"
+from_block = 12965000
+events = ["Transfer"]

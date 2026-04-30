@@ -1,0 +1,24 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+
+# SQLite databases
+*.db
+*.db-shm
+*.db-wal
+
+# Logs
+logs/
+*.log
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env

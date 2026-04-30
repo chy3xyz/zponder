@@ -1,0 +1,650 @@
+const std = @import("std");
+const log = @import("log.zig");
+
+pub const ContractConfig = struct {
+    name: []const u8,
+    address: []const u8,
+    abi_path: []const u8,
+    events: []const []const u8,
+    from_block: u64,
+    start_block: ?u64,
+    poll_interval_ms: ?u32,
+    max_reorg_depth: ?u32,
+    block_batch_size: ?u32,
+};
+
+pub const GlobalConfig = struct {
+    log_level: []const u8,
+    log_file: []const u8,
+    snapshot_interval: u64,
+};
+
+pub const IndexerConfig = struct {
+    contracts: []const ContractConfig,
+    block_batch_size: u32,
+    max_pending_blocks: u32,
+    reorg_safe_depth: u32,
+};
+
+pub const RpcConfig = struct {
+    url: []const u8,
+    retry_count: u32,
+    retry_delay_ms: u32,
+    request_timeout_ms: u32,
+    max_concurrent: u32,
+};
+
+pub const HttpConfig = struct {
+    host: []const u8,
+    port: u16,
+    read_timeout_ms: u32,
+    write_timeout_ms: u32,
+    max_body_size: u32,
+    cors_origins: []const []const u8,
+    rate_limit_rps: ?u32,
+    rate_limit_burst: ?u32,
+};
+
+pub const DatabaseConfig = struct {
+    db_type: []const u8,
+    db_name: []const u8,
+    wal_mode: bool,
+    busy_timeout_ms: u32,
+    max_connections: u32,
+};
+
+pub const Config = struct {
+    alloc: std.mem.Allocator,
+    global: GlobalConfig,
+    rpc: RpcConfig,
+    http: HttpConfig,
+    database: DatabaseConfig,
+    contracts: []const ContractConfig,
+
+    pub fn deinit(self: *Config, alloc: std.mem.Allocator) void {
+        alloc.free(self.global.log_level);
+        alloc.free(self.global.log_file);
+        alloc.free(self.rpc.url);
+        alloc.free(self.http.host);
+        if (self.http.cors_origins.len > 0) {
+            for (self.http.cors_origins) |o| alloc.free(o);
+            alloc.free(self.http.cors_origins);
+        }
+        alloc.free(self.database.db_type);
+        alloc.free(self.database.db_name);
+        for (self.contracts) |c| {
+            alloc.free(c.name);
+            alloc.free(c.address);
+            alloc.free(c.abi_path);
+            for (c.events) |e| alloc.free(e);
+            alloc.free(c.events);
+        }
+        alloc.free(self.contracts);
+    }
+};
+
+fn trim(s: []const u8) []const u8 {
+    var start: usize = 0;
+    while (start < s.len and (s[start] == ' ' or s[start] == '\t')) start += 1;
+    var end: usize = s.len;
+    while (end > start and (s[end - 1] == ' ' or s[end - 1] == '\t')) end -= 1;
+    return s[start..end];
+}
+
+fn parseU64(s: []const u8) !u64 {
+    return std.fmt.parseInt(u64, trim(s), 10);
+}
+
+fn parseU32(s: []const u8) !u32 {
+    return std.fmt.parseInt(u32, trim(s), 10);
+}
+
+fn parseU16(s: []const u8) !u16 {
+    return std.fmt.parseInt(u16, trim(s), 10);
+}
+
+fn parseBool(s: []const u8) bool {
+    const t = trim(s);
+    return std.mem.eql(u8, t, "true");
+}
+
+/// 解析 TOML 字符串值，支持转义序列（\" \\ \n \t \r）
+fn unquote(alloc: std.mem.Allocator, s: []const u8) ![]u8 {
+    const t = trim(s);
+    // 多行字符串 """..."""
+    if (t.len >= 6 and std.mem.startsWith(u8, t, "\"\"\"") and std.mem.endsWith(u8, t, "\"\"\"")) {
+        return try alloc.dupe(u8, t[3 .. t.len - 3]);
+    }
+    // 普通引号字符串 "..."
+    if (t.len >= 2 and t[0] == '"' and t[t.len - 1] == '"') {
+        const inner = t[1 .. t.len - 1];
+        var result = std.ArrayList(u8).empty;
+        errdefer result.deinit(alloc);
+        var i: usize = 0;
+        while (i < inner.len) {
+            if (inner[i] == '\\' and i + 1 < inner.len) {
+                switch (inner[i + 1]) {
+                    '"' => try result.append(alloc, '"'),
+                    '\\' => try result.append(alloc, '\\'),
+                    'n' => try result.append(alloc, '\n'),
+                    't' => try result.append(alloc, '\t'),
+                    'r' => try result.append(alloc, '\r'),
+                    else => {
+                        try result.append(alloc, '\\');
+                        try result.append(alloc, inner[i + 1]);
+                    },
+                }
+                i += 2;
+            } else {
+                try result.append(alloc, inner[i]);
+                i += 1;
+            }
+        }
+        return try result.toOwnedSlice(alloc);
+    }
+    return try alloc.dupe(u8, t);
+}
+
+fn splitKeyValue(line: []const u8) ?struct { key: []const u8, value: []const u8 } {
+    const eq = std.mem.indexOfScalar(u8, line, '=') orelse return null;
+    return .{ .key = trim(line[0..eq]), .value = trim(line[eq + 1 ..]) };
+}
+
+fn parseEvents(alloc: std.mem.Allocator, value: []const u8) ![]const []const u8 {
+    const t = trim(value);
+    if (t.len >= 2 and t[0] == '[' and t[t.len - 1] == ']') {
+        const inner = t[1 .. t.len - 1];
+        var list: std.ArrayList([]const u8) = .empty;
+        errdefer {
+            for (list.items) |item| alloc.free(item);
+            list.deinit(alloc);
+        }
+        var it = std.mem.splitScalar(u8, inner, ',');
+        while (it.next()) |part| {
+            const name = trim(part);
+            if (name.len == 0) continue;
+            try list.append(alloc, try unquote(alloc, name));
+        }
+        return list.toOwnedSlice(alloc);
+    }
+    const single = try unquote(alloc, t);
+    const arr = try alloc.alloc([]const u8, 1);
+    arr[0] = single;
+    return arr;
+}
+
+pub fn load(alloc: std.mem.Allocator, io: std.Io, config_path: []const u8) !Config {
+    const content = try std.Io.Dir.cwd().readFileAlloc(io, config_path, alloc, .limited(1024 * 1024));
+    defer alloc.free(content);
+    var cfg = try loadFromString(alloc, content);
+    try validate(&cfg);
+    return cfg;
+}
+
+/// 从字符串加载配置（用于测试）
+pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
+    var global = GlobalConfig{
+        .log_level = try alloc.dupe(u8, "info"),
+        .log_file = try alloc.dupe(u8, ""),
+        .snapshot_interval = 0,
+    };
+    errdefer {
+        alloc.free(global.log_level);
+        alloc.free(global.log_file);
+    }
+    var rpc = RpcConfig{
+        .url = try alloc.dupe(u8, ""),
+        .retry_count = 3,
+        .retry_delay_ms = 1000,
+        .request_timeout_ms = 10000,
+        .max_concurrent = 10,
+    };
+    errdefer alloc.free(rpc.url);
+    var http = HttpConfig{
+        .host = try alloc.dupe(u8, "0.0.0.0"),
+        .port = 8080,
+        .read_timeout_ms = 30000,
+        .write_timeout_ms = 30000,
+        .max_body_size = 1024 * 1024,
+        .cors_origins = &.{},
+        .rate_limit_rps = null,
+        .rate_limit_burst = null,
+    };
+    errdefer alloc.free(http.host);
+    var database = DatabaseConfig{
+        .db_type = try alloc.dupe(u8, "sqlite"),
+        .db_name = try alloc.dupe(u8, "eth_indexer.db"),
+        .wal_mode = true,
+        .busy_timeout_ms = 5000,
+        .max_connections = 10,
+    };
+    errdefer {
+        alloc.free(database.db_type);
+        alloc.free(database.db_name);
+    }
+
+    var contracts: std.ArrayList(ContractConfig) = .empty;
+    errdefer {
+        for (contracts.items) |c| {
+            alloc.free(c.name);
+            alloc.free(c.address);
+            alloc.free(c.abi_path);
+            for (c.events) |e| alloc.free(e);
+            alloc.free(c.events);
+        }
+        contracts.deinit(alloc);
+    }
+
+    const Section = enum {
+        none,
+        global,
+        rpc,
+        database,
+        http,
+        contracts,
+    };
+    var section: Section = .none;
+    var current_contract: ?ContractConfig = null;
+
+    var lines = std.mem.splitScalar(u8, content, '\n');
+    while (lines.next()) |line_raw| {
+        const line = trim(line_raw);
+        if (line.len == 0) continue;
+        if (std.mem.startsWith(u8, line, "#")) continue;
+
+        if (std.mem.startsWith(u8, line, "[") and std.mem.endsWith(u8, line, "]")) {
+            // 保存之前的合约
+            if (current_contract) |cc| {
+                try contracts.append(alloc, cc);
+                current_contract = null;
+            }
+            // 处理 [[section]] 和 [section] 两种格式
+            var section_name = line[1 .. line.len - 1];
+            if (std.mem.startsWith(u8, section_name, "[")) section_name = section_name[1..];
+            if (std.mem.endsWith(u8, section_name, "]")) section_name = section_name[0 .. section_name.len - 1];
+
+            if (std.mem.eql(u8, section_name, "global")) {
+                section = .global;
+            } else if (std.mem.eql(u8, section_name, "rpc")) {
+                section = .rpc;
+            } else if (std.mem.eql(u8, section_name, "database")) {
+                section = .database;
+            } else if (std.mem.eql(u8, section_name, "http")) {
+                section = .http;
+            } else if (std.mem.eql(u8, section_name, "contracts")) {
+                section = .contracts;
+                current_contract = ContractConfig{
+                    .name = try alloc.dupe(u8, ""),
+                    .address = try alloc.dupe(u8, ""),
+                    .abi_path = try alloc.dupe(u8, ""),
+                    .events = try alloc.alloc([]const u8, 0),
+                    .from_block = 0,
+                    .start_block = null,
+                    .poll_interval_ms = null,
+                    .max_reorg_depth = null,
+                    .block_batch_size = null,
+                };
+            } else {
+                section = .none;
+            }
+            continue;
+        }
+
+        const kv = splitKeyValue(line) orelse continue;
+        const key = kv.key;
+        const value = kv.value;
+
+        if (current_contract) |*cc| {
+            if (std.mem.eql(u8, key, "name")) {
+                if (cc.name.len > 0) alloc.free(cc.name);
+                cc.name = try unquote(alloc, value);
+            } else if (std.mem.eql(u8, key, "address")) {
+                if (cc.address.len > 0) alloc.free(cc.address);
+                cc.address = try unquote(alloc, value);
+            } else if (std.mem.eql(u8, key, "abi_path")) {
+                if (cc.abi_path.len > 0) alloc.free(cc.abi_path);
+                cc.abi_path = try unquote(alloc, value);
+            } else if (std.mem.eql(u8, key, "from_block")) {
+                cc.from_block = try parseU64(value);
+            } else if (std.mem.eql(u8, key, "events")) {
+                cc.events = try parseEvents(alloc, value);
+            } else if (std.mem.eql(u8, key, "poll_interval_ms")) {
+                cc.poll_interval_ms = try parseU32(value);
+            } else if (std.mem.eql(u8, key, "max_reorg_depth")) {
+                cc.max_reorg_depth = try parseU32(value);
+            } else if (std.mem.eql(u8, key, "block_batch_size")) {
+                cc.block_batch_size = try parseU32(value);
+            }
+            continue;
+        }
+
+        switch (section) {
+            .global => {
+                if (std.mem.eql(u8, key, "log_level")) {
+                    alloc.free(global.log_level);
+                    global.log_level = try unquote(alloc, value);
+                } else if (std.mem.eql(u8, key, "log_file")) {
+                    alloc.free(global.log_file);
+                    global.log_file = try unquote(alloc, value);
+                } else if (std.mem.eql(u8, key, "snapshot_interval")) {
+                    global.snapshot_interval = try parseU64(value);
+                }
+            },
+            .rpc => {
+                if (std.mem.eql(u8, key, "url")) {
+                    alloc.free(rpc.url);
+                    rpc.url = try unquote(alloc, value);
+                } else if (std.mem.eql(u8, key, "timeout")) {
+                    rpc.request_timeout_ms = try parseU32(value);
+                } else if (std.mem.eql(u8, key, "retry_count")) {
+                    rpc.retry_count = try parseU32(value);
+                } else if (std.mem.eql(u8, key, "retry_delay_ms")) {
+                    rpc.retry_delay_ms = try parseU32(value);
+                } else if (std.mem.eql(u8, key, "max_concurrent")) {
+                    rpc.max_concurrent = try parseU32(value);
+                }
+            },
+            .database => {
+                if (std.mem.eql(u8, key, "type")) {
+                    alloc.free(database.db_type);
+                    database.db_type = try unquote(alloc, value);
+                } else if (std.mem.eql(u8, key, "db_name")) {
+                    alloc.free(database.db_name);
+                    database.db_name = try unquote(alloc, value);
+                } else if (std.mem.eql(u8, key, "max_connections")) {
+                    database.max_connections = try parseU32(value);
+                } else if (std.mem.eql(u8, key, "wal_mode")) {
+                    database.wal_mode = parseBool(value);
+                } else if (std.mem.eql(u8, key, "busy_timeout_ms")) {
+                    database.busy_timeout_ms = try parseU32(value);
+                }
+            },
+            .http => {
+                if (std.mem.eql(u8, key, "port")) {
+                    http.port = try parseU16(value);
+                } else if (std.mem.eql(u8, key, "host")) {
+                    alloc.free(http.host);
+                    http.host = try unquote(alloc, value);
+                } else if (std.mem.eql(u8, key, "cors")) {
+                    if (parseBool(value)) {
+                        if (http.cors_origins.len > 0) {
+                            for (http.cors_origins) |o| alloc.free(o);
+                            alloc.free(http.cors_origins);
+                        }
+                        http.cors_origins = try alloc.dupe([]const u8, &[_][]const u8{"*"});
+                    }
+                } else if (std.mem.eql(u8, key, "cors_origins")) {
+                    if (http.cors_origins.len > 0) {
+                        for (http.cors_origins) |o| alloc.free(o);
+                        alloc.free(http.cors_origins);
+                    }
+                    http.cors_origins = try parseEvents(alloc, value);
+                } else if (std.mem.eql(u8, key, "read_timeout_ms")) {
+                    http.read_timeout_ms = try parseU32(value);
+                } else if (std.mem.eql(u8, key, "write_timeout_ms")) {
+                    http.write_timeout_ms = try parseU32(value);
+                } else if (std.mem.eql(u8, key, "max_body_size")) {
+                    http.max_body_size = try parseU32(value);
+                } else if (std.mem.eql(u8, key, "rate_limit_rps")) {
+                    http.rate_limit_rps = try parseU32(value);
+                } else if (std.mem.eql(u8, key, "rate_limit_burst")) {
+                    http.rate_limit_burst = try parseU32(value);
+                }
+            },
+            else => {},
+        }
+    }
+
+    if (current_contract) |cc| {
+        try contracts.append(alloc, cc);
+    }
+
+    // 深拷贝 contracts 到最终结果
+    var final_contracts = try alloc.alloc(ContractConfig, contracts.items.len);
+    for (contracts.items, 0..) |c, i| {
+        final_contracts[i] = c;
+    }
+    contracts.deinit(alloc);
+
+    const cfg = Config{
+        .alloc = alloc,
+        .global = global,
+        .rpc = rpc,
+        .http = http,
+        .database = database,
+        .contracts = final_contracts,
+    };
+
+    return cfg;
+}
+
+pub fn validate(cfg: *const Config) !void {
+    var errors: u32 = 0;
+
+    if (cfg.rpc.url.len == 0) {
+        log.err("配置错误: rpc.url 不能为空", .{});
+        errors += 1;
+    }
+    if (cfg.database.db_name.len == 0) {
+        log.err("配置错误: database.db_name 不能为空", .{});
+        errors += 1;
+    }
+    if (cfg.contracts.len == 0) {
+        log.err("配置错误: 必须至少配置一个合约", .{});
+        errors += 1;
+    }
+    for (cfg.contracts) |contract| {
+        if (contract.name.len == 0) {
+            log.err("配置错误: 合约名不能为空", .{});
+            errors += 1;
+        }
+        if (contract.address.len == 0) {
+            log.err("配置错误: 合约 {s} 的 address 不能为空", .{contract.name});
+            errors += 1;
+        }
+        if (contract.abi_path.len == 0) {
+            log.err("配置错误: 合约 {s} 的 abi_path 不能为空", .{contract.name});
+            errors += 1;
+        }
+        if (contract.events.len == 0) {
+            log.err("配置错误: 合约 {s} 必须至少监听一个事件", .{contract.name});
+            errors += 1;
+        }
+    }
+
+    if (errors > 0) {
+        return error.InvalidConfig;
+    }
+
+    log.info("配置验证通过: 发现 {d} 个合约", .{cfg.contracts.len});
+}
+
+// ============================================================================
+// 单元测试
+// ============================================================================
+
+test "config parse basic" {
+        const alloc = std.testing.allocator;
+        const toml =
+        \\[global]
+        \\log_level = "debug"
+        \\snapshot_interval = 3600
+        \\
+        \\[rpc]
+        \\url = "https://example.com"
+        \\timeout = 5000
+        \\retry_count = 5
+        \\
+        \\[database]
+        \\type = "sqlite"
+        \\db_name = "test.db"
+        \\max_connections = 5
+        \\
+        \\[http]
+        \\port = 9090
+        \\host = "127.0.0.1"
+        \\
+        \\[[contracts]]
+        \\name = "dai"
+        \\address = "0x6b175474e89094c44da98b954eedeac495271d0f"
+        \\abi_path = "./abis/erc20.abi"
+        \\from_block = 20000000
+        \\events = ["Transfer", "Approval"]
+    ;
+    var cfg = try loadFromString(alloc, toml);
+    defer cfg.deinit(alloc);
+    try validate(&cfg);
+
+    try std.testing.expectEqualStrings("debug", cfg.global.log_level);
+    try std.testing.expectEqual(@as(u64, 3600), cfg.global.snapshot_interval);
+    try std.testing.expectEqualStrings("https://example.com", cfg.rpc.url);
+    try std.testing.expectEqual(@as(u32, 5000), cfg.rpc.request_timeout_ms);
+    try std.testing.expectEqual(@as(u32, 5), cfg.rpc.retry_count);
+    try std.testing.expectEqualStrings("test.db", cfg.database.db_name);
+    try std.testing.expectEqual(@as(u16, 9090), cfg.http.port);
+    try std.testing.expectEqualStrings("127.0.0.1", cfg.http.host);
+    try std.testing.expectEqual(@as(usize, 1), cfg.contracts.len);
+    try std.testing.expectEqualStrings("dai", cfg.contracts[0].name);
+    try std.testing.expectEqual(@as(u64, 20000000), cfg.contracts[0].from_block);
+    try std.testing.expectEqual(@as(usize, 2), cfg.contracts[0].events.len);
+    try std.testing.expectEqualStrings("Transfer", cfg.contracts[0].events[0]);
+    try std.testing.expectEqualStrings("Approval", cfg.contracts[0].events[1]);
+}
+
+test "config parse multiple contracts" {
+    const alloc = std.testing.allocator;
+    const toml =
+        \\[rpc]
+        \\url = "https://rpc.example.com"
+        \\
+        \\[[contracts]]
+        \\name = "a"
+        \\address = "0x1111111111111111111111111111111111111111"
+        \\abi_path = "./a.abi"
+        \\from_block = 100
+        \\events = ["Evt"]
+        \\
+        \\[[contracts]]
+        \\name = "b"
+        \\address = "0x2222222222222222222222222222222222222222"
+        \\abi_path = "./b.abi"
+        \\from_block = 200
+        \\events = ["Evt1", "Evt2"]
+    ;
+    var cfg = try loadFromString(alloc, toml);
+    defer cfg.deinit(alloc);
+    try validate(&cfg);
+
+    try std.testing.expectEqual(@as(usize, 2), cfg.contracts.len);
+    try std.testing.expectEqualStrings("a", cfg.contracts[0].name);
+    try std.testing.expectEqualStrings("b", cfg.contracts[1].name);
+}
+
+test "config validate rejects empty rpc url" {
+    const alloc = std.testing.allocator;
+    const toml =
+        \\[[contracts]]
+        \\name = "x"
+        \\address = "0x1111111111111111111111111111111111111111"
+        \\abi_path = "./x.abi"
+        \\from_block = 0
+        \\events = ["E"]
+    ;
+    var cfg = try loadFromString(alloc, toml);
+    defer cfg.deinit(alloc);
+
+    alloc.free(cfg.rpc.url);
+    cfg.rpc.url = try alloc.dupe(u8, "");
+    try std.testing.expectError(error.InvalidConfig, validate(&cfg));
+}
+
+test "config validate rejects no contracts" {
+    const alloc = std.testing.allocator;
+    const toml =
+        \\[rpc]
+        \\url = "https://example.com"
+    ;
+    var cfg = try loadFromString(alloc, toml);
+    defer cfg.deinit(alloc);
+
+    for (cfg.contracts) |c| {
+        alloc.free(c.name);
+        alloc.free(c.address);
+        alloc.free(c.abi_path);
+        for (c.events) |e| alloc.free(e);
+        alloc.free(c.events);
+    }
+    alloc.free(cfg.contracts);
+    cfg.contracts = try alloc.alloc(ContractConfig, 0);
+    try std.testing.expectError(error.InvalidConfig, validate(&cfg));
+}
+
+test "config helper functions" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectEqualStrings("hello", trim("  hello  "));
+    {
+        const s = try unquote(alloc, "\"hello\"");
+        defer alloc.free(s);
+        try std.testing.expectEqualStrings("hello", s);
+    }
+    {
+        const s = try unquote(alloc, "hello");
+        defer alloc.free(s);
+        try std.testing.expectEqualStrings("hello", s);
+    }
+    {
+        const s = try unquote(alloc, "\"say \\\"hi\\\"\"");
+        defer alloc.free(s);
+        try std.testing.expectEqualStrings("say \"hi\"", s);
+    }
+    {
+        // 多行字符串
+        const s = try unquote(alloc, "\"\"\"hello\nworld\"\"\"");
+        defer alloc.free(s);
+        try std.testing.expectEqualStrings("hello\nworld", s);
+    }
+    {
+        // 转义序列
+        const s = try unquote(alloc, "\"a\\tb\\nc\\rd\\\\e\"");
+        defer alloc.free(s);
+        try std.testing.expectEqualStrings("a\tb\nc\rd\\e", s);
+    }
+    try std.testing.expectEqual(@as(u64, 42), try parseU64("42"));
+    try std.testing.expectEqual(@as(u32, 100), try parseU32("100"));
+    try std.testing.expect(parseBool("true"));
+    try std.testing.expect(!parseBool("false"));
+
+    // parseEvents
+    {
+        const evts = try parseEvents(alloc, "[\"Transfer\", \"Approval\"]");
+        defer {
+            for (evts) |e| alloc.free(e);
+            alloc.free(evts);
+        }
+        try std.testing.expectEqual(@as(usize, 2), evts.len);
+        try std.testing.expectEqualStrings("Transfer", evts[0]);
+        try std.testing.expectEqualStrings("Approval", evts[1]);
+    }
+    {
+        const evts = try parseEvents(alloc, "\"Transfer\"");
+        defer {
+            for (evts) |e| alloc.free(e);
+            alloc.free(evts);
+        }
+        try std.testing.expectEqual(@as(usize, 1), evts.len);
+        try std.testing.expectEqualStrings("Transfer", evts[0]);
+    }
+    {
+        const evts = try parseEvents(alloc, "[]");
+        defer alloc.free(evts);
+        try std.testing.expectEqual(@as(usize, 0), evts.len);
+    }
+}
+
+test "config load empty string" {
+    const alloc = std.testing.allocator;
+    var cfg = try loadFromString(alloc, "");
+    defer cfg.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), cfg.contracts.len);
+    try std.testing.expectEqualStrings("info", cfg.global.log_level);
+}
