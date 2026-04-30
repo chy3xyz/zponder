@@ -177,6 +177,12 @@ pub const Indexer = struct {
             log.debug("同步 {s}: 区块 {} ~ {}", .{ self.contract.name, current, to_block });
 
             self.syncRange(current, to_block) catch |e| {
+                if (e == error.RpcLimitExceeded) {
+                    const new_batch = @max(self.batch_size / 2, 100);
+                    log.warn("RPC limit exceeded, reducing batch_size from {} to {}", .{ self.batch_size, new_batch });
+                    self.batch_size = new_batch;
+                    continue;
+                }
                 log.err("同步区块 {}~{} 失败: {any}", .{ current, to_block, e });
                 std.Io.sleep(self.rpc.io, std.Io.Duration.fromMilliseconds(self.poll_interval_ms), .real) catch {};
                 continue;

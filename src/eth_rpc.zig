@@ -210,6 +210,18 @@ pub const Client = struct {
         var body = response_writer.toArrayList();
         defer body.deinit(self.alloc);
 
+        // 检查 JSON-RPC 错误码（HTTP 200 也可能包含错误）
+        if (std.json.parseFromSlice(std.json.Value, self.alloc, body.items, .{})) |parsed| {
+            defer parsed.deinit();
+            if (parsed.value.object.get("error")) |err| {
+                const code = if (err.object.get("code")) |c| c.integer else -1;
+                const msg = if (err.object.get("message")) |m| m.string else "unknown";
+                log.warn("RPC error: code={d}, msg={s}", .{ code, msg });
+                if (code == -32005) return error.RpcLimitExceeded;
+                return error.RpcError;
+            }
+        } else |_| {}
+
         return try self.alloc.dupe(u8, body.items);
     }
 

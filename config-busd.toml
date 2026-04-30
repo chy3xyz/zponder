@@ -27,7 +27,9 @@ address = "0x55d398326f99059ff775485246999027b3197955"
 abi_path = "./abis/busd.abi"
 from_block = 25000000
 events = ["Transfer", "Approval"]
-block_batch_size = 2000
+# BSC 公共 RPC 对 eth_getLogs 有查询限制，建议从较小批次开始
+# 如遇 -32005 limit exceeded 会自动减半 batch_size
+block_batch_size = 500
 poll_interval_ms = 3000
 max_reorg_depth = 50
 
