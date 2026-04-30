@@ -1,6 +1,13 @@
 const std = @import("std");
 const log = @import("log.zig");
 
+pub const EventFilter = struct {
+    event: []const u8,
+    field: []const u8,
+    op: []const u8,
+    value: []const u8,
+};
+
 pub const ContractConfig = struct {
     name: []const u8,
     address: []const u8,
@@ -11,6 +18,7 @@ pub const ContractConfig = struct {
     poll_interval_ms: ?u32,
     max_reorg_depth: ?u32,
     block_batch_size: ?u32,
+    filters: []const EventFilter,
 };
 
 pub const GlobalConfig = struct {
@@ -78,6 +86,13 @@ pub const Config = struct {
             alloc.free(c.abi_path);
             for (c.events) |e| alloc.free(e);
             alloc.free(c.events);
+            for (c.filters) |f| {
+                alloc.free(f.event);
+                alloc.free(f.field);
+                alloc.free(f.op);
+                alloc.free(f.value);
+            }
+            alloc.free(c.filters);
         }
         alloc.free(self.contracts);
     }
@@ -171,6 +186,43 @@ fn parseEvents(alloc: std.mem.Allocator, value: []const u8) ![]const []const u8 
     const arr = try alloc.alloc([]const u8, 1);
     arr[0] = single;
     return arr;
+}
+
+fn parseFilters(alloc: std.mem.Allocator, value: []const u8) ![]const EventFilter {
+    const t = trim(value);
+    if (t.len >= 2 and t[0] == '[' and t[t.len - 1] == ']') {
+        const inner = t[1 .. t.len - 1];
+        var list: std.ArrayList(EventFilter) = .empty;
+        errdefer {
+            for (list.items) |f| {
+                alloc.free(f.event);
+                alloc.free(f.field);
+                alloc.free(f.op);
+                alloc.free(f.value);
+            }
+            list.deinit(alloc);
+        }
+        var it = std.mem.splitScalar(u8, inner, ',');
+        while (it.next()) |part| {
+            const item = trim(part);
+            if (item.len == 0) continue;
+            const unquoted = try unquote(alloc, item);
+            defer alloc.free(unquoted);
+            var fit = std.mem.splitScalar(u8, unquoted, ':');
+            const evt = fit.next() orelse continue;
+            const field = fit.next() orelse continue;
+            const op = fit.next() orelse continue;
+            const val = fit.next() orelse continue;
+            try list.append(alloc, .{
+                .event = try alloc.dupe(u8, evt),
+                .field = try alloc.dupe(u8, field),
+                .op = try alloc.dupe(u8, op),
+                .value = try alloc.dupe(u8, val),
+            });
+        }
+        return list.toOwnedSlice(alloc);
+    }
+    return &.{};
 }
 
 pub fn load(alloc: std.mem.Allocator, io: std.Io, config_path: []const u8) !Config {
@@ -283,6 +335,7 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
                     .poll_interval_ms = null,
                     .max_reorg_depth = null,
                     .block_batch_size = null,
+                    .filters = &.{},
                 };
             } else {
                 section = .none;
@@ -308,6 +361,8 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
                 cc.from_block = try parseU64(value);
             } else if (std.mem.eql(u8, key, "events")) {
                 cc.events = try parseEvents(alloc, value);
+            } else if (std.mem.eql(u8, key, "filters")) {
+                cc.filters = try parseFilters(alloc, value);
             } else if (std.mem.eql(u8, key, "poll_interval_ms")) {
                 cc.poll_interval_ms = try parseU32(value);
             } else if (std.mem.eql(u8, key, "max_reorg_depth")) {
@@ -638,6 +693,30 @@ test "config helper functions" {
         const evts = try parseEvents(alloc, "[]");
         defer alloc.free(evts);
         try std.testing.expectEqual(@as(usize, 0), evts.len);
+    }
+
+    // parseFilters
+    {
+        const filters = try parseFilters(alloc, "[\"Transfer:value:gt:500\",\"Approval:value:gt:1000\"]");
+        defer {
+            for (filters) |f| {
+                alloc.free(f.event);
+                alloc.free(f.field);
+                alloc.free(f.op);
+                alloc.free(f.value);
+            }
+            alloc.free(filters);
+        }
+        try std.testing.expectEqual(@as(usize, 2), filters.len);
+        try std.testing.expectEqualStrings("Transfer", filters[0].event);
+        try std.testing.expectEqualStrings("value", filters[0].field);
+        try std.testing.expectEqualStrings("gt", filters[0].op);
+        try std.testing.expectEqualStrings("500", filters[0].value);
+    }
+    {
+        const filters = try parseFilters(alloc, "[]");
+        defer alloc.free(filters);
+        try std.testing.expectEqual(@as(usize, 0), filters.len);
     }
 }
 

@@ -282,7 +282,34 @@ pub const Indexer = struct {
         }
     }
 
-    /// 处理单条日志：解码并写入对应事件表
+    /// 解析字符串为 u256（支持十进制和 0x 十六进制）
+    fn parseU256(s: []const u8) !u256 {
+        const trimmed = std.mem.trim(u8, s, " \t");
+        if (std.mem.startsWith(u8, trimmed, "0x")) {
+            return std.fmt.parseInt(u256, trimmed[2..], 16);
+        }
+        return std.fmt.parseInt(u256, trimmed, 10);
+    }
+
+    /// 检查事件是否满足配置的过滤条件（无匹配 filter 时默认通过）
+    fn shouldRecordEvent(self: *Indexer, event_name: []const u8, fields: []const db.DecodedField) bool {
+        for (self.contract.filters) |filter| {
+            if (!std.mem.eql(u8, filter.event, event_name)) continue;
+            for (fields) |field| {
+                if (!std.mem.eql(u8, field.name, filter.field)) continue;
+                const field_val = parseU256(field.value) catch return true;
+                const filter_val = parseU256(filter.value) catch return true;
+                if (std.mem.eql(u8, filter.op, "gt")) return field_val > filter_val;
+                if (std.mem.eql(u8, filter.op, "gte")) return field_val >= filter_val;
+                if (std.mem.eql(u8, filter.op, "lt")) return field_val < filter_val;
+                if (std.mem.eql(u8, filter.op, "lte")) return field_val <= filter_val;
+                if (std.mem.eql(u8, filter.op, "eq")) return field_val == filter_val;
+            }
+        }
+        return true;
+    }
+
+    /// 处理单条日志：解码、过滤并写入对应事件表
     fn processLog(self: *Indexer, lg: eth_rpc.Log) !void {
         if (self.abi_contract) |ac| {
             if (lg.topics.len > 0) {
@@ -315,6 +342,12 @@ pub const Indexer = struct {
                             .name = f.name,
                             .value = f.value,
                         });
+                    }
+
+                    // 应用配置的过滤条件
+                    if (!self.shouldRecordEvent(evt.name, db_fields.items)) {
+                        log.debug("跳过 {s}.{s} @ 区块 {}（不满足过滤条件）", .{ self.contract.name, evt.name, lg.block_number });
+                        return;
                     }
 
                     try self.database.insertEventLog(
@@ -478,6 +511,72 @@ test "formatTopicsJson" {
     }
 }
 
+test "shouldRecordEvent filtering" {
+    const alloc = std.testing.allocator;
+
+    var filters = try alloc.alloc(config.EventFilter, 1);
+    filters[0] = .{
+        .event = try alloc.dupe(u8, "Transfer"),
+        .field = try alloc.dupe(u8, "value"),
+        .op = try alloc.dupe(u8, "gt"),
+        .value = try alloc.dupe(u8, "500"),
+    };
+    defer {
+        for (filters) |f| {
+            alloc.free(f.event);
+            alloc.free(f.field);
+            alloc.free(f.op);
+            alloc.free(f.value);
+        }
+        alloc.free(filters);
+    }
+
+    const contract = config.ContractConfig{
+        .name = "test",
+        .address = "0xabc",
+        .abi_path = "",
+        .from_block = 0,
+        .events = &.{},
+        .start_block = null,
+        .block_batch_size = null,
+        .poll_interval_ms = null,
+        .max_reorg_depth = null,
+        .filters = filters,
+    };
+
+    var idx = Indexer{
+        .alloc = alloc,
+        .rpc = undefined,
+        .database = undefined,
+        .contract = &contract,
+        .snapshot_interval = 0,
+        .state = std.atomic.Value(IndexerState).init(.stopped),
+        .current_block = std.atomic.Value(u64).init(0),
+        .last_snapshot_time = std.atomic.Value(i64).init(0),
+        .batch_size = 100,
+        .poll_interval_ms = 1000,
+        .abi_contract = null,
+        .thread = null,
+    };
+
+    // value = 0x3e8 (1000) > 500 → 通过
+    const fields_pass = &.{
+        db.DecodedField{ .name = "from", .value = "0x1111" },
+        db.DecodedField{ .name = "value", .value = "0x00000000000000000000000000000000000000000000000000000000000003e8" },
+    };
+    try std.testing.expect(idx.shouldRecordEvent("Transfer", fields_pass));
+
+    // value = 0x64 (100) < 500 → 跳过
+    const fields_skip = &.{
+        db.DecodedField{ .name = "from", .value = "0x1111" },
+        db.DecodedField{ .name = "value", .value = "0x0000000000000000000000000000000000000000000000000000000000000064" },
+    };
+    try std.testing.expect(!idx.shouldRecordEvent("Transfer", fields_skip));
+
+    // 无 filter 匹配的事件 → 默认通过
+    try std.testing.expect(idx.shouldRecordEvent("Approval", fields_pass));
+}
+
 test "indexer getStatus and getCurrentBlock" {
     const alloc = std.testing.allocator;
 
@@ -512,6 +611,7 @@ test "indexer getStatus and getCurrentBlock" {
         .block_batch_size = null,
         .poll_interval_ms = null,
         .max_reorg_depth = null,
+        .filters = &.{},
     };
 
     var idx = Indexer{

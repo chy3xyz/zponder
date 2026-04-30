@@ -1,0 +1,40 @@
+# BSC BUSD 监听配置
+# 过滤规则：
+#   - Transfer 事件：value > 500 BUSD (18 decimals)
+#   - Approval 事件：value > 1000 BUSD (18 decimals)
+
+[global]
+log_level = "info"
+log_file = "./logs/busd-indexer.log"
+snapshot_interval = 3600
+
+[rpc]
+url = "https://bsc-dataseed.binance.org"
+retry_count = 3
+max_concurrent = 10
+
+[database]
+type = "sqlite"
+db_name = "busd_indexer.db"
+
+[http]
+port = 8080
+host = "0.0.0.0"
+
+[[contracts]]
+name = "busd"
+address = "0x55d398326f99059ff775485246999027b3197955"
+abi_path = "./abis/busd.abi"
+from_block = 25000000
+events = ["Transfer", "Approval"]
+block_batch_size = 2000
+poll_interval_ms = 3000
+max_reorg_depth = 50
+
+# 事件过滤：格式为 "event:field:op:value"
+# op 支持 gt/gte/lt/lte/eq
+# value 支持十进制或 0x 十六进制
+filters = [
+    "Transfer:value:gt:500000000000000000000",
+    "Approval:value:gt:1000000000000000000000",
+]
