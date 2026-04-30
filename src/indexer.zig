@@ -181,6 +181,11 @@ pub const Indexer = struct {
                     const new_batch = @max(self.batch_size / 2, 100);
                     log.warn("RPC limit exceeded, reducing batch_size from {} to {}", .{ self.batch_size, new_batch });
                     self.batch_size = new_batch;
+                    // 已经是最小批次仍超限，等待更长时间让 RPC 冷却
+                    if (self.batch_size == 100) {
+                        log.warn("已达最小批次 100，等待 10s 后重试", .{});
+                        std.Io.sleep(self.rpc.io, std.Io.Duration.fromSeconds(10), .real) catch {};
+                    }
                     continue;
                 }
                 log.err("同步区块 {}~{} 失败: {any}", .{ current, to_block, e });

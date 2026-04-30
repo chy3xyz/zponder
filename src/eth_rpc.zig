@@ -124,6 +124,9 @@ pub const Client = struct {
                 self.circuit_state.store(.closed, .monotonic);
                 return data;
             } else |e| {
+                // RPC limit exceeded 不需要重试（批次问题，重试无意义）
+                if (e == error.RpcLimitExceeded) return e;
+
                 attempt += 1;
                 const failures = self.circuit_failures.fetchAdd(1, .monotonic) + 1;
 

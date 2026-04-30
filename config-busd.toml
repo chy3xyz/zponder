@@ -9,6 +9,10 @@ log_file = "./logs/busd-indexer.log"
 snapshot_interval = 3600
 
 [rpc]
+# BSC 公共节点限制较严，建议使用专业节点：
+#   - Ankr: https://rpc.ankr.com/bsc
+#   - QuickNode: https://your-endpoint.bsc.quiknode.pro/
+#   - GetBlock: https://bsc.getblock.io/mainnet/
 url = "https://bsc-dataseed.binance.org"
 retry_count = 3
 max_concurrent = 10
