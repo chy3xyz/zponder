@@ -240,7 +240,10 @@ pub const Indexer = struct {
     fn syncRange(self: *Indexer, from_block: u64, to_block: u64) !void {
         // 构建事件 topic0 过滤
         var topics: std.ArrayList([]const u8) = .empty;
-        defer topics.deinit(self.alloc);
+        defer {
+            for (topics.items) |t| self.alloc.free(t);
+            topics.deinit(self.alloc);
+        }
 
         if (self.abi_contract) |ac| {
             for (self.contract.events) |evt_name| {
