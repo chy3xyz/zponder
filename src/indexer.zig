@@ -311,8 +311,14 @@ pub const Indexer = struct {
             if (!std.mem.eql(u8, filter.event, event_name)) continue;
             for (fields) |field| {
                 if (!std.mem.eql(u8, field.name, filter.field)) continue;
-                const field_val = parseU256(field.value) catch return true;
-                const filter_val = parseU256(filter.value) catch return true;
+                const field_val = parseU256(field.value) catch {
+                    log.warn("过滤字段值解析失败: {s}={s}，默认通过", .{ field.name, field.value });
+                    return true;
+                };
+                const filter_val = parseU256(filter.value) catch {
+                    log.warn("过滤器值解析失败: {s}={s}，默认通过", .{ filter.field, filter.value });
+                    return true;
+                };
                 if (std.mem.eql(u8, filter.op, "gt")) return field_val > filter_val;
                 if (std.mem.eql(u8, filter.op, "gte")) return field_val >= filter_val;
                 if (std.mem.eql(u8, filter.op, "lt")) return field_val < filter_val;
@@ -424,7 +430,25 @@ pub const Indexer = struct {
         for (topics, 0..) |t, i| {
             if (i > 0) try buf.appendSlice(alloc, ",");
             try buf.append(alloc, '"');
-            try buf.appendSlice(alloc, t);
+            for (t) |ch| {
+                if (ch == '\\') {
+                    try buf.appendSlice(alloc, "\\\\");
+                } else if (ch == '"') {
+                    try buf.appendSlice(alloc, "\\\"");
+                } else if (ch == '\n') {
+                    try buf.appendSlice(alloc, "\\n");
+                } else if (ch == '\r') {
+                    try buf.appendSlice(alloc, "\\r");
+                } else if (ch == '\t') {
+                    try buf.appendSlice(alloc, "\\t");
+                } else if (ch <= 0x1F) {
+                    var esc_buf: [6]u8 = undefined;
+                    const esc = try std.fmt.bufPrint(&esc_buf, "\\u{x:0>4}", .{ch});
+                    try buf.appendSlice(alloc, esc);
+                } else {
+                    try buf.append(alloc, ch);
+                }
+            }
             try buf.append(alloc, '"');
         }
         try buf.append(alloc, ']');

@@ -21,12 +21,20 @@ fn signalHandler(sig: c_int) callconv(.c) void {
     g_running.store(false, .monotonic);
 }
 
+fn setupSignals() void {
+    var sa: c_signal.struct_sigaction = undefined;
+    sa.sa_handler = signalHandler;
+    _ = c_signal.sigemptyset(&sa.sa_mask);
+    sa.sa_flags = c_signal.SA_RESTART;
+    _ = c_signal.sigaction(c_signal.SIGINT, &sa, null);
+    _ = c_signal.sigaction(c_signal.SIGTERM, &sa, null);
+}
+
 pub fn main(init: std.process.Init) !void {
     const alloc = init.gpa;
 
-    // 注册信号处理器（SIG_ERR 宏在 macOS 上无法被 zig translate-c 解析，故不检查返回值）
-    _ = c_signal.signal(c_signal.SIGINT, signalHandler);
-    _ = c_signal.signal(c_signal.SIGTERM, signalHandler);
+    // 注册信号处理器（使用 sigaction 替代 signal，确保跨平台行为一致）
+    setupSignals();
 
     // 解析命令行参数
     const args = try init.minimal.args.toSlice(alloc);

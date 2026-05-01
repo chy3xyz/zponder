@@ -191,14 +191,20 @@ fn decodeDynamicValue(alloc: std.mem.Allocator, data: []const u8, offset_hex: us
     };
     const hex_data = data[hex_start..];
 
-    // 读取偏移量指向的 length（前 64 hex 字符 = 32 字节）
-    if (offset_hex + 64 > hex_data.len) return try alloc.dupe(u8, "0x");
+    // 防溢出：offset_hex + 64
+    if (offset_hex > std.math.maxInt(usize) - 64 or offset_hex + 64 > hex_data.len)
+        return try alloc.dupe(u8, "0x");
     const len_word = hex_data[offset_hex .. offset_hex + 64];
     const len = @as(usize, @intCast(hexWordToU256(len_word)));
 
+    // 防溢出：len * 2
+    if (len > std.math.maxInt(usize) / 2) return try alloc.dupe(u8, "0x");
+    const hex_len = len * 2;
+
     const data_start = offset_hex + 64;
-    const hex_len = len * 2; // 每字节 2 个 hex 字符
-    if (data_start + hex_len > hex_data.len) return try alloc.dupe(u8, "0x");
+    // 防溢出：data_start + hex_len
+    if (data_start > std.math.maxInt(usize) - hex_len or data_start + hex_len > hex_data.len)
+        return try alloc.dupe(u8, "0x");
 
     const result_hex = hex_data[data_start .. data_start + hex_len];
     // 返回完整 hex 字符串（带 0x 前缀）
@@ -295,12 +301,16 @@ pub fn decodeLog(alloc: std.mem.Allocator, event: *const AbiEvent, topics: []con
             const word_start = data_word_idx * 64;
             if (isDynamicType(input.type)) {
                 // 动态类型：当前 word 是偏移量（以字节为单位）
-                if (word_start + 64 <= hex_data.len) {
+                if (word_start <= std.math.maxInt(usize) - 64 and word_start + 64 <= hex_data.len) {
                     const offset_word = hex_data[word_start .. word_start + 64];
                     const offset_bytes = @as(usize, @intCast(hexWordToU256(offset_word)));
-                    const offset_hex = offset_bytes * 2; // 转为 hex 字符数
-                    const decoded = try decodeDynamicValue(alloc, data, offset_hex);
-                    try fields.append(alloc, .{ .name = input.name, .value = decoded });
+                    if (offset_bytes > std.math.maxInt(usize) / 2) {
+                        try fields.append(alloc, .{ .name = input.name, .value = try alloc.dupe(u8, "0x") });
+                    } else {
+                        const offset_hex = offset_bytes * 2; // 转为 hex 字符数
+                        const decoded = try decodeDynamicValue(alloc, data, offset_hex);
+                        try fields.append(alloc, .{ .name = input.name, .value = decoded });
+                    }
                 } else {
                     try fields.append(alloc, .{ .name = input.name, .value = try alloc.dupe(u8, "0x") });
                 }

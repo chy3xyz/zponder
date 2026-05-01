@@ -4,6 +4,7 @@ const db = @import("db.zig");
 const indexer = @import("indexer.zig");
 const cache = @import("cache.zig");
 const log = @import("log.zig");
+const utils = @import("utils.zig");
 
 const build_options = @import("build_options");
 
@@ -104,6 +105,15 @@ pub const Server = struct {
         if (self.thread) |t| {
             t.join();
             self.thread = null;
+        }
+        // 等待所有连接处理线程结束（最多 5 秒）
+        var wait_ms: u32 = 0;
+        while (self.active_connections.load(.monotonic) > 0 and wait_ms < 5000) {
+            std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(10), .real) catch {};
+            wait_ms += 10;
+        }
+        if (self.active_connections.load(.monotonic) > 0) {
+            log.warn("HTTP 优雅退出超时，仍有 {d} 个活跃连接", .{self.active_connections.load(.monotonic)});
         }
     }
 
@@ -296,10 +306,11 @@ pub const Server = struct {
                 .error_state => "error",
                 .replaying => "replaying",
             };
-            try buf.writer.print(
-                "{{\"name\":\"{s}\",\"address\":\"{s}\",\"current_block\":{d},\"status\":\"{s}\"}}",
-                .{ idx.contract.name, idx.contract.address, idx.getCurrentBlock(), status_str },
-            );
+            try buf.writer.writeAll("{\"name\":\"");
+            try utils.jsonEscapeString(buf.writer, idx.contract.name);
+            try buf.writer.writeAll("\",\"address\":\"");
+            try utils.jsonEscapeString(buf.writer, idx.contract.address);
+            try buf.writer.print("\",\"current_block\":{d},\"status\":\"{s}\"}", .{ idx.getCurrentBlock(), status_str });
         }
         try buf.writer.writeAll("]");
 
@@ -477,13 +488,18 @@ pub const Server = struct {
         try buf.writer.writeAll("[");
         for (self.indexers, 0..) |idx, i| {
             if (i > 0) try buf.writer.writeByte(',');
-            try buf.writer.print(
-                "{{\"name\":\"{s}\",\"address\":\"{s}\",\"abi_path\":\"{s}\",\"from_block\":{d},\"events\":[",
-                .{ idx.contract.name, idx.contract.address, idx.contract.abi_path, idx.contract.from_block },
-            );
+            try buf.writer.writeAll("{\"name\":\"");
+            try utils.jsonEscapeString(buf.writer, idx.contract.name);
+            try buf.writer.writeAll("\",\"address\":\"");
+            try utils.jsonEscapeString(buf.writer, idx.contract.address);
+            try buf.writer.writeAll("\",\"abi_path\":\"");
+            try utils.jsonEscapeString(buf.writer, idx.contract.abi_path);
+            try buf.writer.print("\",\"from_block\":{d},\"events\":[", .{idx.contract.from_block});
             for (idx.contract.events, 0..) |evt, j| {
                 if (j > 0) try buf.writer.writeByte(',');
-                try buf.writer.print("\"{s}\"", .{evt});
+                try buf.writer.writeByte('"');
+                try utils.jsonEscapeString(buf.writer, evt);
+                try buf.writer.writeByte('"');
             }
             try buf.writer.writeAll("]}");
         }

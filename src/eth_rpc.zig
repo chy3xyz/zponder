@@ -206,7 +206,12 @@ pub const Client = struct {
             .response_writer = &response_writer.writer,
         });
 
-        if (@intFromEnum(result.status) < 200 or @intFromEnum(result.status) >= 300) {
+        const status_int = @intFromEnum(result.status);
+        // 客户端错误：不可重试
+        if (status_int >= 400 and status_int < 500 and status_int != 429) {
+            return error.HttpClientError;
+        }
+        if (status_int < 200 or status_int >= 300) {
             return error.HttpError;
         }
 
@@ -216,9 +221,14 @@ pub const Client = struct {
         // 检查 JSON-RPC 错误码（HTTP 200 也可能包含错误）
         if (std.json.parseFromSlice(std.json.Value, self.alloc, body.items, .{})) |parsed| {
             defer parsed.deinit();
+            if (parsed.value != .object) {
+                // 非标准 JSON-RPC 响应，返回原始 body
+                return try self.alloc.dupe(u8, body.items);
+            }
             if (parsed.value.object.get("error")) |err| {
-                const code = if (err.object.get("code")) |c| c.integer else -1;
-                const msg = if (err.object.get("message")) |m| m.string else "unknown";
+                if (err != .object) return error.RpcError;
+                const code = if (err.object.get("code")) |c| switch (c) { .integer => |v| v, else => -1 } else -1;
+                const msg = if (err.object.get("message")) |m| switch (m) { .string => |v| v, else => "unknown" } else "unknown";
                 log.warn("RPC error: code={d}, msg={s}", .{ code, msg });
                 if (code == -32005) return error.RpcLimitExceeded;
                 return error.RpcError;
@@ -286,11 +296,18 @@ fn parseLogs(alloc: std.mem.Allocator, raw: []const u8) ![]Log {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
     defer parsed.deinit();
 
+    if (parsed.value != .object) {
+        log.err("RPC 返回非对象 JSON", .{});
+        return error.InvalidResponse;
+    }
+
     // 检查 JSON-RPC 错误
     if (parsed.value.object.get("error")) |err| {
-        const code = if (err.object.get("code")) |c| c.integer else -1;
-        const msg = if (err.object.get("message")) |m| m.string else "unknown";
+        if (err != .object) return error.InvalidResponse;
+        const code = if (err.object.get("code")) |c| switch (c) { .integer => |v| v, else => -1 } else -1;
+        const msg = if (err.object.get("message")) |m| switch (m) { .string => |v| v, else => "unknown" } else "unknown";
         log.err("RPC error: code={d}, msg={s}", .{ code, msg });
+        if (code == -32005) return error.RpcLimitExceeded;
         return error.RpcError;
     }
 
@@ -300,20 +317,29 @@ fn parseLogs(alloc: std.mem.Allocator, raw: []const u8) ![]Log {
     var logs: std.ArrayList(Log) = .empty;
     errdefer {
         for (logs.items) |l| {
+            alloc.free(l.address);
+            for (l.topics) |t| alloc.free(t);
             alloc.free(l.topics);
+            alloc.free(l.data);
+            alloc.free(l.transaction_hash);
         }
         logs.deinit(alloc);
     }
 
     for (result.array.items) |item| {
+        if (item != .object) continue;
         const obj = item.object;
 
         var topics: std.ArrayList([]const u8) = .empty;
-        errdefer topics.deinit(alloc);
+        errdefer {
+            for (topics.items) |t| alloc.free(t);
+            topics.deinit(alloc);
+        }
 
         if (obj.get("topics")) |t| {
             if (t == .array) {
                 for (t.array.items) |topic| {
+                    if (topic != .string) continue;
                     try topics.append(alloc, try alloc.dupe(u8, topic.string));
                 }
             }
@@ -321,24 +347,28 @@ fn parseLogs(alloc: std.mem.Allocator, raw: []const u8) ![]Log {
 
         const block_number = blk: {
             if (obj.get("blockNumber")) |bn| {
-                break :blk utils.parseHexU64(bn.string) catch 0;
+                if (bn == .string) break :blk utils.parseHexU64(bn.string) catch 0;
             }
             break :blk 0;
         };
 
         const log_index = blk: {
             if (obj.get("logIndex")) |li| {
-                break :blk utils.parseHexU64(li.string) catch 0;
+                if (li == .string) break :blk utils.parseHexU64(li.string) catch 0;
             }
             break :blk 0;
         };
 
+        const address_str = if (obj.get("address")) |a| switch (a) { .string => |v| v, else => "" } else "";
+        const data_str = if (obj.get("data")) |d| switch (d) { .string => |v| v, else => "" } else "";
+        const tx_str = if (obj.get("transactionHash")) |th| switch (th) { .string => |v| v, else => "" } else "";
+
         try logs.append(alloc, .{
-            .address = try alloc.dupe(u8, if (obj.get("address")) |a| a.string else ""),
+            .address = try alloc.dupe(u8, address_str),
             .topics = try topics.toOwnedSlice(alloc),
-            .data = try alloc.dupe(u8, if (obj.get("data")) |d| d.string else ""),
+            .data = try alloc.dupe(u8, data_str),
             .block_number = block_number,
-            .transaction_hash = try alloc.dupe(u8, if (obj.get("transactionHash")) |th| th.string else ""),
+            .transaction_hash = try alloc.dupe(u8, tx_str),
             .log_index = log_index,
         });
     }

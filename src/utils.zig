@@ -55,6 +55,27 @@ pub fn formatHexU64(buf: []u8, value: u64) ![]u8 {
     return try std.fmt.bufPrint(buf, "0x{x}", .{value});
 }
 
+/// 将字符串中的特殊字符转义为 JSON 安全格式，写入 writer
+pub fn jsonEscapeString(writer: anytype, s: []const u8) !void {
+    for (s) |ch| {
+        if (ch == '\\') {
+            try writer.writeAll("\\\\");
+        } else if (ch == '"') {
+            try writer.writeAll("\\\"");
+        } else if (ch == '\n') {
+            try writer.writeAll("\\n");
+        } else if (ch == '\r') {
+            try writer.writeAll("\\r");
+        } else if (ch == '\t') {
+            try writer.writeAll("\\t");
+        } else if (ch <= 0x1F) {
+            try writer.print("\\u{x:0>4}", .{ch});
+        } else {
+            try writer.writeByte(ch);
+        }
+    }
+}
+
 /// 验证以太坊地址格式（42 字符，0x 前缀）
 pub fn isValidAddress(addr: []const u8) bool {
     if (addr.len != 42) return false;

@@ -5,6 +5,7 @@ const c = @cImport({
 const abi = @import("abi.zig");
 const cache = @import("cache.zig");
 const log = @import("log.zig");
+const utils = @import("utils.zig");
 
 /// 数据库配置
 pub const DatabaseConfig = @import("config.zig").DatabaseConfig;
@@ -384,16 +385,7 @@ pub const Client = struct {
                     else => {
                         const val = std.mem.sliceTo(c.sqlite3_column_text(stmt, col_idx), 0);
                         try rw.writeByte('"');
-                        for (val) |ch| {
-                            switch (ch) {
-                                '\\' => try rw.writeAll("\\\\"),
-                                '"' => try rw.writeAll("\\\""),
-                                '\n' => try rw.writeAll("\\n"),
-                                '\r' => try rw.writeAll("\\r"),
-                                '\t' => try rw.writeAll("\\t"),
-                                else => try rw.writeByte(ch),
-                            }
-                        }
+                        try utils.jsonEscapeString(rw, val);
                         try rw.writeByte('"');
                     },
                 }
@@ -638,6 +630,11 @@ pub const Client = struct {
 
     /// 删除指定合约从某区块开始的所有数据（重组回滚）
     pub fn rollbackFromBlock(self: *Client, contract_address: []const u8, contract_name: []const u8, event_names: []const []const u8, from_block: u64) !void {
+        try self.exec("BEGIN;");
+        errdefer {
+            _ = c.sqlite3_exec(self.db, "ROLLBACK;", null, null, null);
+        }
+
         // 删除事件表数据
         for (event_names) |evt_name| {
             var sql_buf: [256]u8 = undefined;
@@ -647,50 +644,49 @@ pub const Client = struct {
             );
             var stmt: ?*c.sqlite3_stmt = null;
             const rc = c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null);
-            if (rc != c.SQLITE_OK) {
-                log.err("回滚准备失败: {s}", .{sql});
-                continue;
-            }
+            if (rc != c.SQLITE_OK) return error.PrepareFailed;
             defer _ = c.sqlite3_finalize(stmt);
-            if (c.sqlite3_bind_int64(stmt, 1, @intCast(from_block)) != c.SQLITE_OK) continue;
-            _ = c.sqlite3_step(stmt);
+            if (c.sqlite3_bind_int64(stmt, 1, @intCast(from_block)) != c.SQLITE_OK) return error.BindFailed;
+            if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.ExecFailed;
         }
 
         // 删除快照
-        const snap_sql = "DELETE FROM snapshots WHERE contract_address = ? AND block_number >= ?;";
-        var snap_stmt: ?*c.sqlite3_stmt = null;
-        const snap_rc = c.sqlite3_prepare_v2(self.db, snap_sql, @intCast(snap_sql.len), &snap_stmt, null);
-        if (snap_rc == c.SQLITE_OK) {
-            defer _ = c.sqlite3_finalize(snap_stmt);
-            _ = c.sqlite3_bind_text(snap_stmt, 1, contract_address.ptr, @intCast(contract_address.len), c.SQLITE_STATIC);
-            _ = c.sqlite3_bind_int64(snap_stmt, 2, @intCast(from_block));
-            _ = c.sqlite3_step(snap_stmt);
+        {
+            const sql = "DELETE FROM snapshots WHERE contract_address = ? AND block_number >= ?;";
+            var stmt: ?*c.sqlite3_stmt = null;
+            const rc = c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null);
+            if (rc != c.SQLITE_OK) return error.PrepareFailed;
+            defer _ = c.sqlite3_finalize(stmt);
+            if (c.sqlite3_bind_text(stmt, 1, contract_address.ptr, @intCast(contract_address.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.BindFailed;
+            if (c.sqlite3_bind_int64(stmt, 2, @intCast(from_block)) != c.SQLITE_OK) return error.BindFailed;
+            if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.ExecFailed;
         }
 
         // 删除区块 hash 记录
-        const hash_sql = "DELETE FROM block_hashes WHERE contract_address = ? AND block_number >= ?;";
-        var hash_stmt: ?*c.sqlite3_stmt = null;
-        const hash_rc = c.sqlite3_prepare_v2(self.db, hash_sql, @intCast(hash_sql.len), &hash_stmt, null);
-        if (hash_rc == c.SQLITE_OK) {
-            defer _ = c.sqlite3_finalize(hash_stmt);
-            _ = c.sqlite3_bind_text(hash_stmt, 1, contract_address.ptr, @intCast(contract_address.len), c.SQLITE_STATIC);
-            _ = c.sqlite3_bind_int64(hash_stmt, 2, @intCast(from_block));
-            _ = c.sqlite3_step(hash_stmt);
+        {
+            const sql = "DELETE FROM block_hashes WHERE contract_address = ? AND block_number >= ?;";
+            var stmt: ?*c.sqlite3_stmt = null;
+            const rc = c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null);
+            if (rc != c.SQLITE_OK) return error.PrepareFailed;
+            defer _ = c.sqlite3_finalize(stmt);
+            if (c.sqlite3_bind_text(stmt, 1, contract_address.ptr, @intCast(contract_address.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.BindFailed;
+            if (c.sqlite3_bind_int64(stmt, 2, @intCast(from_block)) != c.SQLITE_OK) return error.BindFailed;
+            if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.ExecFailed;
         }
 
         // 更新同步状态
-        const state_sql =
-            \\UPDATE sync_state SET last_synced_block = ? - 1, status = 'reorg_rollback'
-            \\WHERE contract_address = ?;
-        ;
-        var state_stmt: ?*c.sqlite3_stmt = null;
-        const state_rc = c.sqlite3_prepare_v2(self.db, state_sql, @intCast(state_sql.len), &state_stmt, null);
-        if (state_rc == c.SQLITE_OK) {
-            defer _ = c.sqlite3_finalize(state_stmt);
-            _ = c.sqlite3_bind_int64(state_stmt, 1, @intCast(from_block));
-            _ = c.sqlite3_bind_text(state_stmt, 2, contract_address.ptr, @intCast(contract_address.len), c.SQLITE_STATIC);
-            _ = c.sqlite3_step(state_stmt);
+        {
+            const sql = "UPDATE sync_state SET last_synced_block = ? - 1, status = 'reorg_rollback' WHERE contract_address = ?;";
+            var stmt: ?*c.sqlite3_stmt = null;
+            const rc = c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null);
+            if (rc != c.SQLITE_OK) return error.PrepareFailed;
+            defer _ = c.sqlite3_finalize(stmt);
+            if (c.sqlite3_bind_int64(stmt, 1, @intCast(from_block)) != c.SQLITE_OK) return error.BindFailed;
+            if (c.sqlite3_bind_text(stmt, 2, contract_address.ptr, @intCast(contract_address.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.BindFailed;
+            if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.ExecFailed;
         }
+
+        try self.exec("COMMIT;");
     }
 
     /// 查询事件表总行数（用于监控）
