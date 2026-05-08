@@ -23,7 +23,12 @@ fn signalHandler(sig: c_int) callconv(.c) void {
 
 fn setupSignals() void {
     var sa: c_signal.struct_sigaction = undefined;
-    sa.sa_handler = signalHandler;
+    // macOS (Darwin) uses __sigaction_u union; Linux uses direct sa_handler field
+    if (@import("builtin").os.tag.isDarwin()) {
+        sa.__sigaction_u.__sa_handler = signalHandler;
+    } else {
+        sa.sa_handler = signalHandler;
+    }
     _ = c_signal.sigemptyset(&sa.sa_mask);
     sa.sa_flags = c_signal.SA_RESTART;
     _ = c_signal.sigaction(c_signal.SIGINT, &sa, null);
@@ -130,7 +135,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // 8. 启动 HTTP 服务
-    var server = http_server.Server.init(alloc, init.io, &cfg.http, &database, &query_cache, indexer_ptrs.items);
+    var server = http_server.Server.init(alloc, init.io, &cfg.http, &database, &query_cache, indexer_ptrs.items, cfg.queries);
     defer server.deinit();
     try server.start();
 

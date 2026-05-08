@@ -7,6 +7,10 @@ zig-out/
 *.db-shm
 *.db-wal
 
+# RocksDB data
+rocksdb_data/
+/tmp/zponder_test_rocksdb*
+
 # Logs
 logs/
 *.log

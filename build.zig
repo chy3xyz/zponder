@@ -37,6 +37,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
     mod.linkSystemLibrary("sqlite3", .{});
+    mod.linkSystemLibrary("rocksdb", .{});
+    mod.linkSystemLibrary("pq", .{});
+    mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/libpq/include" });
+    mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/libpq/lib" });
     mod.link_libc = true;
 
     const exe = b.addExecutable(.{
@@ -52,8 +56,12 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // 链接 SQLite3（系统库）
+    // 链接 SQLite3 + RocksDB + PostgreSQL（系统库）
     exe.root_module.linkSystemLibrary("sqlite3", .{});
+    exe.root_module.linkSystemLibrary("rocksdb", .{});
+    exe.root_module.linkSystemLibrary("pq", .{});
+    exe.root_module.addIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/libpq/include" });
+    exe.root_module.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/libpq/lib" });
     exe.root_module.link_libc = true;
 
     b.installArtifact(exe);

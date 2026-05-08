@@ -15,7 +15,7 @@ A production-grade Ethereum event indexer written in Zig, inspired by [Ponder](h
 - **Lightweight**: Static binary (< 2MB with SQLite), zero runtime dependencies
 - **Multi-contract**: Parallel indexing with per-contract threads
 - **Resume Support**: Auto-resumes from last synced block on restart
-- **SQLite Persistence**: WAL mode for concurrent read/write safety
+- **Multi Storage**: SQLite, RocksDB, or PostgreSQL — configurable backends
 - **HTTP Query API**: RESTful endpoints with cache, CORS, and Prometheus metrics
 - **Circuit Breaker**: Exponential backoff and circuit breaker for RPC resilience
 - **LRU Cache**: Memory-bounded query cache with LRU eviction
@@ -27,7 +27,7 @@ A production-grade Ethereum event indexer written in Zig, inspired by [Ponder](h
 | Layer | Technology |
 |-------|------------|
 | Language | Zig 0.16.0+ |
-| Storage | SQLite (system library) |
+| Storage | SQLite / RocksDB / PostgreSQL |
 | HTTP Server | `std.http.Server` + per-connection threads |
 | RPC Client | Custom JSON-RPC with retry & circuit breaker |
 | Build | `build.zig` + `build.zig.zon` |
@@ -41,7 +41,9 @@ zponder/
 │   ├── config.zig        # TOML config parser with validation
 │   ├── log.zig           # Structured logging (JSON/text, file+stderr)
 │   ├── eth_rpc.zig       # JSON-RPC client: retry, circuit breaker, log parsing
-│   ├── db.zig            # SQLite client: WAL, auto-migration, bind checks
+│   ├── db.zig            # Database client: SQLite + RocksDB + PostgreSQL
+│   ├── rocksdb.zig       # RocksDB C bindings: K/V put/get, iterators, write batches
+│   ├── pg.zig            # PostgreSQL C bindings: libpq exec/execParams wrapper
 │   ├── indexer.zig       # Per-contract sync loop, replay, snapshot
 │   ├── http_server.zig   # HTTP API: routing, CORS, cache, metrics
 │   ├── abi.zig           # ABI JSON parsing, event signature (Keccak-256), log decode
@@ -77,7 +79,9 @@ timeout = 10000
 retry_count = 3
 
 [database]
+# type = "sqlite"              # or "rocksdb" or "postgresql"
 type = "sqlite"
+# For PostgreSQL: db_name = "host=localhost port=5432 dbname=zponder"
 db_name = "eth_indexer.db"
 
 [http]
@@ -156,7 +160,7 @@ zig build -Doptimize=ReleaseFast
 - **轻量部署**：静态编译单二进制文件（< 2MB），零运行时依赖
 - **多合约并行**：每个合约独立线程处理，提升索引效率
 - **断点续传**：重启后自动从上次同步区块恢复
-- **SQLite 持久化**：WAL 模式保障并发读写安全
+- **多引擎存储**：SQLite、RocksDB 或 PostgreSQL — 可配置后端
 - **HTTP 查询 API**：RESTful 接口，支持缓存、CORS、Prometheus 指标
 - **熔断器机制**：指数退避 + 熔断器保障 RPC 调用韧性
 - **LRU 缓存**：带内存上限的线程安全查询缓存
@@ -168,7 +172,7 @@ zig build -Doptimize=ReleaseFast
 | 层级 | 技术选型 |
 |------|---------|
 | 主语言 | Zig 0.16.0+ |
-| 持久化 | SQLite（系统库） |
+| 持久化 | SQLite / RocksDB / PostgreSQL |
 | HTTP 服务 | `std.http.Server` + 每连接独立线程 |
 | RPC 客户端 | 自定义 JSON-RPC（重试 + 熔断） |
 | 构建系统 | `build.zig` + `build.zig.zon` |
@@ -182,7 +186,9 @@ zponder/
 │   ├── config.zig        # TOML 配置解析 + 验证
 │   ├── log.zig           # 结构化日志（JSON/文本、文件+标准错误）
 │   ├── eth_rpc.zig       # JSON-RPC 客户端：重试、熔断、日志解析
-│   ├── db.zig            # SQLite 客户端：WAL、自动迁移、参数绑定检查
+│   ├── db.zig            # 数据库客户端：SQLite + RocksDB + PostgreSQL
+│   ├── rocksdb.zig       # RocksDB C 绑定：K/V 读写、迭代器、批量写入
+│   ├── pg.zig            # PostgreSQL C 绑定：libpq exec/execParams 封装
 │   ├── indexer.zig       # 单合约同步循环、重放、快照
 │   ├── http_server.zig   # HTTP API：路由、CORS、缓存、指标
 │   ├── abi.zig           # ABI JSON 解析、事件签名（Keccak-256）、日志解码
@@ -218,7 +224,9 @@ timeout = 10000
 retry_count = 3
 
 [database]
+# type = "sqlite"              # or "rocksdb" or "postgresql"
 type = "sqlite"
+# For PostgreSQL: db_name = "host=localhost port=5432 dbname=zponder"
 db_name = "eth_indexer.db"
 
 [http]

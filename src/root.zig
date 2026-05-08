@@ -13,9 +13,10 @@ pub const db = @import("db.zig");
 pub const indexer = @import("indexer.zig");
 pub const http_server = @import("http_server.zig");
 pub const cache = @import("cache.zig");
+pub const rocksdb = @import("rocksdb.zig");
+pub const pg = @import("pg.zig");
 
 test {
-    // 运行所有子模块的测试
     _ = config;
     _ = utils;
     _ = abi;

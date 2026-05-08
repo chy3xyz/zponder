@@ -10,11 +10,12 @@ url = "https://eth-mainnet.g.alchemy.com/v2/your-api-key"
 timeout = 10000             # 超时时间（毫秒）
 retry_count = 3             # 重试次数
 
-# 数据库配置（postgresql/sqlite）
+# 数据库配置（sqlite / rocksdb / postgresql）
 [database]
-type = "sqlite"             # 数据库类型: postgresql | sqlite
-db_name = "eth_indexer.db"  # SQLite 数据库文件名
-max_connections = 10        # 最大连接数
+type = "sqlite"             # sqlite | rocksdb | postgresql
+db_name = "eth_indexer.db"  # SQLite: .db 文件; RocksDB: 目录; PostgreSQL: 连接串
+# PostgreSQL 连接串示例: "host=localhost port=5432 dbname=zponder user=postgres"
+max_connections = 10        # 最大连接数 (仅 SQLite)
 
 # HTTP 服务配置
 [http]
@@ -38,3 +39,23 @@ address = "0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D"
 abi_path = "./abis/erc721.abi"
 from_block = 12965000
 events = ["Transfer"]
+
+# ============================================================
+# 自定义 SQL 查询（可选）
+#   通过 /queries/:name 端点执行，支持 SELECT, JOIN, GROUP BY
+#   SQL 中使用 $param_name 作为命名占位符
+#   参数格式: "name:type:default"
+# ============================================================
+# [[queries]]
+# name = "dai_top_holders"
+# path = "/queries/dai_top_holders"
+# sql = """
+#   SELECT evt_to AS holder, SUM(CAST(evt_value AS DECIMAL)) AS balance
+#   FROM event_dai_Transfer
+#   WHERE block_number <= $block_to
+#   GROUP BY evt_to
+#   ORDER BY balance DESC
+#   LIMIT $limit
+# """
+# params = ["limit:u32:10", "block_to:u64:99999999"]
+# cache_ttl_blocks = 100

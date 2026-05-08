@@ -61,6 +61,20 @@ pub const DatabaseConfig = struct {
     max_connections: u32,
 };
 
+pub const QueryParam = struct {
+    name: []const u8,
+    param_type: []const u8,
+    default_value: []const u8,
+};
+
+pub const QueryConfig = struct {
+    name: []const u8,
+    path: []const u8,
+    sql: []const u8,
+    params: []const QueryParam,
+    cache_ttl_blocks: u64,
+};
+
 pub const Config = struct {
     alloc: std.mem.Allocator,
     global: GlobalConfig,
@@ -68,6 +82,7 @@ pub const Config = struct {
     http: HttpConfig,
     database: DatabaseConfig,
     contracts: []const ContractConfig,
+    queries: []const QueryConfig,
 
     pub fn deinit(self: *Config, alloc: std.mem.Allocator) void {
         alloc.free(self.global.log_level);
@@ -95,6 +110,18 @@ pub const Config = struct {
             alloc.free(c.filters);
         }
         alloc.free(self.contracts);
+        for (self.queries) |q| {
+            alloc.free(q.name);
+            alloc.free(q.path);
+            alloc.free(q.sql);
+            for (q.params) |p| {
+                alloc.free(p.name);
+                alloc.free(p.param_type);
+                alloc.free(p.default_value);
+            }
+            alloc.free(q.params);
+        }
+        alloc.free(self.queries);
     }
 };
 
@@ -225,6 +252,40 @@ fn parseFilters(alloc: std.mem.Allocator, value: []const u8) ![]const EventFilte
     return &.{};
 }
 
+fn parseQueryParams(alloc: std.mem.Allocator, value: []const u8) ![]const QueryParam {
+    const t = trim(value);
+    if (t.len >= 2 and t[0] == '[' and t[t.len - 1] == ']') {
+        const inner = t[1 .. t.len - 1];
+        var list: std.ArrayList(QueryParam) = .empty;
+        errdefer {
+            for (list.items) |p| {
+                alloc.free(p.name);
+                alloc.free(p.param_type);
+                alloc.free(p.default_value);
+            }
+            list.deinit(alloc);
+        }
+        var it = std.mem.splitScalar(u8, inner, ',');
+        while (it.next()) |part| {
+            const item = trim(part);
+            if (item.len == 0) continue;
+            const unquoted = try unquote(alloc, item);
+            defer alloc.free(unquoted);
+            var pit = std.mem.splitScalar(u8, unquoted, ':');
+            const param_name = pit.next() orelse continue;
+            const param_type = pit.next() orelse continue;
+            const param_default = pit.next() orelse "";
+            try list.append(alloc, .{
+                .name = try alloc.dupe(u8, param_name),
+                .param_type = try alloc.dupe(u8, param_type),
+                .default_value = try alloc.dupe(u8, param_default),
+            });
+        }
+        return list.toOwnedSlice(alloc);
+    }
+    return &.{};
+}
+
 pub fn load(alloc: std.mem.Allocator, io: std.Io, config_path: []const u8) !Config {
     const content = try std.Io.Dir.cwd().readFileAlloc(io, config_path, alloc, .limited(1024 * 1024));
     defer alloc.free(content);
@@ -287,6 +348,22 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
         contracts.deinit(alloc);
     }
 
+    var queries: std.ArrayList(QueryConfig) = .empty;
+    errdefer {
+        for (queries.items) |q| {
+            alloc.free(q.name);
+            alloc.free(q.path);
+            alloc.free(q.sql);
+            for (q.params) |p| {
+                alloc.free(p.name);
+                alloc.free(p.param_type);
+                alloc.free(p.default_value);
+            }
+            alloc.free(q.params);
+        }
+        queries.deinit(alloc);
+    }
+
     const Section = enum {
         none,
         global,
@@ -294,9 +371,11 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
         database,
         http,
         contracts,
+        queries,
     };
     var section: Section = .none;
     var current_contract: ?ContractConfig = null;
+    var current_query: ?QueryConfig = null;
 
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line_raw| {
@@ -305,10 +384,14 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
         if (std.mem.startsWith(u8, line, "#")) continue;
 
         if (std.mem.startsWith(u8, line, "[") and std.mem.endsWith(u8, line, "]")) {
-            // 保存之前的合约
+            // 保存之前的合约/查询
             if (current_contract) |cc| {
                 try contracts.append(alloc, cc);
                 current_contract = null;
+            }
+            if (current_query) |cq| {
+                try queries.append(alloc, cq);
+                current_query = null;
             }
             // 处理 [[section]] 和 [section] 两种格式
             var section_name = line[1 .. line.len - 1];
@@ -336,6 +419,15 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
                     .max_reorg_depth = null,
                     .block_batch_size = null,
                     .filters = &.{},
+                };
+            } else if (std.mem.eql(u8, section_name, "queries")) {
+                section = .queries;
+                current_query = QueryConfig{
+                    .name = try alloc.dupe(u8, ""),
+                    .path = try alloc.dupe(u8, ""),
+                    .sql = try alloc.dupe(u8, ""),
+                    .params = &.{},
+                    .cache_ttl_blocks = 0,
                 };
             } else {
                 section = .none;
@@ -369,6 +461,24 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
                 cc.max_reorg_depth = try parseU32(value);
             } else if (std.mem.eql(u8, key, "block_batch_size")) {
                 cc.block_batch_size = try parseU32(value);
+            }
+            continue;
+        }
+
+        if (current_query) |*cq| {
+            if (std.mem.eql(u8, key, "name")) {
+                if (cq.name.len > 0) alloc.free(cq.name);
+                cq.name = try unquote(alloc, value);
+            } else if (std.mem.eql(u8, key, "path")) {
+                if (cq.path.len > 0) alloc.free(cq.path);
+                cq.path = try unquote(alloc, value);
+            } else if (std.mem.eql(u8, key, "sql")) {
+                if (cq.sql.len > 0) alloc.free(cq.sql);
+                cq.sql = try unquote(alloc, value);
+            } else if (std.mem.eql(u8, key, "params")) {
+                cq.params = try parseQueryParams(alloc, value);
+            } else if (std.mem.eql(u8, key, "cache_ttl_blocks")) {
+                cq.cache_ttl_blocks = try parseU64(value);
             }
             continue;
         }
@@ -453,13 +563,21 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
     if (current_contract) |cc| {
         try contracts.append(alloc, cc);
     }
+    if (current_query) |cq| {
+        try queries.append(alloc, cq);
+    }
 
-    // 深拷贝 contracts 到最终结果
     var final_contracts = try alloc.alloc(ContractConfig, contracts.items.len);
     for (contracts.items, 0..) |c, i| {
         final_contracts[i] = c;
     }
     contracts.deinit(alloc);
+
+    var final_queries = try alloc.alloc(QueryConfig, queries.items.len);
+    for (queries.items, 0..) |q, i| {
+        final_queries[i] = q;
+    }
+    queries.deinit(alloc);
 
     const cfg = Config{
         .alloc = alloc,
@@ -468,6 +586,7 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
         .http = http,
         .database = database,
         .contracts = final_contracts,
+        .queries = final_queries,
     };
 
     return cfg;
@@ -507,11 +626,32 @@ pub fn validate(cfg: *const Config) !void {
         }
     }
 
+    for (cfg.queries) |q| {
+        if (q.name.len == 0) {
+            log.err("配置错误: 查询名不能为空", .{});
+            errors += 1;
+        }
+        if (q.path.len == 0) {
+            log.err("配置错误: 查询 {s} 的 path 不能为空", .{q.name});
+            errors += 1;
+        }
+        if (q.sql.len == 0) {
+            log.err("配置错误: 查询 {s} 的 sql 不能为空", .{q.name});
+            errors += 1;
+        }
+        // 安全校验：只允许 SELECT 查询
+        const sql_upper = trim(q.sql);
+        if (!std.ascii.startsWithIgnoreCase(sql_upper, "select")) {
+            log.err("配置错误: 查询 {s} 只允许 SELECT 语句", .{q.name});
+            errors += 1;
+        }
+    }
+
     if (errors > 0) {
         return error.InvalidConfig;
     }
 
-    log.info("配置验证通过: 发现 {d} 个合约", .{cfg.contracts.len});
+    log.info("配置验证通过: 发现 {d} 个合约, {d} 个自定义查询", .{cfg.contracts.len, cfg.queries.len});
 }
 
 // ============================================================================
@@ -726,4 +866,53 @@ test "config load empty string" {
     defer cfg.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 0), cfg.contracts.len);
     try std.testing.expectEqualStrings("info", cfg.global.log_level);
+}
+
+test "config parse queries" {
+    const alloc = std.testing.allocator;
+    const toml =
+        \\[rpc]
+        \\url = "https://example.com"
+        \\
+        \\[[queries]]
+        \\name = "top_transfers"
+        \\path = "/queries/top_transfers"
+        \\sql = "SELECT evt_from, SUM(CAST(evt_value AS DECIMAL)) AS total FROM event_dai_Transfer GROUP BY evt_from ORDER BY total DESC LIMIT $limit"
+        \\params = ["limit:u32:100", "min_value:string:"]
+        \\cache_ttl_blocks = 50
+        \\
+        \\[[queries]]
+        \\name = "holder_balance"
+        \\path = "/queries/holder_balance"
+        \\sql = "SELECT * FROM event_dai_Transfer WHERE evt_from = $address LIMIT 100"
+        \\params = ["address:string:0x0"]
+    ;
+    var cfg = try loadFromString(alloc, toml);
+    defer cfg.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), cfg.queries.len);
+    try std.testing.expectEqualStrings("top_transfers", cfg.queries[0].name);
+    try std.testing.expectEqualStrings("/queries/top_transfers", cfg.queries[0].path);
+    try std.testing.expectEqual(@as(usize, 2), cfg.queries[0].params.len);
+    try std.testing.expectEqualStrings("limit", cfg.queries[0].params[0].name);
+    try std.testing.expectEqualStrings("u32", cfg.queries[0].params[0].param_type);
+    try std.testing.expectEqualStrings("100", cfg.queries[0].params[0].default_value);
+    try std.testing.expectEqual(@as(u64, 50), cfg.queries[0].cache_ttl_blocks);
+}
+
+test "config validate rejects non-select query" {
+    const alloc = std.testing.allocator;
+    const toml =
+        \\[rpc]
+        \\url = "https://example.com"
+        \\
+        \\[[queries]]
+        \\name = "bad"
+        \\path = "/queries/bad"
+        \\sql = "DELETE FROM event_dai_Transfer"
+        \\params = []
+    ;
+    var cfg = try loadFromString(alloc, toml);
+    defer cfg.deinit(alloc);
+    try std.testing.expectError(error.InvalidConfig, validate(&cfg));
 }

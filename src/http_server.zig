@@ -69,6 +69,7 @@ pub const Server = struct {
     database: *db.Client,
     cache: *cache.Cache,
     indexers: []*indexer.Indexer,
+    queries: []const config.QueryConfig,
     listen_socket: ?std.Io.net.Server,
     thread: ?std.Thread,
     running: std.atomic.Value(bool),
@@ -82,6 +83,7 @@ pub const Server = struct {
         database: *db.Client,
         c: *cache.Cache,
         indexers: []*indexer.Indexer,
+        queries: []const config.QueryConfig,
     ) Server {
         const rps = @as(f64, @floatFromInt(cfg.rate_limit_rps orelse 0));
         const burst = @as(f64, @floatFromInt(cfg.rate_limit_burst orelse 0));
@@ -92,6 +94,7 @@ pub const Server = struct {
             .database = database,
             .cache = c,
             .indexers = indexers,
+            .queries = queries,
             .listen_socket = null,
             .thread = null,
             .running = std.atomic.Value(bool).init(false),
@@ -248,6 +251,8 @@ pub const Server = struct {
             try self.handleVersion(request);
         } else if (method == .POST and std.mem.eql(u8, target, "/replay")) {
             try self.handleReplay(request);
+        } else if (method == .GET and std.mem.startsWith(u8, target, "/queries/")) {
+            try self.handleQuery(request);
         } else {
             try self.sendJson(request, "{\"error\":\"Not Found\"}", .not_found);
         }
@@ -307,10 +312,10 @@ pub const Server = struct {
                 .replaying => "replaying",
             };
             try buf.writer.writeAll("{\"name\":\"");
-            try utils.jsonEscapeString(buf.writer, idx.contract.name);
+            try utils.jsonEscapeString(&buf.writer, idx.contract.name);
             try buf.writer.writeAll("\",\"address\":\"");
-            try utils.jsonEscapeString(buf.writer, idx.contract.address);
-            try buf.writer.print("\",\"current_block\":{d},\"status\":\"{s}\"}", .{ idx.getCurrentBlock(), status_str });
+            try utils.jsonEscapeString(&buf.writer, idx.contract.address);
+            try buf.writer.print("\",\"current_block\":{},\"status\":\"{s}\"}}", .{ idx.getCurrentBlock(), status_str });
         }
         try buf.writer.writeAll("]");
 
@@ -489,16 +494,16 @@ pub const Server = struct {
         for (self.indexers, 0..) |idx, i| {
             if (i > 0) try buf.writer.writeByte(',');
             try buf.writer.writeAll("{\"name\":\"");
-            try utils.jsonEscapeString(buf.writer, idx.contract.name);
+            try utils.jsonEscapeString(&buf.writer, idx.contract.name);
             try buf.writer.writeAll("\",\"address\":\"");
-            try utils.jsonEscapeString(buf.writer, idx.contract.address);
+            try utils.jsonEscapeString(&buf.writer, idx.contract.address);
             try buf.writer.writeAll("\",\"abi_path\":\"");
-            try utils.jsonEscapeString(buf.writer, idx.contract.abi_path);
+            try utils.jsonEscapeString(&buf.writer, idx.contract.abi_path);
             try buf.writer.print("\",\"from_block\":{d},\"events\":[", .{idx.contract.from_block});
             for (idx.contract.events, 0..) |evt, j| {
                 if (j > 0) try buf.writer.writeByte(',');
                 try buf.writer.writeByte('"');
-                try utils.jsonEscapeString(buf.writer, evt);
+                try utils.jsonEscapeString(&buf.writer, evt);
                 try buf.writer.writeByte('"');
             }
             try buf.writer.writeAll("]}");
@@ -522,6 +527,7 @@ pub const Server = struct {
         try buf.writer.writeAll("{\"path\":\"/cache/stats\",\"method\":\"GET\",\"description\":\"缓存统计\"},");
         try buf.writer.writeAll("{\"path\":\"/metrics\",\"method\":\"GET\",\"description\":\"Prometheus 指标\"},");
         try buf.writer.writeAll("{\"path\":\"/version\",\"method\":\"GET\",\"description\":\"版本信息\"},");
+        try buf.writer.writeAll("{\"path\":\"/queries/:name\",\"method\":\"GET\",\"description\":\"执行自定义 SQL 查询\"},");
         try buf.writer.writeAll("{\"path\":\"/events/:contract/:event\",\"method\":\"GET\",\"description\":\"查询事件日志\",\"params\":[");
         try buf.writer.writeAll("{\"name\":\"block_from\",\"type\":\"integer\",\"optional\":true,\"description\":\"起始区块\"},");
         try buf.writer.writeAll("{\"name\":\"block_to\",\"type\":\"integer\",\"optional\":true,\"description\":\"结束区块\"},");
@@ -702,6 +708,159 @@ pub const Server = struct {
         }
 
         try self.sendJson(request, "{\"status\":\"replaying\"}", .ok);
+    }
+
+    // ========================================================================
+    // 自定义 SQL 查询 (config-driven)
+    // ========================================================================
+    fn handleQuery(self: *Server, request: *std.http.Server.Request) !void {
+        const prefix = "/queries/";
+        const rest = request.head.target[prefix.len..];
+        const query_name = if (std.mem.indexOf(u8, rest, "?")) |qs| rest[0..qs] else rest;
+
+        if (query_name.len == 0) {
+            try self.sendJson(request, "{\"error\":\"missing query name, use /queries/:name\"}", .bad_request);
+            return;
+        }
+
+        // 查找配置的查询定义
+        var query_cfg: ?*const config.QueryConfig = null;
+        for (self.queries) |*q| {
+            if (std.mem.eql(u8, q.name, query_name)) {
+                query_cfg = q;
+                break;
+            }
+        }
+        const qc = query_cfg orelse {
+            try self.sendJson(request, "{\"error\":\"query not found\"}", .not_found);
+            return;
+        };
+
+        if (self.database.backend_type == .rocksdb) {
+            try self.sendJson(request, "{\"error\":\"SQL queries require SQLite or PostgreSQL backend\"}", .bad_request);
+            return;
+        }
+
+        // 解析查询参数
+        var param_values = std.ArrayList([]const u8).empty;
+        defer {
+            for (param_values.items) |v| self.alloc.free(v);
+            param_values.deinit(self.alloc);
+        }
+        var param_names = std.ArrayList([]const u8).empty;
+        defer param_names.deinit(self.alloc);
+
+        const query_start = std.mem.indexOf(u8, request.head.target, "?");
+        if (query_start) |qs| {
+            const query = request.head.target[qs + 1 ..];
+            var param_it = std.mem.splitSequence(u8, query, "&");
+            while (param_it.next()) |param| {
+                var kv = std.mem.splitSequence(u8, param, "=");
+                const key = kv.next() orelse continue;
+                const val = kv.next() orelse continue;
+                const decoded = urlDecodeAlloc(self.alloc, val) catch continue;
+
+                // 检查是否为配置的参数
+                var matched = false;
+                for (qc.params) |p| {
+                    if (std.mem.eql(u8, key, p.name)) {
+                        try param_names.append(self.alloc, p.name);
+                        try param_values.append(self.alloc, decoded);
+                        matched = true;
+                        break;
+                    }
+                }
+                if (!matched) self.alloc.free(decoded);
+            }
+        }
+
+        // 补全未提供的参数（使用默认值）
+        for (qc.params) |p| {
+            var found = false;
+            for (param_names.items) |n| {
+                if (std.mem.eql(u8, n, p.name)) { found = true; break; }
+            }
+            if (!found) {
+                try param_names.append(self.alloc, p.name);
+                try param_values.append(self.alloc, try self.alloc.dupe(u8, p.default_value));
+            }
+        }
+
+        // 转换 SQL：将 $param_name 替换为后端口占位符
+        var translated_sql = std.ArrayList(u8).empty;
+        defer translated_sql.deinit(self.alloc);
+        var i: usize = 0;
+        while (i < qc.sql.len) {
+            if (qc.sql[i] == '$' and i + 1 < qc.sql.len) {
+                // 尝试匹配参数名
+                const rest_sql = qc.sql[i + 1 ..];
+                var param_idx: ?usize = null;
+                var name_len: usize = 0;
+                for (param_names.items, 0..) |name, pi| {
+                    if (std.mem.startsWith(u8, rest_sql, name)) {
+                        // 确保是单词边界
+                        const after = i + 1 + name.len;
+                        if (after >= qc.sql.len or !std.ascii.isAlphanumeric(qc.sql[after]) and qc.sql[after] != '_') {
+                            param_idx = pi;
+                            name_len = name.len;
+                            break;
+                        }
+                    }
+                }
+                if (param_idx) |pi| {
+                    if (self.database.backend_type == .postgresql) {
+                        try translated_sql.print(self.alloc, "${d}", .{pi + 1});
+                    } else {
+                        try translated_sql.append(self.alloc, '?');
+                    }
+                    i += 1 + name_len;
+                    continue;
+                }
+            }
+            try translated_sql.append(self.alloc, qc.sql[i]);
+            i += 1;
+        }
+
+        // 缓存键
+        var cache_key_buf = std.ArrayList(u8).empty;
+        defer cache_key_buf.deinit(self.alloc);
+        try cache_key_buf.print(self.alloc, "q:{s}:", .{query_name});
+        for (param_values.items) |v| {
+            try cache_key_buf.print(self.alloc, "{s}:", .{v});
+        }
+
+        const cache_key = try cache_key_buf.toOwnedSlice(self.alloc);
+        defer self.alloc.free(cache_key);
+
+        // 缓存检查
+        var current_sync_block: u64 = 0;
+        for (self.indexers) |idx| {
+            const b = idx.getCurrentBlock();
+            if (b > current_sync_block) current_sync_block = b;
+        }
+        if (self.cache.get(cache_key, current_sync_block)) |cached| {
+            try self.sendJson(request, cached, .ok);
+            return;
+        }
+
+        // 执行查询
+        const result = self.database.execQuery(
+            translated_sql.items,
+            param_names.items,
+            param_values.items,
+        ) catch |e| {
+            log.warn("自定义查询 {s} 失败: {any}", .{ query_name, e });
+            try self.sendJson(request, "{\"error\":\"query execution failed\"}", .internal_server_error);
+            return;
+        };
+        defer self.alloc.free(result);
+
+        // 写入缓存
+        _ = self.cache.put(cache_key, result, current_sync_block) catch {
+            log.debug("查询缓存写入失败: {s}", .{query_name});
+        };
+
+        try self.sendJson(request, result, .ok);
     }
 };
 
