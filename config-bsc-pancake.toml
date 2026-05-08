@@ -1,0 +1,43 @@
+# zponder — BNB Chain PancakeSwap K线图演示配置
+#
+# 使用方法:
+#   1. 获取 BscScan API Key: https://bscscan.com/myapikey
+#   2. 替换 etherscan_api_key
+#   3. 启动: zig build run -- -c config-bsc-pancake.toml
+#   4. 浏览器打开: examples/kline.html
+
+[global]
+log_level = "info"
+log_file = "./logs/indexer.log"
+snapshot_interval = 3600
+chain = "bsc"
+etherscan_api_key = ""  # 填你的 BscScan API Key（可选，留空则手动提供 ABI）
+
+[rpc]
+url = "https://bsc-dataseed.binance.org"
+timeout = 10000
+retry_count = 3
+
+[database]
+type = "sqlite"
+db_name = "bsc_pancake.db"
+
+[http]
+port = 8080
+host = "0.0.0.0"
+
+# BUSD/WBNB Pair (PancakeSwap V2)
+[[contracts]]
+name = "busd_wbnb"
+address = "0x58f876857a02d6762e0101bb5c46a3f4e5d07bf3"
+abi_path = "./abis/pancake_pair.abi"
+from_block = 20000000
+events = ["Swap", "Sync"]
+
+# CAKE/WBNB Pair (PancakeSwap V2)
+[[contracts]]
+name = "cake_wbnb"
+address = "0x0eD7e52944161450477ee417DE9Cd3a859b14fD0"
+abi_path = "./abis/pancake_pair.abi"
+from_block = 20000000
+events = ["Swap", "Sync"]

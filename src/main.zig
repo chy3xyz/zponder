@@ -100,8 +100,8 @@ pub fn main(init: std.process.Init) !void {
     log.info("RPC: {s}, 数据库: {s}", .{ cfg.rpc.url, cfg.database.db_type });
 
     // 3. 自动获取 ABI + 自动发现事件
-    const resolved = try resolveEvents(alloc, init.io, &cfg);
-    // ABI auto-fetch is done inside resolveEvents if needed
+    var resolved = try resolveEvents(alloc, init.io, &cfg);
+    defer resolved.deinit();
 
     // 4. 初始化查询缓存
     var query_cache = cache.Cache.init(alloc, 1000, 64 * 1024 * 1024);
@@ -331,20 +331,27 @@ fn readLine(alloc: std.mem.Allocator, io: std.Io, stdin_file: std.Io.File, defau
 /// 解析 ABI 并自动发现事件（当 events 为空时），同时自动获取 ABI
 const ResolvedConfig = struct {
     contracts: []config.ContractConfig,
+    owned: []bool, // 标记哪些 contracts 的 events 是 resolveEvents 分配的
     alloc: std.mem.Allocator,
 
     pub fn deinit(self: *ResolvedConfig) void {
-        for (self.contracts) |*c| {
-            for (c.events) |e| self.alloc.free(e);
-            self.alloc.free(c.events);
+        for (self.contracts, self.owned) |*c, owned| {
+            if (owned) {
+                for (c.events) |e| self.alloc.free(e);
+                self.alloc.free(c.events);
+            }
         }
         self.alloc.free(self.contracts);
+        self.alloc.free(self.owned);
     }
 };
 
 fn resolveEvents(alloc: std.mem.Allocator, io: std.Io, cfg: *const config.Config) !ResolvedConfig {
     var resolved = try alloc.alloc(config.ContractConfig, cfg.contracts.len);
     errdefer alloc.free(resolved);
+    var owned = try alloc.alloc(bool, cfg.contracts.len);
+    errdefer alloc.free(owned);
+    @memset(owned, false);
 
     for (cfg.contracts, 0..) |c, i| {
         resolved[i] = c;
@@ -398,8 +405,9 @@ fn resolveEvents(alloc: std.mem.Allocator, io: std.Io, cfg: *const config.Config
             alloc.free(resolved[i].events);
         }
         resolved[i].events = try events.toOwnedSlice(alloc);
+        owned[i] = true; // 标记为 resolveEvents 分配
         log.info("合约 {s}: 自动发现 {d} 个事件", .{ c.name, resolved[i].events.len });
     }
 
-    return .{ .contracts = resolved, .alloc = alloc };
+    return .{ .contracts = resolved, .owned = owned, .alloc = alloc };
 }
