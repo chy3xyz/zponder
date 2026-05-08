@@ -177,47 +177,79 @@ fn cmdInit(alloc: std.mem.Allocator, io: std.Io) !void {
     const stdin = std.Io.File.stdin();
 
     const prompt =
-        \\╔══════════════════════════════════════╗
-        \\║     zponder 交互式配置向导           ║
-        \\╚══════════════════════════════════════╝
+        \\╔══════════════════════════════════════════╗
+        \\║      zponder 交互式配置向导              ║
+        \\╚══════════════════════════════════════════╝
         \\
         \\按提示输入，直接回车使用默认值。
         \\
     ;
     stdout.writeStreamingAll(io, prompt) catch {};
 
+    // Chain
+    try stdout.writeStreamingAll(io,
+        \\1. 区块链:
+        \\   ethereum | bsc | polygon
+        \\
+    );
+    const chain_str = try readLine(alloc, io, stdin, "ethereum");
+    defer alloc.free(chain_str);
+    const chain = etherscan.Chain.fromString(chain_str) orelse etherscan.Chain.ethereum;
+
+    // Show known contracts for this chain
+    const known = chain.knownContracts();
+    if (known.len > 0) {
+        try stdout.writeStreamingAll(io, "   知名合约 (可直接输入地址):\n");
+        for (known) |kc| {
+            var line_buf: [256]u8 = undefined;
+            const line = try std.fmt.bufPrint(&line_buf, "     {s}: {s}\n", .{ kc.name, kc.address });
+            try stdout.writeStreamingAll(io, line);
+        }
+    }
+
     // RPC URL
-    try stdout.writeStreamingAll(io, "1. Ethereum RPC URL:\n   ");
-    const rpc_url = try readLine(alloc, io, stdin, "https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY");
+    try stdout.writeStreamingAll(io, "\n2. RPC URL:\n   ");
+    const rpc_url = try readLine(alloc, io, stdin, chain.defaultRpc());
     defer alloc.free(rpc_url);
 
-    // Etherscan key
-    try stdout.writeStreamingAll(io, "2. Etherscan API Key (用于自动获取 ABI):\n   ");
-    const etherscan_key = try readLine(alloc, io, stdin, "");
-    defer alloc.free(etherscan_key);
+    // Explorer API key
+    const explorer_name = switch (chain) {
+        .ethereum => "Etherscan",
+        .bsc => "BscScan",
+        .polygon => "PolygonScan",
+    };
+    {
+        var prompt_buf: [128]u8 = undefined;
+        const p = try std.fmt.bufPrint(&prompt_buf, "3. {s} API Key (用于自动获取 ABI):\n   ", .{explorer_name});
+        try stdout.writeStreamingAll(io, p);
+    }
+    const explorer_key = try readLine(alloc, io, stdin, "");
+    defer alloc.free(explorer_key);
 
     // Contract address
-    try stdout.writeStreamingAll(io, "3. 合约地址:\n   ");
-    const contract_addr = try readLine(alloc, io, stdin, "0x6b175474e89094c44da98b954eedeac495271d0f");
+    try stdout.writeStreamingAll(io, "4. 合约地址:\n   ");
+    const default_addr = if (known.len > 0) known[0].address else "0x...";
+    const contract_addr = try readLine(alloc, io, stdin, default_addr);
     defer alloc.free(contract_addr);
 
     // Contract name
-    try stdout.writeStreamingAll(io, "4. 合约名称 (用于表名前缀):\n   ");
-    const contract_name = try readLine(alloc, io, stdin, "dai");
+    try stdout.writeStreamingAll(io, "5. 合约名称 (用于表名前缀):\n   ");
+    const default_name = if (known.len > 0) known[0].name else "contract";
+    const contract_name = try readLine(alloc, io, stdin, default_name);
     defer alloc.free(contract_name);
 
     // Events
-    try stdout.writeStreamingAll(io, "5. 监听事件 (逗号分隔, * 表示全部):\n   ");
+    try stdout.writeStreamingAll(io, "6. 监听事件 (逗号分隔, * 表示全部):\n   ");
     const events_str = try readLine(alloc, io, stdin, "*");
     defer alloc.free(events_str);
 
     // Database
-    try stdout.writeStreamingAll(io, "6. 数据库类型 (sqlite / rocksdb / postgresql):\n   ");
+    try stdout.writeStreamingAll(io, "7. 数据库类型 (sqlite / rocksdb / postgresql):\n   ");
     const db_type = try readLine(alloc, io, stdin, "sqlite");
     defer alloc.free(db_type);
 
     // From block
-    try stdout.writeStreamingAll(io, "7. 起始区块 (0 = 自动选择):\n   ");
+    try stdout.writeStreamingAll(io, "8. 起始区块 (0 = 从头开始):\n   ");
     const from_block_str = try readLine(alloc, io, stdin, "0");
     defer alloc.free(from_block_str);
 
@@ -226,13 +258,14 @@ fn cmdInit(alloc: std.mem.Allocator, io: std.Io) !void {
     defer buf.deinit();
 
     try buf.writer.print(
-        \\# zponder 配置 — 由 `zponder init` 生成
+        \\# zponder 配置 — 由 `zponder init` 生成 ({s})
         \\
         \\[global]
         \\log_level = "info"
         \\log_file = "./logs/indexer.log"
         \\snapshot_interval = 3600
         \\etherscan_api_key = "{s}"
+        \\chain = "{s}"
         \\
         \\[rpc]
         \\url = "{s}"
@@ -241,7 +274,7 @@ fn cmdInit(alloc: std.mem.Allocator, io: std.Io) !void {
         \\
         \\[database]
         \\type = "{s}"
-        \\db_name = "eth_indexer.db"
+        \\db_name = "{s}_indexer.db"
         \\
         \\[http]
         \\port = 8080
@@ -254,9 +287,12 @@ fn cmdInit(alloc: std.mem.Allocator, io: std.Io) !void {
         \\events = [{s}]
         \\
     , .{
-        etherscan_key,
+        chain.name(),
+        explorer_key,
+        chain_str,
         rpc_url,
         db_type,
+        chain_str,
         contract_name,
         contract_addr,
         from_block_str,
@@ -316,7 +352,8 @@ fn resolveEvents(alloc: std.mem.Allocator, io: std.Io, cfg: *const config.Config
         // 自动获取 ABI（如果 abi_path 为空且有 etherscan key）
         if (c.abi_path.len == 0) {
             if (cfg.global.etherscan_api_key.len > 0) {
-                const abi_json = etherscan.fetchAbi(alloc, io, cfg.global.etherscan_api_key, c.address) catch |e| {
+                const chain = etherscan.Chain.fromString(cfg.global.chain) orelse .ethereum;
+                const abi_json = etherscan.fetchAbi(alloc, io, chain, cfg.global.etherscan_api_key, c.address) catch |e| {
                     log.err("获取合约 {s} ABI 失败: {any}", .{ c.name, e });
                     return e;
                 };

@@ -26,6 +26,7 @@ pub const GlobalConfig = struct {
     log_file: []const u8,
     snapshot_interval: u64,
     etherscan_api_key: []const u8,
+    chain: []const u8,            // "ethereum" | "bsc" | "polygon"
 };
 
 pub const IndexerConfig = struct {
@@ -89,6 +90,7 @@ pub const Config = struct {
         alloc.free(self.global.log_level);
         alloc.free(self.global.log_file);
         alloc.free(self.global.etherscan_api_key);
+        alloc.free(self.global.chain);
         alloc.free(self.rpc.url);
         alloc.free(self.http.host);
         if (self.http.cors_origins.len > 0) {
@@ -303,11 +305,13 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
         .log_file = try alloc.dupe(u8, ""),
         .snapshot_interval = 0,
         .etherscan_api_key = try alloc.dupe(u8, ""),
+        .chain = try alloc.dupe(u8, "ethereum"),
     };
     errdefer {
         alloc.free(global.log_level);
         alloc.free(global.log_file);
         alloc.free(global.etherscan_api_key);
+        alloc.free(global.chain);
     }
     var rpc = RpcConfig{
         .url = try alloc.dupe(u8, ""),
@@ -500,6 +504,9 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
                 } else if (std.mem.eql(u8, key, "etherscan_api_key")) {
                     alloc.free(global.etherscan_api_key);
                     global.etherscan_api_key = try unquote(alloc, value);
+                } else if (std.mem.eql(u8, key, "chain")) {
+                    alloc.free(global.chain);
+                    global.chain = try unquote(alloc, value);
                 }
             },
             .rpc => {

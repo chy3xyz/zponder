@@ -1,9 +1,10 @@
 # 全局配置
 [global]
-log_level = "info"              # debug/info/warn/error
+log_level = "info"
 log_file = "./logs/indexer.log"
 snapshot_interval = 3600        # 快照周期（秒），0 表示不开启
-etherscan_api_key = ""          # Etherscan API Key（用于自动获取 ABI）
+etherscan_api_key = ""          # 区块浏览器 API Key（自动获取 ABI）
+chain = "ethereum"              # ethereum | bsc | polygon
 
 # RPC 配置
 [rpc]
@@ -27,19 +28,29 @@ cors = true                 # 是否允许跨域
 # 合约配置（可配置多个合约，数组形式）
 # 每个合约会自动根据其 ABI 中的事件定义创建对应的数据表
 # 表名格式：event_{name}_{EventName}
+# ============================================================
+# 合约配置 — 以太坊示例
+# ============================================================
 [[contracts]]
-name = "dai"                                           # 合约名称（用于表名前缀）
-address = "0x6b175474e89094c44da98b954eedeac495271d0f"  # DAI 合约地址
-abi_path = "./abis/erc20.abi"                            # ABI 文件路径
-from_block = 20000000                                    # 起始区块高度
-events = ["Transfer", "Approval"]                        # 要监听的事件
+name = "dai"
+address = "0x6b175474e89094c44da98b954eedeac495271d0f"
+abi_path = "./abis/erc20.abi"
+from_block = 20000000
+events = ["Transfer", "Approval"]
 
-[[contracts]]
-name = "bayc"
-address = "0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D"
-abi_path = "./abis/erc721.abi"
-from_block = 12965000
-events = ["Transfer"]
+# ============================================================
+# BNB Chain 示例 (chain = "bsc")
+#   PancakeSwap Router:  0x10ed43c718714eb63d5aa57b78b54704e256024e
+#   BUSD:                0xe9e7cea3dedca5984780bafc599bd69add087d56
+#   WBNB:                0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c
+#   CAKE:                0x0e09fabb73bd3ade0a17ecc321fd13a19e81ce82
+#
+# [[contracts]]
+# name = "busd"
+# address = "0xe9e7cea3dedca5984780bafc599bd69add087d56"
+# from_block = 6810700
+# events = ["Transfer"]
+# ============================================================
 
 # ============================================================
 # 自定义 SQL 查询（可选）
