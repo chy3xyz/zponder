@@ -1,8 +1,9 @@
 # 全局配置
 [global]
-log_level = "info"          # debug/info/warn/error
-log_file = "./logs/indexer.log"  # 日志文件路径
-snapshot_interval = 3600    # 快照周期（秒），0 表示不开启
+log_level = "info"              # debug/info/warn/error
+log_file = "./logs/indexer.log"
+snapshot_interval = 3600        # 快照周期（秒），0 表示不开启
+etherscan_api_key = ""          # Etherscan API Key（用于自动获取 ABI）
 
 # RPC 配置
 [rpc]

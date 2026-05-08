@@ -15,6 +15,7 @@ pub const http_server = @import("http_server.zig");
 pub const cache = @import("cache.zig");
 pub const rocksdb = @import("rocksdb.zig");
 pub const pg = @import("pg.zig");
+pub const etherscan = @import("etherscan.zig");
 
 test {
     _ = config;

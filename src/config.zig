@@ -25,6 +25,7 @@ pub const GlobalConfig = struct {
     log_level: []const u8,
     log_file: []const u8,
     snapshot_interval: u64,
+    etherscan_api_key: []const u8,
 };
 
 pub const IndexerConfig = struct {
@@ -87,6 +88,7 @@ pub const Config = struct {
     pub fn deinit(self: *Config, alloc: std.mem.Allocator) void {
         alloc.free(self.global.log_level);
         alloc.free(self.global.log_file);
+        alloc.free(self.global.etherscan_api_key);
         alloc.free(self.rpc.url);
         alloc.free(self.http.host);
         if (self.http.cors_origins.len > 0) {
@@ -300,10 +302,12 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
         .log_level = try alloc.dupe(u8, "info"),
         .log_file = try alloc.dupe(u8, ""),
         .snapshot_interval = 0,
+        .etherscan_api_key = try alloc.dupe(u8, ""),
     };
     errdefer {
         alloc.free(global.log_level);
         alloc.free(global.log_file);
+        alloc.free(global.etherscan_api_key);
     }
     var rpc = RpcConfig{
         .url = try alloc.dupe(u8, ""),
@@ -493,6 +497,9 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
                     global.log_file = try unquote(alloc, value);
                 } else if (std.mem.eql(u8, key, "snapshot_interval")) {
                     global.snapshot_interval = try parseU64(value);
+                } else if (std.mem.eql(u8, key, "etherscan_api_key")) {
+                    alloc.free(global.etherscan_api_key);
+                    global.etherscan_api_key = try unquote(alloc, value);
                 }
             },
             .rpc => {
@@ -616,14 +623,11 @@ pub fn validate(cfg: *const Config) !void {
             log.err("配置错误: 合约 {s} 的 address 不能为空", .{contract.name});
             errors += 1;
         }
-        if (contract.abi_path.len == 0) {
-            log.err("配置错误: 合约 {s} 的 abi_path 不能为空", .{contract.name});
+        if (contract.abi_path.len == 0 and cfg.global.etherscan_api_key.len == 0) {
+            log.err("配置错误: 合约 {s} 缺少 abi_path 且未配置 etherscan_api_key 进行自动获取", .{contract.name});
             errors += 1;
         }
-        if (contract.events.len == 0) {
-            log.err("配置错误: 合约 {s} 必须至少监听一个事件", .{contract.name});
-            errors += 1;
-        }
+        // events 为空时自动索引 ABI 中所有事件（不再报错）
     }
 
     for (cfg.queries) |q| {
