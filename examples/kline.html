@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>zponder — K线图示例 (PancakeSwap / Uniswap)</title>
+<script src="https://unpkg.com/lightweight-charts@5.0.1/dist/lightweight-charts.standalone.production.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+  #chart { width: 100%; height: 560px; }
+  .loading { animation: pulse 1.5s infinite; }
+  @keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:.5 } }
+</style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen">
+
+<!-- Header -->
+<header class="border-b border-gray-800 px-6 py-4">
+  <div class="max-w-7xl mx-auto flex items-center justify-between">
+    <div>
+      <h1 class="text-xl font-bold">zponder K线图</h1>
+      <p class="text-sm text-gray-400">基于链上 Swap 事件的 OHLC 聚合</p>
+    </div>
+    <div class="flex items-center gap-3">
+      <span id="status" class="w-2.5 h-2.5 rounded-full bg-green-500"></span>
+      <span id="statusText" class="text-sm text-gray-400">就绪</span>
+    </div>
+  </div>
+</header>
+
+<!-- Controls -->
+<div class="max-w-7xl mx-auto px-6 py-4">
+  <div class="flex flex-wrap gap-3 items-end">
+
+    <!-- Preset -->
+    <div>
+      <label class="block text-xs text-gray-500 mb-1">预设</label>
+      <select id="preset" class="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm">
+        <option value="pancake_busd_wbnb">PancakeSwap BUSD/WBNB (BSC)</option>
+        <option value="pancake_cake_wbnb">PancakeSwap CAKE/WBNB (BSC)</option>
+        <option value="uniswap_usdc_weth">Uniswap USDC/WETH (Ethereum)</option>
+        <option value="custom">自定义</option>
+      </select>
+    </div>
+
+    <!-- API -->
+    <div id="customFields" class="hidden flex flex-wrap gap-3">
+      <div><label class="block text-xs text-gray-500 mb-1">API 地址</label>
+        <input id="apiBase" class="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm w-80" value="http://localhost:8080"></div>
+      <div><label class="block text-xs text-gray-500 mb-1">合约</label>
+        <input id="contract" class="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm w-32"></div>
+      <div><label class="block text-xs text-gray-500 mb-1">事件</label>
+        <input id="event" class="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm w-32"></div>
+    </div>
+
+    <!-- Interval -->
+    <div>
+      <label class="block text-xs text-gray-500 mb-1">K线周期</label>
+      <select id="interval" class="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm">
+        <option value="60">1分钟</option>
+        <option value="300" selected>5分钟</option>
+        <option value="900">15分钟</option>
+        <option value="3600">1小时</option>
+        <option value="14400">4小时</option>
+      </select>
+    </div>
+
+    <!-- Lookback -->
+    <div>
+      <label class="block text-xs text-gray-500 mb-1">回溯区块</label>
+      <select id="lookback" class="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm">
+        <option value="5000">~5千块</option>
+        <option value="20000" selected>~2万块</option>
+        <option value="100000">~10万块</option>
+        <option value="500000">~50万块</option>
+      </select>
+    </div>
+
+    <button id="fetchBtn" class="bg-blue-600 hover:bg-blue-700 text-white rounded px-5 py-2 text-sm font-medium transition">
+      加载数据
+    </button>
+
+    <span id="blockRange" class="text-xs text-gray-500 self-end pb-2"></span>
+  </div>
+</div>
+
+<!-- Chart -->
+<div class="max-w-7xl mx-auto px-6">
+  <div id="chart" class="bg-gray-900 rounded-lg border border-gray-800"></div>
+</div>
+
+<!-- Stats bar -->
+<div id="stats" class="max-w-7xl mx-auto px-6 py-2 flex gap-6 text-xs text-gray-500"></div>
+
+<script>
+// ============================================================================
+// 预设配置
+// ============================================================================
+const PRESETS = {
+  pancake_busd_wbnb: {
+    apiBase: 'http://localhost:8080',
+    contractName: 'busd_wbnb',
+    eventName: 'Swap',
+    token0: 'BUSD', token1: 'WBNB',
+    amount0Field: 'evt_amount0in', amount1Field: 'evt_amount1out',
+    pairAddress: '0x58f876857a02d6762e0101bb5c46a3f4e5d07bf3',
+    desc: 'PancakeSwap V2 BUSD/WBNB'
+  },
+  pancake_cake_wbnb: {
+    apiBase: 'http://localhost:8080',
+    contractName: 'cake_wbnb',
+    eventName: 'Swap',
+    token0: 'CAKE', token1: 'WBNB',
+    amount0Field: 'evt_amount0in', amount1Field: 'evt_amount1out',
+    pairAddress: '0x0eD7e52944161450477ee417DE9Cd3a859b14fD0',
+    desc: 'PancakeSwap V2 CAKE/WBNB'
+  },
+  uniswap_usdc_weth: {
+    apiBase: 'http://localhost:8080',
+    contractName: 'usdc_weth',
+    eventName: 'Swap',
+    token0: 'USDC', token1: 'WETH',
+    amount0Field: 'evt_amount0in', amount1Field: 'evt_amount1out',
+    pairAddress: '0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc',
+    desc: 'Uniswap V2 USDC/WETH'
+  }
+};
+
+// ============================================================================
+// 状态
+// ============================================================================
+let chart = null, candleSeries = null, volumeSeries = null;
+let allSwaps = [];
+
+// ============================================================================
+// 初始化图表
+// ============================================================================
+function initChart() {
+  const el = document.getElementById('chart');
+  el.innerHTML = '';
+
+  chart = createChart(el, {
+    width: el.clientWidth, height: 560,
+    layout: { background: { color: '#111827' }, textColor: '#9ca3af' },
+    grid: { vertLines: { color: '#1f2937' }, horzLines: { color: '#1f2937' } },
+    crosshair: { mode: 0 },
+    timeScale: { timeVisible: true, borderColor: '#374151' },
+    rightPriceScale: { borderColor: '#374151' }
+  });
+
+  candleSeries = chart.addCandlestickSeries({
+    upColor: '#22c55e', downColor: '#ef4444',
+    borderUpColor: '#22c55e', borderDownColor: '#ef4444',
+    wickUpColor: '#22c55e', wickDownColor: '#ef4444'
+  });
+
+  volumeSeries = chart.addHistogramSeries({
+    color: 'rgba(59, 130, 246, 0.3)',
+    priceFormat: { type: 'volume' },
+    priceScaleId: '',
+  });
+  chart.priceScale('').applyOptions({
+    scaleMargins: { top: 0.8, bottom: 0 }
+  });
+}
+
+// ============================================================================
+// 获取数据
+// ============================================================================
+async function fetchData() {
+  const preset = document.getElementById('preset').value;
+  const isCustom = preset === 'custom';
+
+  let apiBase, contractName, eventName;
+  if (isCustom) {
+    apiBase = document.getElementById('apiBase').value;
+    contractName = document.getElementById('contract').value;
+    eventName = document.getElementById('event').value;
+  } else {
+    const p = PRESETS[preset];
+    apiBase = p.apiBase; contractName = p.contractName; eventName = p.eventName;
+  }
+
+  if (!contractName || !eventName) {
+    alert('请填写合约名和事件名'); return;
+  }
+
+  setStatus('loading', '加载中...');
+  const lookback = parseInt(document.getElementById('lookback').value);
+  const pageSize = 1000;
+  allSwaps = [];
+
+  // 获取最新区块
+  let latestBlock = 0;
+  try {
+    const res = await fetch(`${apiBase}/sync_state`);
+    const states = await res.json();
+    for (const s of states) {
+      if (s.name === contractName) { latestBlock = s.current_block; break; }
+    }
+  } catch(e) { /* 忽略 — 用 mock 数据 */ }
+
+  if (latestBlock === 0) {
+    // Mock 模式 — 生成示例数据
+    setStatus('warning', 'Mock 模式 (API 不可用)');
+    allSwaps = generateMockSwaps();
+    document.getElementById('blockRange').textContent = 'mock 数据';
+    processAndRender();
+    return;
+  }
+
+  const fromBlock = Math.max(0, latestBlock - lookback);
+  document.getElementById('blockRange').textContent = `区块 ${fromBlock} ~ ${latestBlock}`;
+
+  // 分页拉取
+  let offset = 0, hasMore = true;
+  while (hasMore) {
+    const url = `${apiBase}/events/${contractName}/${eventName}?block_from=${fromBlock}&limit=${pageSize}&offset=${offset}&order=asc`;
+    try {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const rows = await res.json();
+      if (rows.length < pageSize) hasMore = false;
+      allSwaps.push(...rows);
+      offset += pageSize;
+      setStatus('loading', `已获取 ${allSwaps.length} 条...`);
+    } catch(e) {
+      console.warn('API 请求失败，使用已有数据', e);
+      hasMore = false;
+    }
+  }
+
+  processAndRender();
+}
+
+// ============================================================================
+// OHLC 聚合
+// ============================================================================
+function processAndRender() {
+  if (allSwaps.length === 0) {
+    setStatus('error', '无数据'); return;
+  }
+
+  const preset = document.getElementById('preset').value;
+  const cfg = PRESETS[preset] || PRESETS['pancake_busd_wbnb'];
+  const intervalSec = parseInt(document.getElementById('interval').value);
+
+  // 按时间聚合
+  const candles = new Map(); // key: epoch_seconds aligned to interval
+
+  for (const swap of allSwaps) {
+    const blockTs = swap.block_number ? swap.block_number * 3 + 1600000000 : Date.now()/1000;
+    // BSC: ~3s/block, genesis ~2020-08-29. Approximate timestamp.
+    const ts = blockTs;
+    const bucket = Math.floor(ts / intervalSec) * intervalSec;
+
+    // 计算价格: price = amount1/amount0 (token1 per token0)
+    const a0in  = parseHexOrDec(swap.evt_amount0in  || swap.evt_amount0In  || '0');
+    const a1in  = parseHexOrDec(swap.evt_amount1in  || swap.evt_amount1In  || '0');
+    const a0out = parseHexOrDec(swap.evt_amount0out || swap.evt_amount0Out || '0');
+    const a1out = parseHexOrDec(swap.evt_amount1out || swap.evt_amount1Out || '0');
+
+    // Price = |amount1| / |amount0| (which direction?)
+    const amt0 = a0in + a0out;
+    const amt1 = a1in + a1out;
+    if (amt0 === 0) continue;
+    const price = amt1 / amt0;
+
+    let c = candles.get(bucket);
+    if (!c) {
+      c = { time: bucket, open: price, high: price, low: price, close: price, volume: 0 };
+      candles.set(bucket, c);
+    }
+    c.high = Math.max(c.high, price);
+    c.low = Math.min(c.low, price);
+    c.close = price;
+    c.volume += amt1; // volume in token1
+  }
+
+  // 排序并转为数组
+  const candleArr = [];
+  for (const [_, c] of candles) {
+    candleArr.push({
+      time: c.time,
+      open: c.open, high: c.high, low: c.low, close: c.close,
+      volume: c.volume
+    });
+  }
+  candleArr.sort((a,b) => a.time - b.time);
+
+  if (candleArr.length === 0) {
+    setStatus('error', '无法聚合出K线数据'); return;
+  }
+
+  // 渲染
+  initChart();
+  candleSeries.setData(candleArr);
+  volumeSeries.setData(candleArr.map(c => ({
+    time: c.time, value: c.volume, color: c.close >= c.open ? 'rgba(34,197,94,0.3)' : 'rgba(239,68,68,0.3)'
+  })));
+  chart.timeScale().fitContent();
+
+  // Stats
+  const first = candleArr[0], last = candleArr[candleArr.length-1];
+  const change = last.close - first.open;
+  const changePct = (change / first.open * 100).toFixed(2);
+  document.getElementById('stats').innerHTML = `
+    <span>K线数: <b>${candleArr.length}</b></span>
+    <span>原始事件: <b>${allSwaps.length.toLocaleString()}</b></span>
+    <span>周期: <b>${formatInterval(intervalSec)}</b></span>
+    <span>开: <b>${formatPrice(first.open)}</b></span>
+    <span>收: <b>${formatPrice(last.close)}</b></span>
+    <span style="color:${change>=0?'#22c55e':'#ef4444'}">涨跌: <b>${change>=0?'+':''}${changePct}%</b></span>
+  `;
+
+  setStatus('ok', `${candleArr.length} 根K线`);
+}
+
+// ============================================================================
+// Mock 数据生成（API 不可用时的演示数据）
+// ============================================================================
+function generateMockSwaps() {
+  const swaps = [];
+  const baseTime = Math.floor(Date.now() / 1000) - 24 * 3600;
+  const basePrice = 600; // BUSD per BNB
+  for (let i = 0; i < 20000; i++) {
+    const dt = Math.random() * 24 * 3600;
+    const price = basePrice + Math.random() * 100 - 50 + 30 * Math.sin(dt / 3600 * Math.PI * 2);
+    const amt0 = 1 + Math.random() * 50;
+    swaps.push({
+      block_number: Math.floor(40000000 - i * 100),
+      evt_amount0in: '0x' + BigInt(Math.floor(amt0 * 1e18)).toString(16),
+      evt_amount1out: '0x' + BigInt(Math.floor(amt0 * price * 1e18)).toString(16),
+      evt_amount0out: '0x0', evt_amount1in: '0x0',
+      evt_sender: '0xmock'
+    });
+  }
+  return swaps;
+}
+
+// ============================================================================
+// 工具函数
+// ============================================================================
+function parseHexOrDec(s) {
+  if (typeof s === 'number') return s;
+  s = String(s).trim();
+  if (s.startsWith('0x')) {
+    const hex = s.slice(2).replace(/^0+/, '') || '0';
+    try { return Number(BigInt('0x' + hex)) / 1e18; } catch { return 0; }
+  }
+  return parseFloat(s) || 0;
+}
+
+function formatPrice(p) {
+  if (p >= 1000) return p.toFixed(2);
+  if (p >= 1) return p.toFixed(4);
+  if (p >= 0.01) return p.toFixed(6);
+  return p.toFixed(8);
+}
+
+function formatInterval(sec) {
+  if (sec < 300) return `${sec}s`;
+  if (sec < 3600) return `${sec/60}m`;
+  if (sec < 86400) return `${sec/3600}h`;
+  return `${sec/86400}d`;
+}
+
+function setStatus(state, text) {
+  const dot = document.getElementById('status');
+  const txt = document.getElementById('statusText');
+  dot.className = 'w-2.5 h-2.5 rounded-full ' +
+    (state === 'loading' ? 'bg-yellow-500 loading' :
+     state === 'ok' ? 'bg-green-500' :
+     state === 'warning' ? 'bg-yellow-500' : 'bg-red-500');
+  txt.textContent = text;
+}
+
+// ============================================================================
+// 事件绑定
+// ============================================================================
+document.getElementById('preset').addEventListener('change', function() {
+  const custom = this.value === 'custom';
+  document.getElementById('customFields').classList.toggle('hidden', !custom);
+  if (!custom) {
+    const p = PRESETS[this.value];
+    document.getElementById('apiBase').value = p.apiBase;
+    document.getElementById('contract').value = p.contractName;
+    document.getElementById('event').value = p.eventName;
+  }
+});
+
+document.getElementById('fetchBtn').addEventListener('click', fetchData);
+
+window.addEventListener('resize', () => {
+  if (chart) chart.applyOptions({ width: document.getElementById('chart').clientWidth });
+});
+
+// ============================================================================
+// 启动 — 自动加载默认预设
+// ============================================================================
+initChart();
+setTimeout(fetchData, 300);
+</script>
+</body>
+</html>
