@@ -7,12 +7,7 @@
 <script src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
 <script src="https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js"></script>
 <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.9/dist/cdn.min.js"></script>
-<script type="module">
-import { twind, observe } from 'https://esm.sh/@twind/core';
-import presetTailwind from 'https://esm.sh/@twind/preset-tailwind';
-const tw = twind({ presets: [presetTailwind()] });
-observe(tw);
-</script>
+	<script src="https://cdn.tailwindcss.com"></script>
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
   #chart { width: 100%; height: 480px; }
@@ -205,6 +200,5 @@ function fmt(n) { return n >= 1000 ? n.toFixed(2) : n >= 1 ? n.toFixed(4) : n.to
 
 initCharts();
 loadChart();
-</script>
 </body>
 </html>

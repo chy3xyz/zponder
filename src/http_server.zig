@@ -697,13 +697,14 @@ pub const Server = struct {
     }
 
     fn handleDashboard(self: *Server, request: *std.http.Server.Request) !void {
+        // 重定向到静态页面，由 HTMX 拉取数据
         const prefix = "/dashboards/";
         const name = if (request.head.target.len >= prefix.len)
             request.head.target[prefix.len..]
         else
             "";
-        if (name.len == 0 or std.mem.eql(u8, request.head.target, "/dashboards")) {
-            // 列出所有 dashboards
+
+        if (name.len == 0) {
             var buf: std.Io.Writer.Allocating = .init(self.alloc);
             defer buf.deinit();
             try buf.writer.writeAll("[");
@@ -714,29 +715,13 @@ pub const Server = struct {
             try buf.writer.writeAll("]");
             var list = buf.toArrayList();
             defer list.deinit(self.alloc);
+            self.alloc.free(list.items); // 自由 JSON allocPrint 分配的内存... fix later
             try self.sendJson(request, list.items, .ok);
             return;
         }
 
-        for (self.dashboards) |d| {
-            if (std.mem.eql(u8, d.name, name)) {
-                const html = dashboard.renderDashboard(self.alloc, d, self.dashboards) catch |e| {
-                    log.err("Dashboard 渲染失败: {any}", .{e});
-                    try self.sendJson(request, "{\"error\":\"dashboard render failed\"}", .internal_server_error);
-                    return;
-                };
-                defer self.alloc.free(html);
-                try request.respond(html, .{
-                    .status = .ok,
-                    .extra_headers = &.{
-                        .{ .name = "Content-Type", .value = "text/html; charset=utf-8" },
-                        .{ .name = "Access-Control-Allow-Origin", .value = "*" },
-                    },
-                });
-                return;
-            }
-        }
-        try self.sendJson(request, "{\"error\":\"dashboard not found\"}", .not_found);
+        // Serve static dashboard page with template vars
+        try self.handlePagePath(request, "pages/dashboard.html");
     }
 
     fn handlePage(self: *Server, request: *std.http.Server.Request) !void {

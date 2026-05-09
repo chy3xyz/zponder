@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>zponder — {$TITLE}看板</title>
+<script src="https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.9/dist/cdn.min.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+body{font-family:system-ui,sans-serif;background:#0f172a;color:#e2e8f0;margin:0}
+.card{background:#1e293b;border:1px solid #334155;border-radius:8px;padding:16px}
+.loading{color:#64748b;font-size:12px}
+</style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen">
+
+<nav class="border-b border-gray-800 px-6 py-3">
+  <div class="max-w-7xl mx-auto flex gap-6 items-center">
+    <h1 class="text-lg font-bold">zponder <span class="text-emerald-400 font-normal">看板</span></h1>
+    <a href="/kline" class="text-gray-400 text-sm">K线图</a>
+    <a href="/pages/contracts" class="text-gray-400 text-sm">合约</a>
+    <a href="/pages/api" class="text-gray-400 text-sm">API</a>
+  </div>
+</nav>
+
+<div class="max-w-7xl mx-auto px-6 py-6" x-data="{auto:true}">
+  <!-- 同步状态 — stats widget -->
+  <div class="card mb-4"
+       hx-get="/sync_state"
+       hx-trigger="load, every 10s"
+       hx-swap="innerHTML">
+    <div class="loading">加载中...</div>
+  </div>
+
+  <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+    <!-- 最新转账 — table widget -->
+    <div class="card">
+      <h3 class="text-sm text-gray-400 mb-3">最新 BUSD 转账</h3>
+      <div hx-get="/events/busd/Transfer?limit=10&order=desc"
+           hx-trigger="load, every 20s"
+           hx-swap="innerHTML">
+        <div class="loading">加载中...</div>
+      </div>
+    </div>
+
+    <!-- 最新 Swap — table widget -->
+    <div class="card">
+      <h3 class="text-sm text-gray-400 mb-3">最新 CAKE Swap</h3>
+      <div hx-get="/events/cake_wbnb/Swap?limit=10&order=desc"
+           hx-trigger="load, every 20s"
+           hx-swap="innerHTML">
+        <div class="loading">加载中...</div>
+      </div>
+    </div>
+
+    <!-- 缓存统计 — count widget -->
+    <div class="card">
+      <h3 class="text-sm text-gray-400 mb-3">系统缓存</h3>
+      <div hx-get="/cache/stats"
+           hx-trigger="load, every 30s"
+           hx-swap="innerHTML">
+        <div class="loading">加载中...</div>
+      </div>
+    </div>
+
+    <!-- 版本 — 静态 -->
+    <div class="card flex items-center justify-center">
+      <div class="text-center">
+        <div class="text-2xl font-bold text-emerald-400">zponder</div>
+        <div class="text-xs text-gray-500 mt-1">{$VERSION}</div>
+        <div class="text-xs text-gray-600 mt-1">{$API}</div>
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>

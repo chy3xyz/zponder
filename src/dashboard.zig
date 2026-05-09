@@ -16,12 +16,7 @@ pub fn renderDashboard(
     try buf.print(alloc, "<title>zponder — {s}</title>\n", .{d.title});
     try buf.appendSlice(alloc, "<script src=\"https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js\"></script>\n");
     try buf.appendSlice(alloc, "<script defer src=\"https://cdn.jsdelivr.net/npm/alpinejs@3.14.9/dist/cdn.min.js\"></script>\n");
-    try buf.appendSlice(alloc, "<script type=\"module\">\n");
-    try buf.appendSlice(alloc, "import { twind, observe } from 'https://esm.sh/@twind/core';\n");
-    try buf.appendSlice(alloc, "import presetTailwind from 'https://esm.sh/@twind/preset-tailwind';\n");
-    try buf.appendSlice(alloc, "const tw = twind({ presets: [presetTailwind()] });\n");
-    try buf.appendSlice(alloc, "observe(tw);\n");
-    try buf.appendSlice(alloc, "</script>\n");
+    try buf.appendSlice(alloc, "<script src=\"https://cdn.tailwindcss.com\"></script>\n");
     try buf.appendSlice(alloc,
         \\<style>
         \\  body { font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; }
