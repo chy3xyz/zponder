@@ -22,5 +22,44 @@
     <div class="text-gray-500 text-sm">加载中...</div>
   </div>
 </div>
+<script>
+document.addEventListener('htmx:beforeSwap',e=>{
+  const t=e.detail.xhr.responseText;
+  if(!t||t[0]!=='{'&&t[0]!=='[')return;
+  try{
+    const d=JSON.parse(t);
+    const h=Array.isArray(d)&&d.length&&typeof d[0]==='object'?renderTable(d):
+            typeof d==='object'&&d!==null?renderKV(d):null;
+    if(h){e.detail.serverResponse=h;e.detail.shouldSwap=true}
+  }catch(ex){}
+});
+function renderTable(rows){
+  const keys=Object.keys(rows[0]).filter(k=>k!=='id'&&k!=='created_at');
+  let h='<table class=\'w-full text-sm\'><thead><tr class=\'border-b border-gray-700\'>';
+  keys.forEach(k=>h+=`<th class=\'text-left text-gray-400 px-2 py-1 text-xs\'>${esc(k)}</th>`);
+  h+='</tr></thead><tbody>';
+  rows.slice(0,30).forEach(r=>{
+    h+='<tr class=\'border-b border-gray-800\'>';
+    keys.forEach(k=>h+=`<td class=\'px-2 py-1 font-mono text-xs text-gray-300\'>${fv(r[k])}</td>`);
+    h+='</tr>'
+  });
+  h+='</tbody></table>';
+  if(rows.length>30)h+=`<div class=\'text-xs text-gray-600 mt-1\'>+${rows.length-30} 行</div>`;
+  return h
+}
+function renderKV(obj){
+  let h='<div class=\'grid grid-cols-2 gap-2\'>';
+  Object.entries(obj).forEach(([k,v])=>h+=`<div class=\'text-xs text-gray-400\'>${esc(k)}</div><div class=\'text-xs font-mono text-gray-200\'>${fv(v)}</div>`);
+  return h+'</div>'
+}
+function fv(v){
+  if(v===null)return'<span class=\'text-gray-600\'>-</span>';
+  const s=String(v);
+  if(s.startsWith('0x')&&s.length===42)return`<span class=\'text-blue-400\' title=\'${esc(s)}\'>${esc(s.slice(0,6)+'...'+s.slice(-4))}</span>`;
+  if(s.startsWith('0x')&&s.length===66)return`<span class=\'text-purple-400\' title=\'${esc(s)}\'>${esc(s.slice(0,10)+'...')}</span>`;
+  return esc(s)
+}
+function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+</script>
 </body>
 </html>

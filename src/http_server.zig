@@ -715,7 +715,6 @@ pub const Server = struct {
             try buf.writer.writeAll("]");
             var list = buf.toArrayList();
             defer list.deinit(self.alloc);
-            self.alloc.free(list.items); // 自由 JSON allocPrint 分配的内存... fix later
             try self.sendJson(request, list.items, .ok);
             return;
         }
