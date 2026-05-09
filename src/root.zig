@@ -16,6 +16,8 @@ pub const cache = @import("cache.zig");
 pub const rocksdb = @import("rocksdb.zig");
 pub const pg = @import("pg.zig");
 pub const etherscan = @import("etherscan.zig");
+pub const template = @import("template.zig");
+pub const dashboard = @import("dashboard.zig");
 
 test {
     _ = config;

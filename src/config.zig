@@ -63,6 +63,21 @@ pub const DatabaseConfig = struct {
     max_connections: u32,
 };
 
+pub const WidgetConfig = struct {
+    id: []const u8,
+    title: []const u8,
+    widget_type: []const u8,  // "stats" | "table" | "count" | "list"
+    endpoint: []const u8,
+    refresh: u32,
+    columns: []const []const u8,
+};
+
+pub const DashboardConfig = struct {
+    name: []const u8,
+    title: []const u8,
+    widgets: []WidgetConfig,
+};
+
 pub const QueryParam = struct {
     name: []const u8,
     param_type: []const u8,
@@ -85,6 +100,7 @@ pub const Config = struct {
     database: DatabaseConfig,
     contracts: []const ContractConfig,
     queries: []const QueryConfig,
+    dashboards: []const DashboardConfig,
 
     pub fn deinit(self: *Config, alloc: std.mem.Allocator) void {
         alloc.free(self.global.log_level);
@@ -126,6 +142,20 @@ pub const Config = struct {
             alloc.free(q.params);
         }
         alloc.free(self.queries);
+        for (self.dashboards) |d| {
+            alloc.free(d.name);
+            alloc.free(d.title);
+            for (d.widgets) |w| {
+                alloc.free(w.id);
+                alloc.free(w.title);
+                alloc.free(w.widget_type);
+                alloc.free(w.endpoint);
+                for (w.columns) |c| alloc.free(c);
+                alloc.free(w.columns);
+            }
+            alloc.free(d.widgets);
+        }
+        alloc.free(self.dashboards);
     }
 };
 
@@ -372,6 +402,24 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
         queries.deinit(alloc);
     }
 
+    var dashboards: std.ArrayList(DashboardConfig) = .empty;
+    errdefer {
+        for (dashboards.items) |d| {
+            alloc.free(d.name);
+            alloc.free(d.title);
+            for (d.widgets) |w| {
+                alloc.free(w.id);
+                alloc.free(w.title);
+                alloc.free(w.widget_type);
+                alloc.free(w.endpoint);
+                for (w.columns) |c| alloc.free(c);
+                alloc.free(w.columns);
+            }
+            alloc.free(d.widgets);
+        }
+        dashboards.deinit(alloc);
+    }
+
     const Section = enum {
         none,
         global,
@@ -380,10 +428,15 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
         http,
         contracts,
         queries,
+        dashboards,
+        dashboard_widgets,
     };
     var section: Section = .none;
     var current_contract: ?ContractConfig = null;
     var current_query: ?QueryConfig = null;
+    var current_dashboard: ?DashboardConfig = null;
+    var current_widget: ?WidgetConfig = null;
+    var current_widgets: std.ArrayList(WidgetConfig) = .empty;
 
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line_raw| {
@@ -392,7 +445,7 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
         if (std.mem.startsWith(u8, line, "#")) continue;
 
         if (std.mem.startsWith(u8, line, "[") and std.mem.endsWith(u8, line, "]")) {
-            // 保存之前的合约/查询
+            // 保存之前的合约/查询/dashboard
             if (current_contract) |cc| {
                 try contracts.append(alloc, cc);
                 current_contract = null;
@@ -401,10 +454,26 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
                 try queries.append(alloc, cq);
                 current_query = null;
             }
+            if (current_widget) |cw| {
+                try current_widgets.append(alloc, cw);
+                current_widget = null;
+            }
             // 处理 [[section]] 和 [section] 两种格式
             var section_name = line[1 .. line.len - 1];
             if (std.mem.startsWith(u8, section_name, "[")) section_name = section_name[1..];
             if (std.mem.endsWith(u8, section_name, "]")) section_name = section_name[0 .. section_name.len - 1];
+
+            // dashboard.widgets 是 dashboards 的子节，不 flush 父级
+            const is_dashboard_widget = std.mem.eql(u8, section_name, "dashboards.widgets");
+
+            if (!is_dashboard_widget) {
+                if (current_dashboard) |*cd| {
+                    cd.widgets = try current_widgets.toOwnedSlice(alloc);
+                    try dashboards.append(alloc, cd.*);
+                    current_dashboard = null;
+                    current_widgets = .empty;
+                }
+            }
 
             if (std.mem.eql(u8, section_name, "global")) {
                 section = .global;
@@ -436,6 +505,23 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
                     .sql = try alloc.dupe(u8, ""),
                     .params = &.{},
                     .cache_ttl_blocks = 0,
+                };
+            } else if (std.mem.eql(u8, section_name, "dashboards")) {
+                section = .dashboards;
+                current_dashboard = DashboardConfig{
+                    .name = try alloc.dupe(u8, ""),
+                    .title = try alloc.dupe(u8, ""),
+                    .widgets = &.{},
+                };
+            } else if (std.mem.eql(u8, section_name, "dashboards.widgets")) {
+                section = .dashboard_widgets;
+                current_widget = WidgetConfig{
+                    .id = try alloc.dupe(u8, ""),
+                    .title = try alloc.dupe(u8, ""),
+                    .widget_type = try alloc.dupe(u8, "stats"),
+                    .endpoint = try alloc.dupe(u8, ""),
+                    .refresh = 30,
+                    .columns = &.{},
                 };
             } else {
                 section = .none;
@@ -487,6 +573,39 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
                 cq.params = try parseQueryParams(alloc, value);
             } else if (std.mem.eql(u8, key, "cache_ttl_blocks")) {
                 cq.cache_ttl_blocks = try parseU64(value);
+            }
+            continue;
+        }
+
+        // Widget checking before Dashboard (both have "title" field)
+        if (current_widget) |*cw| {
+            if (std.mem.eql(u8, key, "id")) {
+                if (cw.id.len > 0) alloc.free(cw.id);
+                cw.id = try unquote(alloc, value);
+            } else if (std.mem.eql(u8, key, "title")) {
+                if (cw.title.len > 0) alloc.free(cw.title);
+                cw.title = try unquote(alloc, value);
+            } else if (std.mem.eql(u8, key, "type")) {
+                if (cw.widget_type.len > 0) alloc.free(cw.widget_type);
+                cw.widget_type = try unquote(alloc, value);
+            } else if (std.mem.eql(u8, key, "endpoint")) {
+                if (cw.endpoint.len > 0) alloc.free(cw.endpoint);
+                cw.endpoint = try unquote(alloc, value);
+            } else if (std.mem.eql(u8, key, "refresh")) {
+                cw.refresh = try parseU32(value);
+            } else if (std.mem.eql(u8, key, "columns")) {
+                cw.columns = try parseEvents(alloc, value);
+            }
+            continue;
+        }
+
+        if (current_dashboard) |*cd| {
+            if (std.mem.eql(u8, key, "name")) {
+                if (cd.name.len > 0) alloc.free(cd.name);
+                cd.name = try unquote(alloc, value);
+            } else if (std.mem.eql(u8, key, "title")) {
+                if (cd.title.len > 0) alloc.free(cd.title);
+                cd.title = try unquote(alloc, value);
             }
             continue;
         }
@@ -580,6 +699,13 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
     if (current_query) |cq| {
         try queries.append(alloc, cq);
     }
+    if (current_widget) |cw| {
+        try current_widgets.append(alloc, cw);
+    }
+    if (current_dashboard) |*cd| {
+        cd.widgets = try current_widgets.toOwnedSlice(alloc);
+        try dashboards.append(alloc, cd.*);
+    }
 
     var final_contracts = try alloc.alloc(ContractConfig, contracts.items.len);
     for (contracts.items, 0..) |c, i| {
@@ -593,6 +719,12 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
     }
     queries.deinit(alloc);
 
+    var final_dashboards = try alloc.alloc(DashboardConfig, dashboards.items.len);
+    for (dashboards.items, 0..) |d, i| {
+        final_dashboards[i] = d;
+    }
+    dashboards.deinit(alloc);
+
     const cfg = Config{
         .alloc = alloc,
         .global = global,
@@ -601,6 +733,7 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
         .database = database,
         .contracts = final_contracts,
         .queries = final_queries,
+        .dashboards = final_dashboards,
     };
 
     return cfg;

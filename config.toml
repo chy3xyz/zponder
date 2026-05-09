@@ -71,3 +71,25 @@ events = ["Transfer", "Approval"]
 # """
 # params = ["limit:u32:10", "block_to:u64:99999999"]
 # cache_ttl_blocks = 100
+
+# ============================================================
+# 仪表板 — 访问 /dashboards/:name 查看
+# ============================================================
+# [[dashboards]]
+# name = "main"
+# title = "实时数据看板"
+#
+# [[dashboards.widgets]]
+# id = "sync_status"
+# title = "同步状态"
+# type = "stats"
+# endpoint = "/sync_state"
+# refresh = 10
+#
+# [[dashboards.widgets]]
+# id = "latest_transfers"
+# title = "最新转账"
+# type = "table"
+# endpoint = "/events/dai/Transfer?limit=10&order=desc"
+# columns = ["block_number", "evt_from", "evt_to", "evt_value"]
+# refresh = 15

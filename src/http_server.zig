@@ -6,6 +6,7 @@ const cache = @import("cache.zig");
 const log = @import("log.zig");
 const utils = @import("utils.zig");
 const template = @import("template.zig");
+const dashboard = @import("dashboard.zig");
 
 const build_options = @import("build_options");
 
@@ -71,6 +72,7 @@ pub const Server = struct {
     cache: *cache.Cache,
     indexers: []*indexer.Indexer,
     queries: []const config.QueryConfig,
+    dashboards: []const config.DashboardConfig,
     listen_socket: ?std.Io.net.Server,
     thread: ?std.Thread,
     running: std.atomic.Value(bool),
@@ -85,6 +87,7 @@ pub const Server = struct {
         c: *cache.Cache,
         indexers: []*indexer.Indexer,
         queries: []const config.QueryConfig,
+        dashboards: []const config.DashboardConfig,
     ) Server {
         const rps = @as(f64, @floatFromInt(cfg.rate_limit_rps orelse 0));
         const burst = @as(f64, @floatFromInt(cfg.rate_limit_burst orelse 0));
@@ -96,6 +99,7 @@ pub const Server = struct {
             .cache = c,
             .indexers = indexers,
             .queries = queries,
+            .dashboards = dashboards,
             .listen_socket = null,
             .thread = null,
             .running = std.atomic.Value(bool).init(false),
@@ -232,7 +236,9 @@ pub const Server = struct {
             return;
         }
 
-        if (method == .GET and std.mem.startsWith(u8, target, "/pages/")) {
+        if (method == .GET and (std.mem.eql(u8, target, "/dashboards") or std.mem.startsWith(u8, target, "/dashboards/"))) {
+            try self.handleDashboard(request);
+        } else if (method == .GET and std.mem.startsWith(u8, target, "/pages/")) {
             try self.handlePage(request);
         } else if (method == .GET and (std.mem.eql(u8, target, "/") or std.mem.eql(u8, target, "/kline"))) {
             try self.handlePagePath(request, "pages/kline.html");
@@ -688,6 +694,49 @@ pub const Server = struct {
         for (v.values) |val| self.alloc.free(val);
         for (v.keys) |key| self.alloc.free(key);
         v.deinit(self.alloc);
+    }
+
+    fn handleDashboard(self: *Server, request: *std.http.Server.Request) !void {
+        const prefix = "/dashboards/";
+        const name = if (request.head.target.len >= prefix.len)
+            request.head.target[prefix.len..]
+        else
+            "";
+        if (name.len == 0 or std.mem.eql(u8, request.head.target, "/dashboards")) {
+            // 列出所有 dashboards
+            var buf: std.Io.Writer.Allocating = .init(self.alloc);
+            defer buf.deinit();
+            try buf.writer.writeAll("[");
+            for (self.dashboards, 0..) |d, i| {
+                if (i > 0) try buf.writer.writeByte(',');
+                try buf.writer.print("{{\"name\":\"{s}\",\"title\":\"{s}\",\"widgets\":{d}}}", .{ d.name, d.title, d.widgets.len });
+            }
+            try buf.writer.writeAll("]");
+            var list = buf.toArrayList();
+            defer list.deinit(self.alloc);
+            try self.sendJson(request, list.items, .ok);
+            return;
+        }
+
+        for (self.dashboards) |d| {
+            if (std.mem.eql(u8, d.name, name)) {
+                const html = dashboard.renderDashboard(self.alloc, d, self.dashboards) catch |e| {
+                    log.err("Dashboard 渲染失败: {any}", .{e});
+                    try self.sendJson(request, "{\"error\":\"dashboard render failed\"}", .internal_server_error);
+                    return;
+                };
+                defer self.alloc.free(html);
+                try request.respond(html, .{
+                    .status = .ok,
+                    .extra_headers = &.{
+                        .{ .name = "Content-Type", .value = "text/html; charset=utf-8" },
+                        .{ .name = "Access-Control-Allow-Origin", .value = "*" },
+                    },
+                });
+                return;
+            }
+        }
+        try self.sendJson(request, "{\"error\":\"dashboard not found\"}", .not_found);
     }
 
     fn handlePage(self: *Server, request: *std.http.Server.Request) !void {

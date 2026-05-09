@@ -41,3 +41,39 @@ address = "0x0eD7e52944161450477ee417DE9Cd3a859b14fD0"
 abi_path = "./abis/pancake_pair.abi"
 from_block = 20000000
 events = ["Swap", "Sync"]
+
+# ============================================================
+# 仪表板
+# ============================================================
+[[dashboards]]
+name = "bsc"
+title = "BSC 实时数据看板"
+
+[[dashboards.widgets]]
+id = "busd_count"
+title = "BUSD 转账总数"
+type = "count"
+endpoint = "/events/busd_wbnb/Swap?limit=1"
+refresh = 30
+
+[[dashboards.widgets]]
+id = "cake_count"
+title = "CAKE 转账总数"
+type = "count"
+endpoint = "/events/cake_wbnb/Swap?limit=1"
+refresh = 30
+
+[[dashboards.widgets]]
+id = "sync"
+title = "同步状态"
+type = "stats"
+endpoint = "/sync_state"
+refresh = 10
+
+[[dashboards.widgets]]
+id = "latest_swaps"
+title = "最新 CAKE 交易"
+type = "table"
+endpoint = "/events/cake_wbnb/Swap?limit=10&order=desc"
+columns = ["block_number", "evt_sender", "evt_amount0in", "evt_amount1out"]
+refresh = 20
