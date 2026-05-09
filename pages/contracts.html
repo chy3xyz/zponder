@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>zponder — 合约列表</title>
+<script src="https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.9/dist/cdn.min.js"></script>
+<script type="module">
+import { twind, observe } from 'https://esm.sh/@twind/core';
+import presetTailwind from 'https://esm.sh/@twind/preset-tailwind';
+observe(twind({ presets: [presetTailwind()] }));
+</script>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen">
+<nav class="border-b border-gray-800 px-6 py-3">
+  <div class="max-w-7xl mx-auto flex gap-6 items-center">
+    <h1 class="text-lg font-bold">zponder</h1>
+    <a href="/kline" class="text-gray-400 text-sm">K线图</a>
+    <span class="text-emerald-400 text-sm border-b border-emerald-400 pb-1">合约</span>
+    <a href="/pages/api" class="text-gray-400 text-sm">API文档</a>
+  </div>
+</nav>
+<div class="max-w-7xl mx-auto px-6 py-8">
+  <h2 class="text-xl font-bold mb-6">已配置合约</h2>
+  <div hx-get="/contracts" hx-trigger="load, every 15s" hx-swap="innerHTML" class="space-y-3">
+    <div class="text-gray-500 text-sm loading">加载中...</div>
+  </div>
+</div>
+</body>
+</html>

@@ -4,36 +4,29 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>zponder — BNB Chain K线图</title>
-<script src="https://unpkg.com/lightweight-charts@5.0.1/dist/lightweight-charts.standalone.production.js"></script>
+<script src="https://unpkg.com/lightweight-charts@4.2.3/dist/lightweight-charts.standalone.production.js"></script>
 <script src="https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js"></script>
-	<script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.9/dist/cdn.min.js"></script>
-	<script type="module">
-		import { twind, observe } from 'https://esm.sh/@twind/core';
-		import { presetTailwind } from 'https://esm.sh/@twind/preset-tailwind';
-		const tw = twind({ presets: [presetTailwind()] });
-		observe(tw);
-	</script>
+<script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.9/dist/cdn.min.js"></script>
+<script type="module">
+import { twind, observe } from 'https://esm.sh/@twind/core';
+import presetTailwind from 'https://esm.sh/@twind/preset-tailwind';
+const tw = twind({ presets: [presetTailwind()] });
+observe(tw);
+</script>
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
   #chart { width: 100%; height: 480px; }
   #volChart { width: 100%; height: 140px; }
-  .htmx-indicator { opacity: 0; transition: opacity 0.2s; }
-  .htmx-request .htmx-indicator { opacity: 1; }
-  .htmx-request.htmx-indicator { opacity: 1; }
   @keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:.5 } }
   .loading { animation: pulse 1.5s infinite; }
 </style>
 </head>
-<body class="bg-gray-950 text-gray-100 min-h-screen"
-      hx-ext="json-enc">
+<body class="bg-gray-950 text-gray-100 min-h-screen">
 
-<!-- 导航栏 -->
 <nav class="border-b border-gray-800 px-6 py-3">
   <div class="max-w-7xl mx-auto flex items-center justify-between">
     <div class="flex items-center gap-6">
-      <h1 class="text-lg font-bold">
-        zponder <span class="text-emerald-400 font-normal">v{$VERSION}</span>
-      </h1>
+      <h1 class="text-lg font-bold">zponder <span class="text-emerald-400 font-normal">v{$VERSION}</span></h1>
       <div class="flex gap-3 text-sm">
         <a href="/kline" class="text-emerald-400 border-b border-emerald-400 pb-1">K线图</a>
         <a href="/pages/contracts" class="text-gray-400 hover:text-gray-200 pb-1">合约</a>
@@ -48,7 +41,6 @@
   </div>
 </nav>
 
-<!-- 数据源选择 -->
 <div class="max-w-7xl mx-auto px-6 py-4">
   <div class="flex flex-wrap gap-3 items-end">
     <div>
@@ -58,8 +50,7 @@
     </div>
     <div>
       <label class="block text-xs text-gray-500 mb-1">数据集</label>
-      <select id="dataset" class="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm"
-              onchange="onDatasetChange()">
+      <select id="dataset" class="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm">
         <option value="busd:Transfer">BUSD Transfer — 交易量/频次</option>
         <option value="cake_wbnb:Swap">CAKE/WBNB Swap — K线(价格)</option>
       </select>
@@ -84,41 +75,27 @@
       </select>
     </div>
     <button id="fetchBtn" onclick="loadChart()"
-            class="bg-emerald-600 hover:bg-emerald-700 text-white rounded px-5 py-2 text-sm font-medium transition">
+            class="bg-emerald-600 hover:bg-emerald-700 text-white rounded px-5 py-2 text-sm font-medium">
       加载数据
     </button>
     <span id="syncInfo" class="text-xs text-gray-500 self-end pb-2"></span>
   </div>
 </div>
 
-<!-- 图表区 -->
 <div class="max-w-7xl mx-auto px-6">
   <div id="chart" class="bg-gray-900 rounded-lg border border-gray-800"></div>
   <div id="volChart" class="bg-gray-900 rounded-lg border border-gray-800 mt-1"></div>
 </div>
 
-<!-- 统计 -->
 <div id="stats" class="max-w-7xl mx-auto px-6 py-3 flex flex-wrap gap-x-6 gap-y-1 text-xs text-gray-500 border-t border-gray-800 mt-3"></div>
-
-<!-- htmx: 合约列表 (自动加载) -->
-<div class="max-w-7xl mx-auto px-6 py-4">
-  <h3 class="text-sm text-gray-400 mb-2">已配置合约</h3>
-  <div class="flex flex-wrap gap-2" id="contractList">
-    <!-- htmx 从 sync_state 端点自动填充 -->
-  </div>
-</div>
 
 <script>
 const API = document.getElementById('apiBase').value;
-const BSC_GENESIS = 1598659200;
-const BSC_BLOCK_TIME = 3;
-
-let chart = null, candleSeries = null, volumeSeries = null;
-let volChart = null, volHistSeries = null;
+const BSC_GENESIS = 1598659200, BSC_BLOCK_TIME = 3;
+let chart = null, candleSeries = null, volChart = null, volHistSeries = null;
 
 function initCharts() {
-  const el = document.getElementById('chart');
-  el.innerHTML = '';
+  const el = document.getElementById('chart'); el.innerHTML = '';
   if (chart) { chart.remove(); chart = null; }
   if (volChart) { volChart.remove(); volChart = null; }
 
@@ -137,21 +114,14 @@ function initCharts() {
     wickUpColor: '#22c55e', wickDownColor: '#ef4444',
   });
 
-  const vel = document.getElementById('volChart');
-  vel.innerHTML = '';
+  const vel = document.getElementById('volChart'); vel.innerHTML = '';
   volChart = LightweightCharts.createChart(vel, {
     width: vel.clientWidth, height: 140,
     layout: { background: { color: '#111827' }, textColor: '#9ca3af' },
     grid: { vertLines: { color: '#1f2937' }, horzLines: { color: '#1f2937' } },
-    timeScale: { visible: false },
-    rightPriceScale: { borderColor: '#374151' }
+    timeScale: { visible: false }, rightPriceScale: { borderColor: '#374151' }
   });
   volHistSeries = volChart.addHistogramSeries({ color: 'rgba(59,130,246,0.3)' });
-}
-
-function onDatasetChange() {
-  const ds = document.getElementById('dataset').value.split(':');
-  document.getElementById('title').textContent = ds[0] + ' — ' + ds[1];
 }
 
 async function loadChart() {
@@ -159,41 +129,32 @@ async function loadChart() {
   const lookback = parseInt(document.getElementById('lookback').value);
   const intervalSec = parseInt(document.getElementById('interval').value);
   const isSwap = event === 'Swap';
-
   document.getElementById('fetchBtn').disabled = true;
 
-  // 获取最新同步区块
   let latestBlock = 0;
   try {
     const r = await fetch(API + '/sync_state');
     const states = await r.json();
-    for (const s of states) {
-      if (s.name === contract) latestBlock = s.current_block || 0;
-    }
+    for (const s of states) if (s.name === contract) latestBlock = s.current_block || 0;
   } catch(e) { alert('连接 zponder 失败: ' + e.message); return; }
 
   const fromBlock = Math.max(0, latestBlock - lookback);
   document.getElementById('syncInfo').textContent =
-    `区块 ${fromBlock.toLocaleString()} ~ ${latestBlock.toLocaleString()}`;
+    '区块 ' + fromBlock.toLocaleString() + ' ~ ' + latestBlock.toLocaleString();
 
-  // 分页拉取
-  const rows = [];
-  let offset = 0, pageSize = 1000;
+  const rows = []; let offset = 0;
   while (true) {
     try {
-      const r = await fetch(API + `/events/${contract}/${event}?block_from=${fromBlock}&limit=${pageSize}&offset=${offset}&order=asc`);
+      const r = await fetch(API + '/events/' + contract + '/' + event + '?block_from=' + fromBlock + '&limit=1000&offset=' + offset + '&order=asc');
       if (!r.ok) break;
       const batch = await r.json();
       if (!Array.isArray(batch) || batch.length === 0) break;
-      rows.push(...batch);
-      offset += pageSize;
-      if (batch.length < pageSize) break;
+      rows.push(...batch); offset += 1000;
+      if (batch.length < 1000) break;
     } catch(e) { break; }
   }
-
   if (rows.length === 0) { alert('无数据'); document.getElementById('fetchBtn').disabled = false; return; }
 
-  // OHLC 聚合
   const buckets = new Map();
   for (const row of rows) {
     const block = typeof row.block_number === 'number' ? row.block_number : parseInt(String(row.block_number), 10) || 0;
@@ -202,25 +163,19 @@ async function loadChart() {
 
     let val;
     if (isSwap) {
-      const a0i = parseU256(row.evt_amount0in) + parseU256(row.evt_amount0out);
-      const a1i = parseU256(row.evt_amount1in) + parseU256(row.evt_amount1out);
-      val = a0i > 0 ? a1i / a0i : 0;
-    } else {
-      val = parseU256(row.evt_value);
-    }
+      const a0 = parseU256(row.evt_amount0in) + parseU256(row.evt_amount0out);
+      const a1 = parseU256(row.evt_amount1in) + parseU256(row.evt_amount1out);
+      val = a0 > 0 ? a1 / a0 : 0;
+    } else { val = parseU256(row.evt_value); }
 
     let b = buckets.get(bucket);
     if (!b) { b = { time: bucket, open: val, high: val, low: val, close: val, vol: 0, count: 0 }; buckets.set(bucket, b); }
     if (val > b.high) b.high = val;
     if (val < b.low) b.low = val;
-    b.close = val;
-    b.vol += val;
-    b.count++;
+    b.close = val; b.vol += val; b.count++;
   }
 
   const candles = [...buckets.values()].sort((a,b) => a.time - b.time);
-
-  // 渲染
   initCharts();
   candleSeries.setData(candles);
   volHistSeries.setData(candles.map(c => ({
@@ -229,35 +184,25 @@ async function loadChart() {
   })));
   chart.timeScale().fitContent();
 
-  // 统计
   const first = candles[0], last = candles[candles.length-1];
-  const change = last.close - first.open;
-  const pct = first.open > 0 ? (change / first.open * 100) : 0;
+  const chg = last.close - first.open, pct = first.open > 0 ? (chg/first.open*100) : 0;
   document.getElementById('stats').innerHTML = [
-    `K线: <b>${candles.length}</b>`,
-    `事件: <b>${rows.length.toLocaleString()}</b>`,
-    isSwap
-      ? `价格: <b>${fmt(last.close)}</b>`
-      : `总量: <b>${fmt(last.vol)}</b>`,
-    `<span style="color:${change>=0?'#22c55e':'#ef4444'}">${pct>=0?'+':''}${pct.toFixed(2)}%</span>`
+    'K线: <b>' + candles.length + '</b>',
+    '事件: <b>' + rows.length.toLocaleString() + '</b>',
+    isSwap ? '价格: <b>' + fmt(last.close) + '</b>' : '总量: <b>' + fmt(last.vol) + '</b>',
+    '<span style="color:' + (chg>=0?'#22c55e':'#ef4444') + '">' + (chg>=0?'+':'') + pct.toFixed(2) + '%</span>'
   ].join(' &nbsp;|&nbsp; ');
-
   document.getElementById('fetchBtn').disabled = false;
 }
 
 function parseU256(v) {
   if (v === null || v === undefined) return 0;
   const s = String(v).trim();
-  if (s.startsWith('0x')) {
-    const clean = s.slice(2).replace(/^0+/, '') || '0';
-    try { return Number(BigInt('0x' + clean)) / 1e18; } catch { return 0; }
-  }
-  return parseFloat(s) / 1e18 || 0;
+  if (s.startsWith('0x')) { const c = s.slice(2).replace(/^0+/,'')||'0'; try { return Number(BigInt('0x'+c))/1e18 } catch { return 0 } }
+  return parseFloat(s)/1e18 || 0;
 }
-
 function fmt(n) { return n >= 1000 ? n.toFixed(2) : n >= 1 ? n.toFixed(4) : n.toFixed(8); }
 
-// 启动
 initCharts();
 loadChart();
 </script>

@@ -18,7 +18,7 @@ pub fn renderDashboard(
     try buf.appendSlice(alloc, "<script defer src=\"https://cdn.jsdelivr.net/npm/alpinejs@3.14.9/dist/cdn.min.js\"></script>\n");
     try buf.appendSlice(alloc, "<script type=\"module\">\n");
     try buf.appendSlice(alloc, "import { twind, observe } from 'https://esm.sh/@twind/core';\n");
-    try buf.appendSlice(alloc, "import { presetTailwind } from 'https://esm.sh/@twind/preset-tailwind';\n");
+    try buf.appendSlice(alloc, "import presetTailwind from 'https://esm.sh/@twind/preset-tailwind';\n");
     try buf.appendSlice(alloc, "const tw = twind({ presets: [presetTailwind()] });\n");
     try buf.appendSlice(alloc, "observe(tw);\n");
     try buf.appendSlice(alloc, "</script>\n");
