@@ -3,134 +3,111 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>zponder — PancakeSwap K线图</title>
+<title>zponder — BNB Chain 实时数据</title>
 <script src="https://unpkg.com/lightweight-charts@5.0.1/dist/lightweight-charts.standalone.production.js"></script>
 <script src="https://cdn.tailwindcss.com"></script>
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
-  #chart { width: 100%; height: 560px; }
+  #chart { width: 100%; height: 480px; }
+  #volChart { width: 100%; height: 160px; }
   .loading-dot { animation: pulse 1.5s infinite; }
   @keyframes pulse { 0%,100% { opacity:1 } 50% { opacity:.5 } }
 </style>
 </head>
 <body class="bg-gray-950 text-gray-100 min-h-screen">
 
-<!-- Header -->
 <header class="border-b border-gray-800 px-6 py-4">
   <div class="max-w-7xl mx-auto flex items-center justify-between">
     <div>
       <h1 class="text-xl font-bold">zponder
-        <span class="text-gray-400 font-normal text-base">× PancakeSwap K线图</span>
+        <span class="text-emerald-400 font-normal text-base">× BNB Chain 实时索引</span>
       </h1>
-      <p class="text-sm text-gray-500">数据源: zponder HTTP API → Swap 事件 → OHLC 聚合</p>
+      <p class="text-sm text-gray-500" id="subtitle">BUSD Transfer 交易量 + CAKE/WBNB K线</p>
     </div>
     <div class="flex items-center gap-3">
       <span id="statusDot" class="w-2.5 h-2.5 rounded-full bg-gray-600"></span>
-      <span id="statusText" class="text-sm text-gray-500">等待连接 zponder...</span>
+      <span id="statusText" class="text-sm text-gray-500">等待连接...</span>
     </div>
   </div>
 </header>
 
-<!-- Controls -->
 <div class="max-w-7xl mx-auto px-6 py-4">
   <div class="flex flex-wrap gap-3 items-end">
-
-    <!-- zponder API -->
     <div>
       <label class="block text-xs text-gray-500 mb-1">zponder API</label>
       <input id="apiBase" class="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm w-64"
-             value="http://localhost:8080">
+             value="">
     </div>
-
-    <!-- Pair preset -->
     <div>
-      <label class="block text-xs text-gray-500 mb-1">交易对</label>
-      <select id="pair" class="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm">
-        <option value="busd_wbnb">BUSD/WBNB (PancakeSwap BSC)</option>
-        <option value="cake_wbnb">CAKE/WBNB (PancakeSwap BSC)</option>
-        <option value="custom">自定义...</option>
+      <label class="block text-xs text-gray-500 mb-1">数据集</label>
+      <select id="dataset" class="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm">
+        <option value="busd">BUSD Transfer — 交易量/频次</option>
+        <option value="cake_wbnb">CAKE/WBNB Swap — K线(价格)</option>
       </select>
     </div>
-
-    <div id="customPair" class="hidden flex gap-3">
-      <div><label class="block text-xs text-gray-500 mb-1">合约名</label>
-        <input id="contractName" class="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm w-36"></div>
-    </div>
-
-    <!-- Interval -->
     <div>
-      <label class="block text-xs text-gray-500 mb-1">K线周期</label>
+      <label class="block text-xs text-gray-500 mb-1">粒度</label>
       <select id="interval" class="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm">
         <option value="60">1分钟</option>
         <option value="300" selected>5分钟</option>
         <option value="900">15分钟</option>
         <option value="3600">1小时</option>
-        <option value="14400">4小时</option>
       </select>
     </div>
-
-    <!-- Blocks -->
     <div>
-      <label class="block text-xs text-gray-500 mb-1">回溯区块</label>
+      <label class="block text-xs text-gray-500 mb-1">块范围</label>
       <select id="lookback" class="bg-gray-800 border border-gray-700 rounded px-3 py-2 text-sm">
+        <option value="2000">2千</option>
         <option value="5000">5千</option>
-        <option value="20000" selected>2万</option>
-        <option value="100000">10万</option>
-        <option value="500000">50万</option>
+        <option value="10000" selected>1万</option>
+        <option value="50000">5万</option>
       </select>
     </div>
-
-    <button id="fetchBtn" class="bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white rounded px-5 py-2 text-sm font-medium transition">
+    <button id="fetchBtn" class="bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white rounded px-5 py-2 text-sm font-medium transition">
       加载数据
     </button>
   </div>
   <div id="syncInfo" class="text-xs text-gray-500 mt-2"></div>
 </div>
 
-<!-- Chart -->
 <div class="max-w-7xl mx-auto px-6">
   <div id="chart" class="bg-gray-900 rounded-lg border border-gray-800"></div>
+  <div id="volChart" class="bg-gray-900 rounded-lg border border-gray-800 mt-1"></div>
 </div>
 
-<!-- Stats -->
-<div id="stats" class="max-w-7xl mx-auto px-6 py-2 flex flex-wrap gap-x-6 gap-y-1 text-xs text-gray-500"></div>
+<div id="stats" class="max-w-7xl mx-auto px-6 py-3 flex flex-wrap gap-x-6 gap-y-1 text-xs text-gray-500 border-t border-gray-800 mt-3"></div>
 
 <script>
 // ============================================================================
-// zponder API 字段名映射
-//
-// zponder 用 sanitizeColumnName 转换 ABI 字段:
-//   amount0In  → evt_amount0in
-//   amount1Out → evt_amount1out
-//   sender     → evt_sender (indexed → topic)
-//
-// API 返回格式 (/events/:contract/:event):
-//   [{"evt_sender":"0x...","evt_amount0in":"0x...",...,"block_number":12345}, ...]
+// zponder 返回的字段名 (sanitizeColumnName: evt_前缀, 全小写)
+// BUSD Transfer: id, evt_from, evt_to, evt_value, block_number, tx_hash, log_index
+// PancakeSwap:   evt_sender, evt_amount0in, evt_amount1in, evt_amount0out,
+//                evt_amount1out, evt_to, block_number, tx_hash, log_index
 // ============================================================================
 
-const SWAP_FIELDS = {
-  amount0In:  'evt_amount0in',
-  amount1In:  'evt_amount1in',
-  amount0Out: 'evt_amount0out',
-  amount1Out: 'evt_amount1out',
+const DATASETS = {
+  busd: { contract: 'busd', event: 'Transfer', isSwap: false, label: 'BUSD Transfer' },
+  cake_wbnb: { contract: 'cake_wbnb', event: 'Swap', isSwap: true, label: 'CAKE/WBNB Swap' }
 };
 
 let chart = null, candleSeries = null, volumeSeries = null;
+let volChart = null, volHistSeries = null;
 
 // ============================================================================
-// 图表初始化
+// 初始化图表
 // ============================================================================
-function initChart() {
+function initCharts() {
+  // 主图
   const el = document.getElementById('chart');
   el.innerHTML = '';
   if (chart) { chart.remove(); chart = null; }
 
   chart = LightweightCharts.createChart(el, {
-    width: el.clientWidth, height: 560,
+    width: el.clientWidth, height: 480,
     layout: { background: { color: '#111827' }, textColor: '#9ca3af' },
     grid: { vertLines: { color: '#1f2937' }, horzLines: { color: '#1f2937' } },
     crosshair: { mode: 1 },
-    timeScale: { timeVisible: true, borderColor: '#374151', secondsVisible: false },
+    timeScale: { timeVisible: true, borderColor: '#374151' },
     rightPriceScale: { borderColor: '#374151' }
   });
 
@@ -140,37 +117,51 @@ function initChart() {
     wickUpColor: '#22c55e', wickDownColor: '#ef4444',
   });
 
-  volumeSeries = chart.addHistogramSeries({
-    color: 'rgba(59,130,246,0.3)',
-    priceFormat: { type: 'volume' },
-    priceScaleId: '',
+  // 成交量附图
+  const vel = document.getElementById('volChart');
+  vel.innerHTML = '';
+  if (volChart) { volChart.remove(); volChart = null; }
+
+  volChart = LightweightCharts.createChart(vel, {
+    width: vel.clientWidth, height: 160,
+    layout: { background: { color: '#111827' }, textColor: '#9ca3af' },
+    grid: { vertLines: { color: '#1f2937' }, horzLines: { color: '#1f2937' } },
+    timeScale: { visible: false },
+    rightPriceScale: { borderColor: '#374151' }
   });
-  chart.priceScale('').applyOptions({ scaleMargins: { top: 0.8, bottom: 0 } });
+
+  volHistSeries = volChart.addHistogramSeries({
+    color: 'rgba(59,130,246,0.3)',
+  });
 }
 
 // ============================================================================
 // 从 zponder 拉取数据
 // ============================================================================
-async function fetchFromZponder() {
-  const apiBase = document.getElementById('apiBase').value.replace(/\/$/, '');
-  const pair = document.getElementById('pair').value;
-  const contractName = pair === 'custom'
-    ? document.getElementById('contractName').value
-    : pair;
+async function fetchData() {
+  // Auto-detect API URL from current page origin (works when served by zponder)
+  let apiBase = document.getElementById('apiBase').value.replace(/\/$/, '');
+  if (!apiBase) {
+    apiBase = window.location.origin || 'http://localhost:8080';
+    document.getElementById('apiBase').value = apiBase;
+  }
+  const dsKey = document.getElementById('dataset').value;
+  const ds = DATASETS[dsKey];
   const lookback = parseInt(document.getElementById('lookback').value);
 
   document.getElementById('fetchBtn').disabled = true;
   setStatus('loading', `查询 zponder: ${apiBase} ...`);
 
-  // 1. 获取同步状态 → 知道最新区块
+  // 1. 获取最新同步区块
   let latestBlock = 0;
   try {
     const r = await fetch(`${apiBase}/sync_state`);
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     const states = await r.json();
     for (const s of states) {
-      if (s.name === contractName && s.current_block > latestBlock) {
+      if (s.name === ds.contract && s.current_block > 0) {
         latestBlock = s.current_block;
+        break;
       }
     }
   } catch (e) {
@@ -179,186 +170,174 @@ async function fetchFromZponder() {
     return;
   }
 
+  // 2. 如果还在同步中，用 RPC 最新区块
+  if (latestBlock === 0) {
+    setStatus('error', `合约 ${ds.contract} 未被索引`);
+    document.getElementById('fetchBtn').disabled = false;
+    return;
+  }
+
   const fromBlock = Math.max(0, latestBlock - lookback);
   document.getElementById('syncInfo').textContent =
-    `zponder 已同步到区块 ${latestBlock.toLocaleString()}，查询范围 ${fromBlock.toLocaleString()} ~ ${latestBlock.toLocaleString()}`;
+    `zponder 已同步到 ${latestBlock.toLocaleString()}，查询 ${fromBlock.toLocaleString()} ~ ${latestBlock.toLocaleString()}`;
 
-  // 2. 分页拉取 Swap 事件
-  const allSwaps = [];
+  // 3. 分页拉取
+  const allRows = [];
   const pageSize = 1000;
   let offset = 0;
 
   while (true) {
-    const url = `${apiBase}/events/${contractName}/Swap?block_from=${fromBlock}&limit=${pageSize}&offset=${offset}&order=asc`;
+    const url = `${apiBase}/events/${ds.contract}/${ds.event}?block_from=${fromBlock}&limit=${pageSize}&offset=${offset}&order=asc`;
     try {
       const r = await fetch(url);
       if (!r.ok) break;
       const rows = await r.json();
       if (!Array.isArray(rows) || rows.length === 0) break;
-      allSwaps.push(...rows);
-      const isLastPage = rows.length < pageSize;
+      allRows.push(...rows);
       offset += pageSize;
-      setStatus('loading', `已获取 ${allSwaps.length.toLocaleString()} 条 Swap 记录...`);
-      if (isLastPage) break;
-    } catch(e) {
-      console.warn('分页请求失败:', e);
-      break;
-    }
+      setStatus('loading', `${ds.label}: ${allRows.length.toLocaleString()} 条...`);
+      if (rows.length < pageSize) break;
+    } catch(e) { break; }
   }
 
-  if (allSwaps.length === 0) {
-    setStatus('warning', '查询范围内无 Swap 事件 (尝试增大回溯区块)');
+  if (allRows.length === 0) {
+    setStatus('warning', '无数据 (尝试增大块范围)');
     document.getElementById('fetchBtn').disabled = false;
     return;
   }
 
-  return allSwaps;
+  document.getElementById('subtitle').textContent =
+    `${ds.label} — ${allRows.length.toLocaleString()} 条链上事件`;
+
+  return { rows: allRows, ds };
 }
 
 // ============================================================================
-// OHLC 聚合
+// 聚合 + 渲染
 // ============================================================================
-function aggregateToOHLC(swaps, intervalSec) {
-  // BSC 出块时间 ~3s，用 block_number 估算时间戳
-  // BSC 创世块时间 2020-08-29 约 1598659200
-  const BSC_GENESIS = 1598659200; // unix timestamp
-  const BSC_BLOCK_TIME = 3;       // seconds
+function render(rows, ds, intervalSec) {
+  const BSC_GENESIS = 1598659200;
+  const BSC_BLOCK_TIME = 3;
 
-  const candles = new Map();
+  // 按时间桶聚合
+  const buckets = new Map(); // key: epoch_sec → { o,h,l,c,vol,count }
 
-  for (const row of swaps) {
-    const block = typeof row.block_number === 'number' ? row.block_number : parseInt(row.block_number) || 0;
-    // 估算区块时间戳
+  for (const row of rows) {
+    const block = parseBlock(row);
     const estTs = BSC_GENESIS + block * BSC_BLOCK_TIME;
     const bucket = Math.floor(estTs / intervalSec) * intervalSec;
 
-    // 读取 zponder 返回的字段 (sanitizeColumnName: lowercase, evt_ prefix)
-    const a0i = parseUint256(row[SWAP_FIELDS.amount0In]  || row['evt_amount0in']  || '0x0');
-    const a1i = parseUint256(row[SWAP_FIELDS.amount1In]  || row['evt_amount1in']  || '0x0');
-    const a0o = parseUint256(row[SWAP_FIELDS.amount0Out] || row['evt_amount0out'] || '0x0');
-    const a1o = parseUint256(row[SWAP_FIELDS.amount1Out] || row['evt_amount1out'] || '0x0');
-
-    // price = amount1 / amount0 (quote per base, BUSD per WBNB)
-    const amt0 = a0i + a0o;
-    const amt1 = a1i + a1o;
-    if (amt0 === 0) continue;
-    const price = amt1 / amt0;
-
-    let c = candles.get(bucket);
-    if (!c) {
-      c = { time: bucket, open: price, high: price, low: price, close: price, vol: 0 };
-      candles.set(bucket, c);
+    let val = 0;
+    if (ds.isSwap) {
+      // Swap: price = amount1 / amount0
+      const a0i = parseU256(row.evt_amount0in  || '0x0');
+      const a1i = parseU256(row.evt_amount1in  || '0x0');
+      const a0o = parseU256(row.evt_amount0out || '0x0');
+      const a1o = parseU256(row.evt_amount1out || '0x0');
+      const amt0 = a0i + a0o;
+      const amt1 = a1i + a1o;
+      val = amt0 > 0 ? amt1 / amt0 : 0;
+    } else {
+      // Transfer: value = amount / 1e18
+      val = parseU256(row.evt_value || '0x0');
     }
-    if (price > c.high) c.high = price;
-    if (price < c.low) c.low = price;
-    c.close = price;
-    c.vol += amt1;
+
+    let b = buckets.get(bucket);
+    if (!b) {
+      b = { time: bucket, open: val, high: val, low: val, close: val, vol: val, count: 1 };
+      buckets.set(bucket, b);
+    }
+    if (val > b.high) b.high = val;
+    if (val < b.low) b.low = val;
+    b.close = val;
+    b.vol += val;
+    b.count += 1;
   }
 
-  const result = [];
-  for (const [_, c] of candles) result.push(c);
-  result.sort((a, b) => a.time - b.time);
-  return result;
-}
-
-// ============================================================================
-// 主流程
-// ============================================================================
-async function loadAndRender() {
-  const swaps = await fetchFromZponder();
-  if (!swaps) return;
-
-  const intervalSec = parseInt(document.getElementById('interval').value);
-  const candles = aggregateToOHLC(swaps, intervalSec);
-
-  if (candles.length === 0) {
-    setStatus('warning', '无法聚合出 K线 (Swap 事件太少)');
-    document.getElementById('fetchBtn').disabled = false;
-    return;
-  }
+  const arr = [...buckets.values()].sort((a,b) => a.time - b.time);
+  if (arr.length === 0) { setStatus('warning', '聚合后无数据'); return; }
 
   // 渲染
-  initChart();
-  candleSeries.setData(candles);
-  volumeSeries.setData(candles.map(c => ({
-    time: c.time, value: c.vol,
+  initCharts();
+  candleSeries.setData(arr);
+  volHistSeries.setData(arr.map(c => ({
+    time: c.time,
+    value: ds.isSwap ? c.vol : c.count,
     color: c.close >= c.open ? 'rgba(34,197,94,0.3)' : 'rgba(239,68,68,0.3)'
   })));
   chart.timeScale().fitContent();
 
   // 统计
-  const first = candles[0], last = candles[candles.length - 1];
+  const first = arr[0], last = arr[arr.length-1];
   const change = last.close - first.open;
-  const pct = (change / first.open * 100);
+  const pct = first.open > 0 ? (change / first.open * 100) : 0;
+
   document.getElementById('stats').innerHTML = [
-    `K线: <b>${candles.length}</b>`,
-    `Swap事件: <b>${swaps.length.toLocaleString()}</b>`,
-    `周期: <b>${formatInterval(intervalSec)}</b>`,
-    `开: <b>${fmt(first.open)}</b>`,
-    `高: <b>${fmt(Math.max(...candles.map(c=>c.high)))}</b>`,
-    `低: <b>${fmt(Math.min(...candles.map(c=>c.low)))}</b>`,
-    `收: <b>${fmt(last.close)}</b>`,
+    `桶数: <b>${arr.length}</b>`,
+    `事件数: <b>${rows.length.toLocaleString()}</b>`,
+    `周期: <b>${fmtInterval(intervalSec)}</b>`,
+    ds.isSwap
+      ? `价格 开: <b>${fmtPrice(first.open)}</b> 收: <b>${fmtPrice(last.close)}</b>`
+      : `总量: <b>${fmtValue(last.vol)}</b>`,
     `<span style="color:${change>=0?'#22c55e':'#ef4444'}">涨跌: <b>${pct>=0?'+':''}${pct.toFixed(2)}%</b></span>`,
   ].join(' &nbsp;|&nbsp; ');
 
-  setStatus('ok', `${candles.length} 根K线, ${swaps.length.toLocaleString()} 条链上Swap`);
+  setStatus('ok', `${arr.length} 个数据点, ${rows.length.toLocaleString()} 条事件`);
   document.getElementById('fetchBtn').disabled = false;
 }
 
 // ============================================================================
-// 工具函数
+// 工具
 // ============================================================================
-function parseUint256(hex) {
-  if (typeof hex === 'number') return hex;
+function parseU256(hex) {
+  if (hex === null || hex === undefined) return 0;
+  if (typeof hex === 'number') return hex / 1e18;
   const s = String(hex).trim();
+  if (!s || s === '0x') return 0;
   if (s.startsWith('0x') || s.startsWith('0X')) {
     const clean = s.slice(2).replace(/^0+/, '') || '0';
-    try {
-      // BigInt division to get token amount (18 decimals for BUSD/WBNB/CAKE)
-      return Number(BigInt('0x' + clean)) / 1e18;
-    } catch { return 0; }
+    try { return Number(BigInt('0x' + clean)) / 1e18; } catch { return 0; }
   }
-  return parseFloat(s) || 0;
+  return parseFloat(s) / 1e18 || 0;
 }
 
-function fmt(n) {
-  if (n >= 10000) return n.toFixed(2);
-  if (n >= 1) return n.toFixed(4);
-  if (n >= 0.001) return n.toFixed(6);
-  return n.toExponential(4);
+function parseBlock(row) {
+  const bn = row.block_number;
+  if (typeof bn === 'number') return bn;
+  return parseInt(String(bn), 10) || 0;
 }
 
-function formatInterval(sec) {
-  if (sec < 300) return `${sec}s`;
-  if (sec < 3600) return `${sec/60}m`;
-  if (sec < 86400) return `${sec/3600}h`;
-  return `${sec/86400}d`;
-}
-
-function setStatus(state, msg) {
-  const dot = document.getElementById('statusDot');
-  dot.className = 'w-2.5 h-2.5 rounded-full ' + (
-    state === 'loading' ? 'bg-yellow-500 loading-dot' :
-    state === 'ok' ? 'bg-green-500' :
-    state === 'warning' ? 'bg-yellow-500' : 'bg-red-500'
-  );
+function fmtPrice(n) { return n >= 1 ? n.toFixed(6) : n.toFixed(12); }
+function fmtValue(n) { return n >= 1e6 ? (n/1e6).toFixed(2)+'M' : n >= 1e3 ? (n/1e3).toFixed(2)+'K' : n.toFixed(2); }
+function fmtInterval(s) { return s<300?`${s}s` : s<3600?`${s/60}m` : s<86400?`${s/3600}h` : `${s/86400}d`; }
+function setStatus(s, msg) {
+  document.getElementById('statusDot').className = 'w-2.5 h-2.5 rounded-full ' +
+    (s==='loading'?'bg-yellow-500 loading-dot': s==='ok'?'bg-emerald-500': s==='warning'?'bg-yellow-500':'bg-red-500');
   document.getElementById('statusText').textContent = msg;
 }
 
 // ============================================================================
 // 事件
 // ============================================================================
-document.getElementById('pair').addEventListener('change', function() {
-  document.getElementById('customPair').classList.toggle('hidden', this.value !== 'custom');
-});
-document.getElementById('fetchBtn').addEventListener('click', loadAndRender);
+async function load() {
+  const result = await fetchData();
+  if (!result) return;
+  const intervalSec = parseInt(document.getElementById('interval').value);
+  render(result.rows, result.ds, intervalSec);
+}
+
+document.getElementById('fetchBtn').addEventListener('click', load);
 window.addEventListener('resize', () => {
   if (chart) chart.applyOptions({ width: document.getElementById('chart').clientWidth });
+  if (volChart) volChart.applyOptions({ width: document.getElementById('volChart').clientWidth });
 });
 
-// 首次加载
-initChart();
-setTimeout(loadAndRender, 500);
+// 自动加载
+initCharts();
+setTimeout(load, 500);
+
+// 每30秒刷新
+setInterval(load, 30000);
 </script>
 </body>
 </html>

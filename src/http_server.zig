@@ -5,6 +5,7 @@ const indexer = @import("indexer.zig");
 const cache = @import("cache.zig");
 const log = @import("log.zig");
 const utils = @import("utils.zig");
+const template = @import("template.zig");
 
 const build_options = @import("build_options");
 
@@ -231,7 +232,11 @@ pub const Server = struct {
             return;
         }
 
-        if (method == .GET and std.mem.eql(u8, target, "/health")) {
+        if (method == .GET and std.mem.startsWith(u8, target, "/pages/")) {
+            try self.handlePage(request);
+        } else if (method == .GET and (std.mem.eql(u8, target, "/") or std.mem.eql(u8, target, "/kline"))) {
+            try self.handlePagePath(request, "pages/kline.html");
+        } else if (method == .GET and std.mem.eql(u8, target, "/health")) {
             try self.handleHealth(request);
         } else if (method == .GET and std.mem.eql(u8, target, "/sync_state")) {
             try self.handleSyncState(request);
@@ -641,6 +646,86 @@ pub const Server = struct {
         var list = buf.toArrayList();
         defer list.deinit(self.alloc);
         try self.sendJson(request, list.items, .ok);
+    }
+
+    /// 模板变量 (返回值由调用方负责 deinit)
+    fn buildTemplateVars(self: *Server) !template.VarMap {
+        var vars = try template.VarMap.init(self.alloc, 5);
+        errdefer vars.deinit(self.alloc);
+
+        try vars.putOwned(self.alloc, 0, "API", try std.fmt.allocPrint(self.alloc, "http://{s}:{d}", .{ self.config.host, self.config.port }));
+        try vars.putOwned(self.alloc, 1, "VERSION", try std.fmt.allocPrint(self.alloc, "{s} ({s})", .{ build_options.version, build_options.git_commit }));
+
+        // 合约列表
+        var cb = std.ArrayList(u8).empty;
+        try cb.appendSlice(self.alloc, "[");
+        for (self.indexers, 0..) |idx, i| {
+            if (i > 0) try cb.appendSlice(self.alloc, ",");
+            try cb.print(self.alloc, "{{\"name\":\"{s}\",\"address\":\"{s}\",\"block\":{}}}", .{
+                idx.contract.name, idx.contract.address, idx.getCurrentBlock(),
+            });
+        }
+        try cb.appendSlice(self.alloc, "]");
+        try vars.putOwned(self.alloc, 2, "CONTRACTS", cb.items);
+
+        // 同步状态
+        var sb = std.ArrayList(u8).empty;
+        try sb.appendSlice(self.alloc, "[");
+        for (self.indexers, 0..) |idx, i| {
+            if (i > 0) try sb.appendSlice(self.alloc, ",");
+            try sb.print(self.alloc, "{{\"name\":\"{s}\",\"block\":{},\"state\":\"syncing\"}}", .{ idx.contract.name, idx.getCurrentBlock() });
+        }
+        try sb.appendSlice(self.alloc, "]");
+        try vars.putOwned(self.alloc, 3, "SYNC_STATE", sb.items);
+
+        const cs = self.cache.stats();
+        try vars.putOwned(self.alloc, 4, "CACHE_STATS", try std.fmt.allocPrint(self.alloc, "{{\"entries\":{},\"bytes\":{}}}", .{ cs.count, cs.total_bytes }));
+
+        return vars;
+    }
+
+    fn deinitTemplateVars(self: *Server, v: *template.VarMap) void {
+        for (v.values) |val| self.alloc.free(val);
+        for (v.keys) |key| self.alloc.free(key);
+        v.deinit(self.alloc);
+    }
+
+    fn handlePage(self: *Server, request: *std.http.Server.Request) !void {
+        const prefix = "/pages/";
+        const page_name = request.head.target[prefix.len..];
+        if (page_name.len == 0) {
+            try self.sendJson(request, "{\"error\":\"usage: /pages/:name\"}", .bad_request);
+            return;
+        }
+        var path_buf: [512]u8 = undefined;
+        const file_path = try std.fmt.bufPrint(&path_buf, "pages/{s}.html", .{page_name});
+        try self.handlePagePath(request, file_path);
+    }
+
+    fn handlePagePath(self: *Server, request: *std.http.Server.Request, file_path: []const u8) !void {
+        const raw = std.Io.Dir.cwd().readFileAlloc(self.io, file_path, self.alloc, .limited(256 * 1024)) catch {
+            try self.sendJson(request, "{\"error\":\"page not found\"}", .not_found);
+            return;
+        };
+        defer self.alloc.free(raw);
+
+        var vars = self.buildTemplateVars() catch template.VarMap{ .keys = &.{}, .values = &.{} };
+        defer {
+            for (vars.keys) |k| self.alloc.free(k);
+            for (vars.values) |v| self.alloc.free(v);
+            vars.deinit(self.alloc);
+        }
+
+        const rendered = template.render(self.alloc, self.io, raw, vars) catch raw;
+        defer if (rendered.ptr != raw.ptr) self.alloc.free(rendered);
+
+        try request.respond(rendered, .{
+            .status = .ok,
+            .extra_headers = &.{
+                .{ .name = "Content-Type", .value = "text/html; charset=utf-8" },
+                .{ .name = "Access-Control-Allow-Origin", .value = "*" },
+            },
+        });
     }
 
     fn handleVersion(self: *Server, request: *std.http.Server.Request) !void {
