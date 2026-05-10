@@ -159,6 +159,9 @@ pub fn start(alloc: std.mem.Allocator, cfg: *const config.GraphQLConfig, ctx: Co
         .ctx_ptr = ctx_ptr,
         .rate_limiter = rate_limiter,
     };
+    // Fix: the server's schema_def pointer must point to the heap copy in wrapper,
+    // not the stack-local schema_def which goes out of scope when start() returns.
+    wrapper.server.schema_def = &wrapper.schema_def;
 
     const thread = std.Thread.spawn(.{}, ServerWrapper.run, .{wrapper}) catch |err| {
         if (rate_limiter) |*rl| rl.deinit();

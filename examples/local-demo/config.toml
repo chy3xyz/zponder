@@ -1,0 +1,38 @@
+# zponder Local Demo Configuration
+# Indexes a DemoToken ERC20 on a local Anvil node.
+
+[global]
+log_level = "info"
+log_file = ""
+snapshot_interval = 0
+chain = "anvil"
+track_blocks = true
+
+[rpc]
+url = "http://localhost:8545"
+timeout = 10000
+retry_count = 3
+
+[database]
+type = "sqlite"
+db_name = "demo_indexer.db"
+
+[http]
+port = 9090
+host = "0.0.0.0"
+cors = false
+
+[graphql]
+enabled = true
+port = 9091
+host = "0.0.0.0"
+enable_playground = true
+max_query_depth = 20
+max_query_complexity = 1000
+
+[[contracts]]
+name = "demo"
+address = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+abi_path = "./examples/local-demo/DemoToken.abi"
+from_block = 0
+events = ["Transfer"]

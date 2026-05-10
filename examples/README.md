@@ -1,49 +1,62 @@
-# zponder 示例
+# zponder Examples
 
-## K线图 (`kline.html`)
+## Local Demo (`local-demo/`)
 
-基于链上 Swap 事件的 OHLC 聚合 + 交互式蜡烛图。
-
-```
-打开方式: 浏览器直接打开 examples/kline.html
-```
-
-### 功能
-- 从 zponder `/events/:contract/:event` API 拉取 Swap 事件
-- 按时间聚合为 OHLC (开高低收) 蜡烛图
-- 支持 1m / 5m / 15m / 1h / 4h K线周期
-- 内置 PancakeSwap BUSD/WBNB、CAKE/WBNB 预设 (BNB Chain)
-- 内置 Uniswap USDC/WETH 预设 (Ethereum)
-- Mock 模式 — API 不可用时自动生成演示数据
-- 使用 TradingView Lightweight Charts 渲染
-
-### 使用前提
-
-**方式 1: 连接运行中的 zponder**
+Full end-to-end demo that runs a local Anvil Ethereum node, deploys an ERC20 token,
+indexes Transfer events with zponder, and queries both REST and GraphQL APIs.
 
 ```bash
-# 1. 启动 zponder 索引 PancakeSwap pair
-# config.toml:
-#   chain = "bsc"
-#   [[contracts]]
-#   name = "busd_wbnb"
-#   address = "0x58f876857a02d6762e0101bb5c46a3f4e5d07bf3"
-#   events = ["Swap"]
-
-zig build run -- -c config.toml
-
-# 2. 浏览器打开 examples/kline.html
-# 3. 选择预设 "PancakeSwap BUSD/WBNB"
-# 4. 点击 "加载数据"
+# From the project root:
+bash examples/local-demo/run.sh
 ```
 
-**方式 2: 纯前端演示 (Mock 模式)**
+**Prerequisites:** Zig 0.16.0+, Foundry (anvil + cast), solc, sqlite3
 
-直接打开 `kline.html`，无需启动 zponder。图表自动使用模拟数据渲染。
+**What it does:**
+1. Starts Anvil (local Ethereum node on port 8545)
+2. Compiles and deploys a DemoToken ERC20 contract
+3. Sends 3 transfer transactions to generate events
+4. Builds zponder (if not already built)
+5. Starts zponder with demo configuration
+6. Indexes all Transfer events (blocks 0–4)
+7. Queries REST API (`/health`, `/events`, `/sync_state`, `/version`)
+8. Queries GraphQL API (`contracts`, `syncStates`, `latestEvents`, `contractCall`)
 
-### PancakeSwap V2 Pair ABI (最小化)
+**Files:**
+- `run.sh` — automated demo script
+- `DemoToken.sol` — minimal ERC20 contract
+- `DemoToken.abi` — compiled ABI
+- `config.toml` — zponder configuration
 
-索引 PancakeSwap/Uniswap V2 交易对需要以下 ABI：
+---
+
+## Kline Chart (`kline.html`)
+
+Interactive OHLC candlestick chart from on-chain Swap events.
+
+Open `examples/kline.html` in a browser.
+
+**Features:**
+- Fetches Swap events from zponder REST API
+- Aggregates into OHLC candles (1m / 5m / 15m / 1h / 4h)
+- Built-in presets for PancakeSwap and Uniswap pairs
+- Mock mode fallback when API is unavailable
+- Rendered with TradingView Lightweight Charts v5
+
+### Requirements
+
+**Option 1: Connect to running zponder**
+
+```bash
+zig build run -- -c config.toml  # with Swap contract configured
+# Then open kline.html in browser → select preset → load
+```
+
+**Option 2: Pure frontend demo (Mock mode)**
+
+Just open `kline.html` — no zponder needed. Chart renders with mock data.
+
+### PancakeSwap V2 Pair ABI
 
 ```json
 [{
@@ -60,25 +73,22 @@ zig build run -- -c config.toml
 }]
 ```
 
-### K线计算逻辑
+### How It Works
 
 ```
-price = (amount0In + amount0Out) / (amount1In + amount1Out)
-       = token1 per token0
+price = (amount0In + amount0Out) / (amount1In + amount1Out)  // token1 per token0
 
-每个 Swap 事件:
-  open  = 区间第一个 price
+Per candle interval:
+  open  = first price in interval
   high  = max(price)
   low   = min(price)
-  close = 区间最后一个 price
+  close = last price in interval
   volume = Σ amount1
 ```
 
-### 技术栈
-
-| 组件 | 选型 |
-|------|------|
-| 图表库 | TradingView Lightweight Charts v5 (免费, CDN) |
+| Layer | Technology |
+|-------|------------|
+| Charts | TradingView Lightweight Charts v5 (CDN) |
 | CSS | Tailwind CSS CDN |
-| 框架 | 无 — 纯 vanilla JS |
-| 数据源 | zponder HTTP API (带 mock fallback) |
+| Framework | Vanilla JS (no build step) |
+| Data | zponder HTTP API + mock fallback |
