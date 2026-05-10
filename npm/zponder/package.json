@@ -3,7 +3,10 @@
   "version": "0.3.0",
   "description": "Production-grade EVM event indexer written in Zig — index any contract on any EVM chain, with REST + GraphQL APIs",
   "license": "MIT",
-  "repository": "github:chy3xyz/zponder",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/chy3xyz/zponder.git"
+  },
   "homepage": "https://github.com/chy3xyz/zponder",
   "keywords": [
     "ethereum",
