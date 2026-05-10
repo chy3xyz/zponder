@@ -27,6 +27,13 @@ logs/
 *.swp
 *.swo
 
+# npm binary artifacts (built with scripts/build-all-targets.sh)
+npm/zponder/bin/darwin-arm64/zponder
+npm/zponder/bin/darwin-x64/zponder
+npm/zponder/bin/linux-x64/zponder
+npm/zponder/bin/linux-arm64/zponder
+npm/zponder/bin/zponder
+
 # Environment
 .env
 .gstack/

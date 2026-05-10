@@ -1,0 +1,23 @@
+# Build artifacts
+.zig-cache/
+zig-out/
+zig-pkg/
+
+# Source (not needed for binary distribution)
+src/
+abis/
+pages/
+docs/
+examples/
+config.toml
+build.zig
+build.zig.zon
+AGENTS.md
+
+# Dev files
+.gstack/
+.claude/
+.vscode/
+
+# Scripts
+scripts/

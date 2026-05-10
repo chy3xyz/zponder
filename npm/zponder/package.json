@@ -1,0 +1,40 @@
+{
+  "name": "zponder",
+  "version": "0.3.0",
+  "description": "Production-grade EVM event indexer written in Zig — index any contract on any EVM chain, with REST + GraphQL APIs",
+  "license": "MIT",
+  "repository": "github:chy3xyz/zponder",
+  "homepage": "https://github.com/chy3xyz/zponder",
+  "keywords": [
+    "ethereum",
+    "evm",
+    "indexer",
+    "graphql",
+    "events",
+    "blockchain",
+    "web3",
+    "ponder",
+    "zig"
+  ],
+  "bin": {
+    "zponder": "bin/zponder"
+  },
+  "scripts": {
+    "postinstall": "node postinstall.js"
+  },
+  "files": [
+    "bin/",
+    "postinstall.js"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "cpu": [
+    "arm64",
+    "x64"
+  ]
+}
