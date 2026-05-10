@@ -32,7 +32,6 @@ npm/zponder/bin/darwin-arm64/zponder
 npm/zponder/bin/darwin-x64/zponder
 npm/zponder/bin/linux-x64/zponder
 npm/zponder/bin/linux-arm64/zponder
-npm/zponder/bin/zponder
 
 # Environment
 .env

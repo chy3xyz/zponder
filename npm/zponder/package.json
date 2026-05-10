@@ -1,6 +1,6 @@
 {
   "name": "zponder",
-  "version": "0.3.0",
+  "version": "0.3.2",
   "description": "Production-grade EVM event indexer written in Zig — index any contract on any EVM chain, with REST + GraphQL APIs",
   "license": "MIT",
   "repository": {

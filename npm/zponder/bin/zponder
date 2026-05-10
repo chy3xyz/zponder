@@ -1,0 +1,44 @@
+#!/usr/bin/env sh
+# zponder — auto-detect platform and exec the right binary.
+set -e
+
+# Resolve symlinks to find the real package bin/ directory.
+if command -v realpath >/dev/null 2>&1; then
+  SCRIPT_DIR="$(dirname "$(realpath "$0")")"
+elif command -v readlink >/dev/null 2>&1 && readlink "$0" >/dev/null 2>&1; then
+  # macOS: resolve relative symlink manually
+  LINK="$(readlink "$0")"
+  case "$LINK" in
+    /*) SCRIPT_DIR="$(dirname "$LINK")" ;;
+    *)  SCRIPT_DIR="$(cd "$(dirname "$0")" && cd "$(dirname "$LINK")" && pwd)" ;;
+  esac
+else
+  SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+fi
+
+UNAME_S=$(uname -s)
+UNAME_M=$(uname -m)
+
+case "$UNAME_S" in
+  Darwin)  PLAT="darwin" ;;
+  Linux)   PLAT="linux" ;;
+  *)       echo "zponder: unsupported OS '$UNAME_S'. Build from source: https://github.com/chy3xyz/zponder" >&2; exit 1 ;;
+esac
+
+case "$UNAME_M" in
+  arm64|aarch64) ARCH="arm64" ;;
+  x86_64)        ARCH="x64" ;;
+  *)             echo "zponder: unsupported arch '$UNAME_M'. Build from source: https://github.com/chy3xyz/zponder" >&2; exit 1 ;;
+esac
+
+BINARY="$SCRIPT_DIR/${PLAT}-${ARCH}/zponder"
+
+if [ -x "$BINARY" ]; then
+  exec "$BINARY" "$@"
+fi
+
+echo "zponder: no pre-built binary for ${PLAT}-${ARCH}." >&2
+echo "Available in:" >&2
+ls "$SCRIPT_DIR"/*/zponder 2>/dev/null | sed "s|$SCRIPT_DIR/|  |;s|/zponder||" >&2 || true
+echo "Build from source: git clone https://github.com/chy3xyz/zponder" >&2
+exit 1

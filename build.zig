@@ -12,7 +12,6 @@ fn getVersionFromZon(b: *std.Build) []const u8 {
     const argv = &.{ "grep", "version", b.pathFromRoot("build.zig.zon") };
     var out_code: u8 = 0;
     const stdout = b.runAllowFail(argv, &out_code, .ignore) catch return "0.1.0";
-    // 期望输出: .version = "0.1.0",
     const trimmed = std.mem.trim(u8, stdout, " \n\r\t,");
     const prefix = ".version = \"";
     const start = std.mem.indexOf(u8, trimmed, prefix) orelse return "0.1.0";
@@ -63,7 +62,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // 链接 SQLite3 + RocksDB + PostgreSQL（系统库）
     exe.root_module.linkSystemLibrary("sqlite3", .{});
     exe.root_module.linkSystemLibrary("rocksdb", .{});
     exe.root_module.linkSystemLibrary("pq", .{});

@@ -1,48 +1,48 @@
 #!/usr/bin/env node
 /**
- * zponder npm postinstall — select the correct binary for the current platform.
- *
- * The package ships with pre-built binaries in bin/<platform>/.
- * This script symlinks (or copies) the correct one to bin/zponder.
+ * zponder postinstall — verify runtime dependencies are available.
+ * The bin/zponder wrapper script auto-detects the platform at runtime.
  */
-
-const fs = require("fs");
-const path = require("path");
+const { execSync } = require("child_process");
 const os = require("os");
+const fs = require("fs");
 
-const BIN_DIR = path.join(__dirname, "bin");
-const TARGET = path.join(BIN_DIR, "zponder");
-
-function platformDir() {
-  const plat = os.platform();   // "darwin" | "linux" | "win32"
-  const arch = os.arch();       // "arm64" | "x64"
-  return `${plat}-${arch}`;
-}
+const BOLD = "\x1b[1m";
+const RESET = "\x1b[0m";
 
 function run() {
-  const dir = platformDir();
-  const source = path.join(BIN_DIR, dir, "zponder");
+  const plat = os.platform() + "-" + os.arch();
+  const binDir = `${__dirname}/bin`;
 
-  if (!fs.existsSync(source)) {
-    console.error(
-      `zponder: no pre-built binary for ${dir}. ` +
-      `Available: ${fs.readdirSync(BIN_DIR).filter(f => f !== "zponder" && !f.endsWith(".js")).join(", ")}. ` +
-      `Build from source: https://github.com/chy3xyz/zponder`
-    );
-    process.exit(1);
+  // Check if pre-built binary exists for this platform
+  const binaryPath = `${binDir}/${plat}/zponder`;
+  if (fs.existsSync(binaryPath)) {
+    console.log(`zponder: pre-built binary found for ${plat}`);
+  } else if (plat !== "darwin-arm64") {
+    // Pre-built currently only for darwin-arm64
+    console.log(`zponder: no pre-built binary for ${plat} (available: darwin-arm64)`);
   }
 
-  // Remove existing link/copy
-  try { fs.unlinkSync(TARGET); } catch (_) { /* ok */ }
-
-  // Prefer hard link, fall back to copy
-  try {
-    fs.linkSync(source, TARGET);
-    console.log(`zponder: linked bin/${dir}/zponder → bin/zponder`);
-  } catch (_) {
-    fs.copyFileSync(source, TARGET);
-    fs.chmodSync(TARGET, 0o755);
-    console.log(`zponder: copied bin/${dir}/zponder → bin/zponder`);
+  // Check sqlite3
+  if (os.platform() === "darwin") {
+    try {
+      execSync("pkg-config --exists sqlite3 2>/dev/null || echo sqlite3 | cc -lsqlite3 -x c - -o /dev/null 2>/dev/null", { stdio: "ignore" });
+    } catch (_) {
+      console.log("");
+      console.log(`${BOLD}  zponder requires SQLite3. Install it:${RESET}`);
+      console.log(`    brew install sqlite3`);
+      console.log("");
+    }
+  }
+  if (os.platform() === "linux") {
+    try {
+      execSync("ldconfig -p 2>/dev/null | grep -q libsqlite3 || dpkg -l libsqlite3-dev 2>/dev/null", { stdio: "ignore" });
+    } catch (_) {
+      console.log("");
+      console.log(`${BOLD}  zponder requires SQLite3. Install it:${RESET}`);
+      console.log(`    apt install libsqlite3-dev`);
+      console.log("");
+    }
   }
 }
 
