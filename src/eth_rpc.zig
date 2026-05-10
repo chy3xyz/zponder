@@ -90,6 +90,105 @@ pub const Client = struct {
         return try self.alloc.dupe(u8, hash_val.string);
     }
 
+    pub const BlockData = struct {
+        hash: []const u8,
+        number: u64,
+        timestamp: u64,
+        miner: []const u8,
+        gas_used: u64,
+        gas_limit: u64,
+        base_fee_per_gas: []const u8,
+        transaction_count: u64,
+    };
+
+    pub fn getBlockData(self: *Client, block_number: u64) !?BlockData {
+        const params = try std.fmt.allocPrint(self.alloc, "[\"0x{x}\",false]", .{block_number});
+        defer self.alloc.free(params);
+
+        const raw = try self.rpcCallWithRetry("eth_getBlockByNumber", params);
+        defer self.alloc.free(raw);
+
+        const parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, raw, .{});
+        defer parsed.deinit();
+
+        const result = parsed.value.object.get("result") orelse return null;
+        if (result != .object) return null;
+        const obj = result.object;
+
+        const hash_val = obj.get("hash") orelse return null;
+        if (hash_val != .string) return null;
+
+        const number_str = obj.get("number") orelse return null;
+        const block_num = if (number_str == .string) utils.parseHexU64(number_str.string) catch return null else return null;
+
+        const timestamp_str = obj.get("timestamp") orelse return null;
+        const ts = if (timestamp_str == .string) utils.parseHexU64(timestamp_str.string) catch return null else return null;
+
+        const miner_str = if (obj.get("miner")) |m| blk: {
+            if (m == .string) break :blk try self.alloc.dupe(u8, m.string);
+            break :blk try self.alloc.dupe(u8, "");
+        } else try self.alloc.dupe(u8, "");
+
+        const gas_used_str = obj.get("gasUsed") orelse return null;
+        const gu = if (gas_used_str == .string) utils.parseHexU64(gas_used_str.string) catch return null else return null;
+
+        const gas_limit_str = obj.get("gasLimit") orelse return null;
+        const gl = if (gas_limit_str == .string) utils.parseHexU64(gas_limit_str.string) catch return null else return null;
+
+        const base_fee = if (obj.get("baseFeePerGas")) |bf| blk: {
+            if (bf == .string) break :blk try self.alloc.dupe(u8, bf.string);
+            break :blk try self.alloc.dupe(u8, "0x0");
+        } else try self.alloc.dupe(u8, "0x0");
+
+        var tx_count: u64 = 0;
+        if (obj.get("transactions")) |txs| {
+            if (txs == .array) {
+                tx_count = txs.array.items.len;
+            }
+        }
+
+        return BlockData{
+            .hash = try self.alloc.dupe(u8, hash_val.string),
+            .number = block_num,
+            .timestamp = ts,
+            .miner = miner_str,
+            .gas_used = gu,
+            .gas_limit = gl,
+            .base_fee_per_gas = base_fee,
+            .transaction_count = tx_count,
+        };
+    }
+
+    pub fn freeBlockData(alloc: std.mem.Allocator, data: BlockData) void {
+        alloc.free(data.hash);
+        alloc.free(data.miner);
+        alloc.free(data.base_fee_per_gas);
+    }
+
+    /// 调用合约方法 (eth_call)。返回原始 hex 结果字符串。
+    pub fn ethCall(self: *Client, to: []const u8, data: []const u8, block_number: ?u64) ![]u8 {
+        const block_tag = if (block_number) |bn|
+            try std.fmt.allocPrint(self.alloc, "\"0x{x}\"", .{bn})
+        else
+            try self.alloc.dupe(u8, "\"latest\"");
+        defer self.alloc.free(block_tag);
+
+        const params = try std.fmt.allocPrint(self.alloc,
+            \\[{{"to":"{s}","data":"{s}"}},{s}]
+        , .{ to, data, block_tag });
+        defer self.alloc.free(params);
+
+        const raw = try self.rpcCallWithRetry("eth_call", params);
+        defer self.alloc.free(raw);
+
+        const parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, raw, .{});
+        defer parsed.deinit();
+
+        const result = parsed.value.object.get("result") orelse return error.NoResult;
+        if (result != .string) return error.InvalidResponse;
+        return try self.alloc.dupe(u8, result.string);
+    }
+
     /// 获取日志列表
     pub fn getLogs(self: *Client, filter: LogFilter) ![]Log {
         const params = try self.formatLogFilter(filter);

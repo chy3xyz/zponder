@@ -6,6 +6,8 @@ const eth_rpc = @import("eth_rpc.zig");
 const db = @import("db.zig");
 const indexer = @import("indexer.zig");
 const http_server = @import("http_server.zig");
+const graphql = @import("graphql.zig");
+const factory = @import("factory.zig");
 const cache = @import("cache.zig");
 const etherscan = @import("etherscan.zig");
 const abi = @import("abi.zig");
@@ -139,6 +141,8 @@ pub fn main(init: std.process.Init) !void {
         const idx = try indexer.Indexer.init(
             alloc, init.io, &rpc, &database,
             &resolved.contracts[i], cfg.global.snapshot_interval,
+            cfg.global.track_blocks, cfg.global.chain,
+            null, null, 0,
         );
         try indexers.append(alloc, idx);
         log.info("索引器: {s} ({s}) 起始={d} 事件={d}", .{
@@ -150,6 +154,29 @@ pub fn main(init: std.process.Init) !void {
     }
     for (indexers.items) |*idx| try indexer_ptrs.append(alloc, idx);
 
+    // 工厂合约管理
+    var factory_manager: ?factory.FactoryManager = null;
+    if (cfg.factories.len > 0) {
+        factory_manager = try factory.FactoryManager.init(
+            alloc, init.io, &rpc, &database,
+            cfg.factories, cfg.global.snapshot_interval,
+            cfg.global.chain, cfg.global.track_blocks,
+        );
+
+        // 将工厂回调关联到匹配的索引器
+        for (cfg.factories, 0..) |fc, fi| {
+            for (indexers.items) |*idx| {
+                if (std.mem.eql(u8, fc.address, idx.contract.address)) {
+                    idx.factory_ctx = &factory_manager.?;
+                    idx.factory_callback = factory.FactoryManager.onFactoryEventCallback;
+                    idx.factory_idx = fi;
+                    log.info("工厂 {s}: 已关联到索引器 {s}", .{ fc.name, idx.contract.name });
+                    break;
+                }
+            }
+        }
+    }
+
     // 8. 启动
     for (indexers.items) |*idx| try idx.start();
 
@@ -157,14 +184,42 @@ pub fn main(init: std.process.Init) !void {
     defer server.deinit();
     try server.start();
 
+    // GraphQL server (optional)
+    var graphql_shutdown = std.atomic.Value(bool).init(false);
+    var graphql_thread: ?std.Thread = null;
+    if (cfg.graphql.enabled) {
+        const gql_ctx = graphql.Context{
+            .database = &database,
+            .indexers = indexer_ptrs.items,
+            .chain = cfg.global.chain,
+            .shutdown_flag = &graphql_shutdown,
+            .rpc = &rpc,
+        };
+        graphql_thread = graphql.start(alloc, &cfg.graphql, gql_ctx) catch null;
+        if (graphql_thread == null) {
+            log.warn("GraphQL 服务启动失败", .{});
+        }
+    }
+
     log.info("所有模块已启动，索引器运行中...", .{});
 
     while (g_running.load(.monotonic)) {
         std.Io.sleep(init.io, std.Io.Duration.fromSeconds(1), .real) catch {};
+
+        // GraphQL server 收到 SIGINT 后自行退出，设置此标志触发主循环退出
+        if (graphql_shutdown.load(.acquire)) {
+            log.info("GraphQL 服务已退出，开始优雅关闭...", .{});
+            break;
+        }
     }
 
     log.info("收到终止信号，开始优雅退出...", .{});
     server.stop();
+    if (factory_manager) |*fm| {
+        log.info("停止所有工厂子索引器...", .{});
+        fm.stopChildren();
+        log.info("工厂子索引器已停止", .{});
+    }
     for (indexers.items) |*idx| idx.stop();
     log.info("优雅退出完成", .{});
 }
@@ -279,6 +334,24 @@ fn cmdInit(alloc: std.mem.Allocator, io: std.Io) !void {
         \\[http]
         \\port = 8080
         \\host = "0.0.0.0"
+        \\
+        \\# [graphql]
+        \\# enabled = true
+        \\# port = 8081
+        \\# host = "0.0.0.0"
+        \\# enable_playground = true
+        \\# rate_limit_rps = 10
+        \\# rate_limit_burst = 100
+        \\
+        \\# [[factories]]
+        \\# name = "factory_name"
+        \\# address = "0x..."
+        \\# abi_path = "./abis/factory.abi"
+        \\# creation_event = "ContractCreated"
+        \\# child_address_field = "newContract"
+        \\# child_abi_path = "./abis/child.abi"
+        \\# child_events = ["Event1", "Event2"]
+        \\# max_children = 1000
         \\
         \\[[contracts]]
         \\name = "{s}"

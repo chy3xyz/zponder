@@ -212,6 +212,290 @@ CORS preflight. Returns `204 No Content` with CORS headers.
 
 ---
 
+## GraphQL API Reference
+
+When `[graphql].enabled = true`, a GraphQL server is available at the configured port (default `8081`).
+
+**Endpoint:** `POST /graphql`
+**Playground:** `GET /graphql/playground` (when `enable_playground = true`)
+**Health:** `GET /health`
+**Ready:** `GET /ready`
+**Metrics:** `GET /graphql/metrics`
+
+---
+
+### Query Fields
+
+#### `health`
+
+Returns server health status.
+
+```graphql
+query { health }
+```
+
+**Response:** `{ "data": { "health": "ok" } }`
+
+---
+
+#### `version`
+
+Returns version and git commit.
+
+```graphql
+query { version }
+```
+
+**Response:** `{ "data": { "version": "0.1.0 (a1b2c3d)" } }`
+
+---
+
+#### `contracts`
+
+Returns all configured contracts with metadata.
+
+```graphql
+query {
+  contracts {
+    name
+    address
+    chain
+    fromBlock
+    events
+  }
+}
+```
+
+**Response:**
+```json
+{
+  "data": {
+    "contracts": [
+      {
+        "name": "dai",
+        "address": "0x6b175474e89094c44da98b954eedeac495271d0f",
+        "chain": "ethereum",
+        "fromBlock": 20000000,
+        "events": ["Transfer", "Approval"]
+      }
+    ]
+  }
+}
+```
+
+---
+
+#### `contract(name: String!)`
+
+Returns a single contract by name. Returns `null` if not found.
+
+```graphql
+query {
+  contract(name: "dai") {
+    address
+    fromBlock
+  }
+}
+```
+
+---
+
+#### `syncStates`
+
+Returns sync status for all configured contracts.
+
+```graphql
+query {
+  syncStates {
+    contractName
+    currentBlock
+    status
+  }
+}
+```
+
+Status values (enum `IndexerStatus`): `RUNNING`, `STOPPED`, `ERROR`, `REPLAYING`.
+
+---
+
+#### `latestEvents`
+
+Paginated event log queries with optional block-range filters.
+
+**Arguments:**
+
+| Arg          | Type     | Default | Description                          |
+|--------------|----------|---------|--------------------------------------|
+| `contract`   | String!  | —       | Contract name (required)             |
+| `event`      | String!  | —       | Event name (required)                |
+| `limit`      | Int      | 10      | Max results (clamped to 1–1000)      |
+| `offset`     | Int      | 0       | Pagination offset                    |
+| `blockFrom`  | Int      | null    | Start block filter (inclusive)       |
+| `blockTo`    | Int      | null    | End block filter (inclusive)         |
+
+**Example:**
+
+```graphql
+query {
+  latestEvents(contract: "dai", event: "Transfer", limit: 5, blockFrom: 20000000) {
+    blockNumber
+    transactionHash
+    eventName
+    fields {
+      key
+      value
+    }
+  }
+}
+```
+
+**Response:**
+```json
+{
+  "data": {
+    "latestEvents": [
+      {
+        "blockNumber": 20000001,
+        "transactionHash": "0xabc123...",
+        "eventName": "Transfer",
+        "fields": [
+          { "key": "from", "value": "0x1111..." },
+          { "key": "to", "value": "0x2222..." },
+          { "key": "value", "value": "1000000000000000000" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+**Notes:**
+- The `fields` array contains all event parameters as key-value string pairs.
+- Contract name and event name are validated against alphanumeric + underscore characters (SQL injection prevention).
+- Returns `null` (and errors in `errors[]`) on database query failure.
+- Validator enforces argument types before resolver execution.
+
+---
+
+#### `contractCall`
+
+Calls a contract method via `eth_call` at a specific block height. Results are cached.
+
+**Arguments:**
+
+| Arg           | Type     | Default | Description                              |
+|---------------|----------|---------|------------------------------------------|
+| `contract`    | String!  | —       | Contract name (required)                 |
+| `method`      | String!  | —       | Method signature, e.g. `balanceOf(address)` |
+| `args`        | [String!]| —       | Hex-encoded arguments (optional)         |
+| `blockNumber` | Int      | null    | Block height (null = latest)             |
+
+**Example:**
+
+```graphql
+query {
+  contractCall(
+    contract: "dai"
+    method: "balanceOf(address)"
+    args: ["0x6B175474E89094C44Da98b954EedeAC495271d0F"]
+  )
+}
+```
+
+```graphql
+query {
+  contractCall(
+    contract: "dai"
+    method: "totalSupply()"
+    blockNumber: 20000000
+  )
+}
+```
+
+**Notes:**
+- Method signature format: `functionName(type1,type2,...)`. Only alphanumeric + parens + commas + underscores allowed.
+- Arguments must be hex-encoded (0x-prefixed), left-padded to 64 chars per argument.
+- Results are cached in the `call_cache` table keyed by `{contract_address}:{call_data}:{block_number}`.
+- Returns the decoded result as a string (uint256 → decimal, address → 0x format, bool → "true"/"false").
+- Returns `null` if the contract is not found, method signature is invalid, or the RPC call fails.
+
+---
+
+### GraphQL Types
+
+```graphql
+type Query {
+  health: String!
+  version: String!
+  contracts: [Contract!]!
+  contract(name: String!): Contract
+  syncStates: [SyncState!]!
+  latestEvents(
+    contract: String!,
+    event: String!,
+    limit: Int = 10,
+    offset: Int = 0,
+    blockFrom: Int,
+    blockTo: Int
+  ): [Event!]
+  contractCall(
+    contract: String!,
+    method: String!,
+    args: [String!],
+    blockNumber: Int
+  ): String
+}
+
+type Contract {
+  name: String!
+  address: String!
+  chain: String!
+  fromBlock: Int!
+  events: [String!]!
+}
+
+enum IndexerStatus {
+  RUNNING
+  STOPPED
+  ERROR
+  REPLAYING
+}
+
+type SyncState {
+  contractName: String!
+  currentBlock: Int!
+  status: IndexerStatus!
+}
+
+type Event {
+  blockNumber: Int!
+  transactionHash: String!
+  eventName: String!
+  fields: [EventField!]!
+}
+
+type EventField {
+  key: String!
+  value: String!
+}
+```
+
+---
+
+### Rate Limiting
+
+When `rate_limit_rps` is configured, the GraphQL server enforces a token-bucket rate limit per client IP. Exceeding the limit returns:
+
+```json
+{
+  "errors": [{ "message": "Rate limit exceeded" }]
+}
+```
+
+HTTP status: `429 Too Many Requests`.
+
+---
+
 <a name="中文-api-参考"></a>
 ## 中文 API 参考
 

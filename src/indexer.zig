@@ -14,6 +14,15 @@ pub const IndexerState = enum(u8) {
     replaying,
 };
 
+/// Callback invoked after a factory contract event is successfully recorded.
+pub const FactoryCallback = *const fn (
+    ctx: *anyopaque,
+    factory_idx: usize,
+    event_name: []const u8,
+    fields: []const db.DecodedField,
+    block_number: u64,
+) void;
+
 /// 核心索引器
 pub const Indexer = struct {
     alloc: std.mem.Allocator,
@@ -28,6 +37,11 @@ pub const Indexer = struct {
     poll_interval_ms: u32,
     abi_contract: ?abi.AbiContract,
     thread: ?std.Thread,
+    track_blocks: bool,
+    chain: []const u8,
+    factory_ctx: ?*anyopaque,
+    factory_callback: ?FactoryCallback,
+    factory_idx: usize,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -36,6 +50,11 @@ pub const Indexer = struct {
         database: *db.Client,
         contract: *const config.ContractConfig,
         snapshot_interval: u64,
+        track_blocks: bool,
+        chain: []const u8,
+        factory_ctx: ?*anyopaque,
+        factory_callback: ?FactoryCallback,
+        factory_idx: usize,
     ) !Indexer {
         // 加载 ABI
         var abi_contract: ?abi.AbiContract = null;
@@ -83,6 +102,11 @@ pub const Indexer = struct {
             .poll_interval_ms = poll_interval_ms,
             .abi_contract = abi_contract,
             .thread = null,
+            .track_blocks = track_blocks,
+            .chain = chain,
+            .factory_ctx = factory_ctx,
+            .factory_callback = factory_callback,
+            .factory_idx = factory_idx,
         };
     }
 
@@ -203,6 +227,12 @@ pub const Indexer = struct {
                 }
             } else |e| {
                 log.warn("获取区块 {d} hash 失败: {any}", .{ to_block, e });
+            }
+
+            if (self.track_blocks and to_block > 0) {
+                self.storeBlockMetadata(to_block) catch |e| {
+                    log.warn("存储区块 {d} 元数据失败: {any}", .{ to_block, e });
+                };
             }
 
             self.current_block.store(to_block + 1, .monotonic);
@@ -380,6 +410,12 @@ pub const Indexer = struct {
                     );
 
                     log.debug("已写入 {s}.{s} @ 区块 {}", .{ self.contract.name, evt.name, lg.block_number });
+
+                    if (self.factory_callback) |cb| {
+                        if (self.factory_ctx) |fctx| {
+                            cb(fctx, self.factory_idx, evt.name, db_fields.items, lg.block_number);
+                        }
+                    }
                     return;
                 }
             }
@@ -387,6 +423,27 @@ pub const Indexer = struct {
 
         // ABI 无法解析：返回错误让调用方记录，避免静默丢弃
         return error.AbiMismatch;
+    }
+
+    /// 存储区块元数据到 blocks 表
+    fn storeBlockMetadata(self: *Indexer, block_number: u64) !void {
+        const block_data = (try self.rpc.getBlockData(block_number)) orelse return;
+        defer {
+            self.alloc.free(block_data.hash);
+            self.alloc.free(block_data.miner);
+            self.alloc.free(block_data.base_fee_per_gas);
+        }
+        try self.database.upsertBlock(.{
+            .chain = self.chain,
+            .block_number = block_data.number,
+            .block_hash = block_data.hash,
+            .timestamp = block_data.timestamp,
+            .miner = block_data.miner,
+            .gas_used = block_data.gas_used,
+            .gas_limit = block_data.gas_limit,
+            .base_fee_per_gas = block_data.base_fee_per_gas,
+            .transaction_count = block_data.transaction_count,
+        });
     }
 
     /// 检查并创建快照
@@ -595,6 +652,11 @@ test "shouldRecordEvent filtering" {
         .poll_interval_ms = 1000,
         .abi_contract = null,
         .thread = null,
+        .track_blocks = false,
+        .chain = "ethereum",
+        .factory_ctx = null,
+        .factory_callback = null,
+        .factory_idx = 0,
     };
 
     // value = 0x3e8 (1000) > 500 → 通过
@@ -665,6 +727,11 @@ test "indexer getStatus and getCurrentBlock" {
         .poll_interval_ms = 1000,
         .abi_contract = null,
         .thread = null,
+        .track_blocks = false,
+        .chain = "ethereum",
+        .factory_ctx = null,
+        .factory_callback = null,
+        .factory_idx = 0,
     };
 
     try std.testing.expectEqual(IndexerState.stopped, idx.getStatus());

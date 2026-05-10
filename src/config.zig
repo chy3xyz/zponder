@@ -27,6 +27,7 @@ pub const GlobalConfig = struct {
     snapshot_interval: u64,
     etherscan_api_key: []const u8,
     chain: []const u8,            // "ethereum" | "bsc" | "polygon"
+    track_blocks: bool,
 };
 
 pub const IndexerConfig = struct {
@@ -55,6 +56,17 @@ pub const HttpConfig = struct {
     rate_limit_burst: ?u32,
 };
 
+pub const GraphQLConfig = struct {
+    enabled: bool,
+    host: []const u8,
+    port: u16,
+    enable_playground: bool,
+    max_query_depth: u32,
+    max_query_complexity: u32,
+    rate_limit_rps: ?u32,
+    rate_limit_burst: ?u32,
+};
+
 pub const DatabaseConfig = struct {
     db_type: []const u8,
     db_name: []const u8,
@@ -78,6 +90,19 @@ pub const DashboardConfig = struct {
     widgets: []WidgetConfig,
 };
 
+pub const FactoryConfig = struct {
+    name: []const u8,
+    address: []const u8,
+    abi_path: []const u8,
+    creation_event: []const u8,
+    child_address_field: []const u8,
+    child_abi_path: []const u8,
+    child_events: []const []const u8,
+    max_children: u64,
+    child_poll_interval_ms: ?u32,
+    child_batch_size: ?u32,
+};
+
 pub const QueryParam = struct {
     name: []const u8,
     param_type: []const u8,
@@ -97,10 +122,12 @@ pub const Config = struct {
     global: GlobalConfig,
     rpc: RpcConfig,
     http: HttpConfig,
+    graphql: GraphQLConfig,
     database: DatabaseConfig,
     contracts: []const ContractConfig,
     queries: []const QueryConfig,
     dashboards: []const DashboardConfig,
+    factories: []const FactoryConfig,
 
     pub fn deinit(self: *Config, alloc: std.mem.Allocator) void {
         alloc.free(self.global.log_level);
@@ -113,6 +140,7 @@ pub const Config = struct {
             for (self.http.cors_origins) |o| alloc.free(o);
             alloc.free(self.http.cors_origins);
         }
+        alloc.free(self.graphql.host);
         alloc.free(self.database.db_type);
         alloc.free(self.database.db_name);
         for (self.contracts) |c| {
@@ -156,6 +184,17 @@ pub const Config = struct {
             alloc.free(d.widgets);
         }
         alloc.free(self.dashboards);
+        for (self.factories) |f| {
+            alloc.free(f.name);
+            alloc.free(f.address);
+            alloc.free(f.abi_path);
+            alloc.free(f.creation_event);
+            alloc.free(f.child_address_field);
+            alloc.free(f.child_abi_path);
+            for (f.child_events) |e| alloc.free(e);
+            alloc.free(f.child_events);
+        }
+        alloc.free(self.factories);
     }
 };
 
@@ -336,6 +375,7 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
         .snapshot_interval = 0,
         .etherscan_api_key = try alloc.dupe(u8, ""),
         .chain = try alloc.dupe(u8, "ethereum"),
+        .track_blocks = false,
     };
     errdefer {
         alloc.free(global.log_level);
@@ -362,6 +402,17 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
         .rate_limit_burst = null,
     };
     errdefer alloc.free(http.host);
+    var graphql = GraphQLConfig{
+        .enabled = false,
+        .host = try alloc.dupe(u8, "0.0.0.0"),
+        .port = 8081,
+        .enable_playground = false,
+        .max_query_depth = 20,
+        .max_query_complexity = 1000,
+        .rate_limit_rps = null,
+        .rate_limit_burst = null,
+    };
+    errdefer alloc.free(graphql.host);
     var database = DatabaseConfig{
         .db_type = try alloc.dupe(u8, "sqlite"),
         .db_name = try alloc.dupe(u8, "eth_indexer.db"),
@@ -420,16 +471,33 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
         dashboards.deinit(alloc);
     }
 
+    var factories: std.ArrayList(FactoryConfig) = .empty;
+    errdefer {
+        for (factories.items) |f| {
+            alloc.free(f.name);
+            alloc.free(f.address);
+            alloc.free(f.abi_path);
+            alloc.free(f.creation_event);
+            alloc.free(f.child_address_field);
+            alloc.free(f.child_abi_path);
+            for (f.child_events) |e| alloc.free(e);
+            alloc.free(f.child_events);
+        }
+        factories.deinit(alloc);
+    }
+
     const Section = enum {
         none,
         global,
         rpc,
         database,
         http,
+        graphql,
         contracts,
         queries,
         dashboards,
         dashboard_widgets,
+        factories,
     };
     var section: Section = .none;
     var current_contract: ?ContractConfig = null;
@@ -437,6 +505,7 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
     var current_dashboard: ?DashboardConfig = null;
     var current_widget: ?WidgetConfig = null;
     var current_widgets: std.ArrayList(WidgetConfig) = .empty;
+    var current_factory: ?FactoryConfig = null;
 
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line_raw| {
@@ -445,7 +514,11 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
         if (std.mem.startsWith(u8, line, "#")) continue;
 
         if (std.mem.startsWith(u8, line, "[") and std.mem.endsWith(u8, line, "]")) {
-            // 保存之前的合约/查询/dashboard
+            // 保存之前的合约/查询/dashboard/factory
+            if (current_factory) |cf| {
+                try factories.append(alloc, cf);
+                current_factory = null;
+            }
             if (current_contract) |cc| {
                 try contracts.append(alloc, cc);
                 current_contract = null;
@@ -483,6 +556,8 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
                 section = .database;
             } else if (std.mem.eql(u8, section_name, "http")) {
                 section = .http;
+            } else if (std.mem.eql(u8, section_name, "graphql")) {
+                section = .graphql;
             } else if (std.mem.eql(u8, section_name, "contracts")) {
                 section = .contracts;
                 current_contract = ContractConfig{
@@ -523,6 +598,20 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
                     .refresh = 30,
                     .columns = &.{},
                 };
+            } else if (std.mem.eql(u8, section_name, "factories")) {
+                section = .factories;
+                current_factory = FactoryConfig{
+                    .name = try alloc.dupe(u8, ""),
+                    .address = try alloc.dupe(u8, ""),
+                    .abi_path = try alloc.dupe(u8, ""),
+                    .creation_event = try alloc.dupe(u8, ""),
+                    .child_address_field = try alloc.dupe(u8, ""),
+                    .child_abi_path = try alloc.dupe(u8, ""),
+                    .child_events = try alloc.alloc([]const u8, 0),
+                    .max_children = 1000,
+                    .child_poll_interval_ms = null,
+                    .child_batch_size = null,
+                };
             } else {
                 section = .none;
             }
@@ -532,6 +621,37 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
         const kv = splitKeyValue(line) orelse continue;
         const key = kv.key;
         const value = kv.value;
+
+        if (current_factory) |*cf| {
+            if (std.mem.eql(u8, key, "name")) {
+                if (cf.name.len > 0) alloc.free(cf.name);
+                cf.name = try unquote(alloc, value);
+            } else if (std.mem.eql(u8, key, "address")) {
+                if (cf.address.len > 0) alloc.free(cf.address);
+                cf.address = try unquote(alloc, value);
+            } else if (std.mem.eql(u8, key, "abi_path")) {
+                if (cf.abi_path.len > 0) alloc.free(cf.abi_path);
+                cf.abi_path = try unquote(alloc, value);
+            } else if (std.mem.eql(u8, key, "creation_event")) {
+                if (cf.creation_event.len > 0) alloc.free(cf.creation_event);
+                cf.creation_event = try unquote(alloc, value);
+            } else if (std.mem.eql(u8, key, "child_address_field")) {
+                if (cf.child_address_field.len > 0) alloc.free(cf.child_address_field);
+                cf.child_address_field = try unquote(alloc, value);
+            } else if (std.mem.eql(u8, key, "child_abi_path")) {
+                if (cf.child_abi_path.len > 0) alloc.free(cf.child_abi_path);
+                cf.child_abi_path = try unquote(alloc, value);
+            } else if (std.mem.eql(u8, key, "child_events")) {
+                cf.child_events = try parseEvents(alloc, value);
+            } else if (std.mem.eql(u8, key, "max_children")) {
+                cf.max_children = try parseU64(value);
+            } else if (std.mem.eql(u8, key, "child_poll_interval_ms")) {
+                cf.child_poll_interval_ms = try parseU32(value);
+            } else if (std.mem.eql(u8, key, "child_batch_size")) {
+                cf.child_batch_size = try parseU32(value);
+            }
+            continue;
+        }
 
         if (current_contract) |*cc| {
             if (std.mem.eql(u8, key, "name")) {
@@ -626,6 +746,8 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
                 } else if (std.mem.eql(u8, key, "chain")) {
                     alloc.free(global.chain);
                     global.chain = try unquote(alloc, value);
+                } else if (std.mem.eql(u8, key, "track_blocks")) {
+                    global.track_blocks = parseBool(value);
                 }
             },
             .rpc => {
@@ -689,10 +811,33 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
                     http.rate_limit_burst = try parseU32(value);
                 }
             },
+            .graphql => {
+                if (std.mem.eql(u8, key, "enabled")) {
+                    graphql.enabled = parseBool(value);
+                } else if (std.mem.eql(u8, key, "port")) {
+                    graphql.port = try parseU16(value);
+                } else if (std.mem.eql(u8, key, "host")) {
+                    alloc.free(graphql.host);
+                    graphql.host = try unquote(alloc, value);
+                } else if (std.mem.eql(u8, key, "enable_playground")) {
+                    graphql.enable_playground = parseBool(value);
+                } else if (std.mem.eql(u8, key, "max_query_depth")) {
+                    graphql.max_query_depth = try parseU32(value);
+                } else if (std.mem.eql(u8, key, "max_query_complexity")) {
+                    graphql.max_query_complexity = try parseU32(value);
+                } else if (std.mem.eql(u8, key, "rate_limit_rps")) {
+                    graphql.rate_limit_rps = try parseU32(value);
+                } else if (std.mem.eql(u8, key, "rate_limit_burst")) {
+                    graphql.rate_limit_burst = try parseU32(value);
+                }
+            },
             else => {},
         }
     }
 
+    if (current_factory) |cf| {
+        try factories.append(alloc, cf);
+    }
     if (current_contract) |cc| {
         try contracts.append(alloc, cc);
     }
@@ -725,15 +870,23 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
     }
     dashboards.deinit(alloc);
 
+    var final_factories = try alloc.alloc(FactoryConfig, factories.items.len);
+    for (factories.items, 0..) |f, i| {
+        final_factories[i] = f;
+    }
+    factories.deinit(alloc);
+
     const cfg = Config{
         .alloc = alloc,
         .global = global,
         .rpc = rpc,
         .http = http,
+        .graphql = graphql,
         .database = database,
         .contracts = final_contracts,
         .queries = final_queries,
         .dashboards = final_dashboards,
+        .factories = final_factories,
     };
 
     return cfg;
@@ -741,6 +894,18 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
 
 pub fn validate(cfg: *const Config) !void {
     var errors: u32 = 0;
+
+    // GraphQL 配置验证
+    if (cfg.graphql.enabled) {
+        if (cfg.graphql.port == 0) {
+            log.err("配置错误: graphql.port 不能为 0", .{});
+            errors += 1;
+        }
+        if (cfg.graphql.host.len == 0) {
+            log.err("配置错误: graphql.host 不能为空", .{});
+            errors += 1;
+        }
+    }
 
     if (cfg.rpc.url.len == 0) {
         log.err("配置错误: rpc.url 不能为空", .{});
@@ -750,8 +915,8 @@ pub fn validate(cfg: *const Config) !void {
         log.err("配置错误: database.db_name 不能为空", .{});
         errors += 1;
     }
-    if (cfg.contracts.len == 0) {
-        log.err("配置错误: 必须至少配置一个合约", .{});
+    if (cfg.contracts.len == 0 and cfg.factories.len == 0) {
+        log.err("配置错误: 必须至少配置一个合约或工厂合约", .{});
         errors += 1;
     }
     for (cfg.contracts) |contract| {
@@ -788,6 +953,36 @@ pub fn validate(cfg: *const Config) !void {
         if (!std.ascii.startsWithIgnoreCase(sql_upper, "select")) {
             log.err("配置错误: 查询 {s} 只允许 SELECT 语句", .{q.name});
             errors += 1;
+        }
+    }
+
+    for (cfg.factories) |f| {
+        if (f.name.len == 0) {
+            log.err("配置错误: 工厂合约名不能为空", .{});
+            errors += 1;
+        }
+        if (f.address.len == 0) {
+            log.err("配置错误: 工厂合约 {s} 的 address 不能为空", .{f.name});
+            errors += 1;
+        }
+        if (f.creation_event.len == 0) {
+            log.err("配置错误: 工厂合约 {s} 的 creation_event 不能为空", .{f.name});
+            errors += 1;
+        }
+        if (f.child_address_field.len == 0) {
+            log.err("配置错误: 工厂合约 {s} 的 child_address_field 不能为空", .{f.name});
+            errors += 1;
+        }
+        if (f.child_abi_path.len == 0) {
+            log.err("配置错误: 工厂合约 {s} 的 child_abi_path 不能为空", .{f.name});
+            errors += 1;
+        }
+        if (f.max_children < 1) {
+            log.err("配置错误: 工厂合约 {s} 的 max_children 必须 >= 1", .{f.name});
+            errors += 1;
+        }
+        if (f.max_children > 100000) {
+            log.warn("工厂合约 {s} 的 max_children 较大 ({d})，建议限制", .{ f.name, f.max_children });
         }
     }
 

@@ -32,9 +32,15 @@ pub fn build(b: *std.Build) void {
     options.addOption([]const u8, "git_commit", git_commit);
     options.addOption([]const u8, "version", version);
 
+    const zgraphql_dep = b.dependency("zgraphql", .{});
+    const zgraphql_mod = zgraphql_dep.module("zgraphql");
+
     const mod = b.addModule("zponder", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+        .imports = &.{
+            .{ .name = "zgraphql", .module = zgraphql_mod },
+        },
     });
     mod.linkSystemLibrary("sqlite3", .{});
     mod.linkSystemLibrary("rocksdb", .{});
@@ -52,6 +58,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "zponder", .module = mod },
                 .{ .name = "build_options", .module = options.createModule() },
+                .{ .name = "zgraphql", .module = zgraphql_mod },
             },
         }),
     });

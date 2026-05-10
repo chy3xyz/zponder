@@ -25,6 +25,31 @@ port = 8080
 host = "0.0.0.0"
 cors = true                 # 是否允许跨域
 
+# GraphQL 服务配置（可选）
+# [graphql]
+# enabled = true
+# port = 8081
+# host = "0.0.0.0"
+# enable_playground = true   # 启用 /graphql/playground
+# max_query_depth = 20
+# max_query_complexity = 1000
+# rate_limit_rps = 10        # 每秒请求数限制（不设置则不限制）
+# rate_limit_burst = 100     # 突发容量（默认 = rps * 10）
+
+# 工厂合约配置（可选，可多个）
+# 监听工厂合约的创建事件，自动索引子合约
+# [[factories]]
+# name = "uniswap_v2_factory"
+# address = "0x5C69bEe701ef814a2B6a3EDD4B1652CB9cc5aA6f"
+# abi_path = "./abis/uniswap_v2_factory.abi"
+# creation_event = "PairCreated"
+# child_address_field = "pair"
+# child_abi_path = "./abis/uniswap_v2_pair.abi"
+# child_events = ["Swap", "Mint", "Burn", "Sync"]
+# max_children = 10000
+# child_poll_interval_ms = 2000
+# child_batch_size = 500
+
 # 合约配置（可配置多个合约，数组形式）
 # 每个合约会自动根据其 ABI 中的事件定义创建对应的数据表
 # 表名格式：event_{name}_{EventName}

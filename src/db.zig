@@ -36,6 +36,18 @@ pub const DecodedField = struct {
     value: []const u8,
 };
 
+pub const BlockRecord = struct {
+    chain: []const u8,
+    block_number: u64,
+    block_hash: []const u8,
+    timestamp: u64,
+    miner: []const u8,
+    gas_used: u64,
+    gas_limit: u64,
+    base_fee_per_gas: []const u8,
+    transaction_count: u64,
+};
+
 pub const Client = struct {
     alloc: std.mem.Allocator,
     config: *const DatabaseConfig,
@@ -146,6 +158,31 @@ pub const Client = struct {
             \\  UNIQUE(contract_address, block_number)
             \\);
             \\CREATE INDEX IF NOT EXISTS idx_block_hashes ON block_hashes(contract_address, block_number);
+
+            \\CREATE TABLE IF NOT EXISTS blocks (
+            \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+            \\  block_number INTEGER NOT NULL,
+            \\  block_hash TEXT NOT NULL,
+            \\  timestamp INTEGER NOT NULL,
+            \\  miner TEXT DEFAULT '',
+            \\  gas_used INTEGER DEFAULT 0,
+            \\  gas_limit INTEGER DEFAULT 0,
+            \\  base_fee_per_gas TEXT DEFAULT '0',
+            \\  transaction_count INTEGER DEFAULT 0,
+            \\  chain TEXT NOT NULL DEFAULT '',
+            \\  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            \\  UNIQUE(chain, block_number)
+            \\);
+            \\CREATE INDEX IF NOT EXISTS idx_blocks_chain_number ON blocks(chain, block_number);
+
+            \\CREATE TABLE IF NOT EXISTS call_cache (
+            \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+            \\  cache_key TEXT NOT NULL UNIQUE,
+            \\  result TEXT NOT NULL,
+            \\  block_number INTEGER NOT NULL,
+            \\  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            \\);
+            \\CREATE INDEX IF NOT EXISTS idx_call_cache_key ON call_cache(cache_key);
         ;
         try self.exec(sql);
     }
@@ -797,6 +834,295 @@ pub const Client = struct {
     }
 
     // ========================================================================
+    // blocks
+    // ========================================================================
+    pub fn upsertBlock(self: *Client, block: BlockRecord) !void {
+        if (self.backend_type == .rocksdb) return self.upsertBlockRocks(block);
+        if (self.backend_type == .postgresql) return self.upsertBlockPG(block);
+
+        const sql =
+            \\INSERT INTO blocks (block_number, block_hash, timestamp, miner, gas_used, gas_limit, base_fee_per_gas, transaction_count, chain)
+            \\VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            \\ON CONFLICT(chain, block_number) DO UPDATE SET
+            \\  block_hash = excluded.block_hash,
+            \\  timestamp = excluded.timestamp,
+            \\  miner = excluded.miner,
+            \\  gas_used = excluded.gas_used,
+            \\  gas_limit = excluded.gas_limit,
+            \\  base_fee_per_gas = excluded.base_fee_per_gas,
+            \\  transaction_count = excluded.transaction_count;
+        ;
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_bind_int64(stmt, 1, @intCast(block.block_number)) != c.SQLITE_OK) return error.BindFailed;
+        if (c.sqlite3_bind_text(stmt, 2, block.block_hash.ptr, @intCast(block.block_hash.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.BindFailed;
+        if (c.sqlite3_bind_int64(stmt, 3, @intCast(block.timestamp)) != c.SQLITE_OK) return error.BindFailed;
+        if (c.sqlite3_bind_text(stmt, 4, block.miner.ptr, @intCast(block.miner.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.BindFailed;
+        if (c.sqlite3_bind_int64(stmt, 5, @intCast(block.gas_used)) != c.SQLITE_OK) return error.BindFailed;
+        if (c.sqlite3_bind_int64(stmt, 6, @intCast(block.gas_limit)) != c.SQLITE_OK) return error.BindFailed;
+        if (c.sqlite3_bind_text(stmt, 7, block.base_fee_per_gas.ptr, @intCast(block.base_fee_per_gas.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.BindFailed;
+        if (c.sqlite3_bind_int64(stmt, 8, @intCast(block.transaction_count)) != c.SQLITE_OK) return error.BindFailed;
+        if (c.sqlite3_bind_text(stmt, 9, block.chain.ptr, @intCast(block.chain.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.BindFailed;
+        rc = c.sqlite3_step(stmt);
+        if (rc != c.SQLITE_DONE) return error.ExecFailed;
+    }
+
+    fn upsertBlockRocks(self: *Client, block: BlockRecord) !void {
+        var key_buf: [192]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "b:{s}:{d:0>20}", .{ block.chain, block.block_number });
+        const value = try std.json.Stringify.valueAlloc(self.alloc, block, .{});
+        defer self.alloc.free(value);
+        try self.rocks.?.put(key, value);
+    }
+
+    fn upsertBlockPG(self: *Client, block: BlockRecord) !void {
+        const sql =
+            \\INSERT INTO blocks (block_number, block_hash, timestamp, miner, gas_used, gas_limit, base_fee_per_gas, transaction_count, chain)
+            \\VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            \\ON CONFLICT(chain, block_number) DO UPDATE SET
+            \\  block_hash = EXCLUDED.block_hash,
+            \\  timestamp = EXCLUDED.timestamp,
+            \\  miner = EXCLUDED.miner,
+            \\  gas_used = EXCLUDED.gas_used,
+            \\  gas_limit = EXCLUDED.gas_limit,
+            \\  base_fee_per_gas = EXCLUDED.base_fee_per_gas,
+            \\  transaction_count = EXCLUDED.transaction_count;
+        ;
+        var block_num_buf: [32]u8 = undefined;
+        var ts_buf: [32]u8 = undefined;
+        var gu_buf: [32]u8 = undefined;
+        var gl_buf: [32]u8 = undefined;
+        var tc_buf: [32]u8 = undefined;
+        const args = [_][]const u8{
+            try std.fmt.bufPrint(&block_num_buf, "{d}", .{block.block_number}),
+            block.block_hash,
+            try std.fmt.bufPrint(&ts_buf, "{d}", .{block.timestamp}),
+            block.miner,
+            try std.fmt.bufPrint(&gu_buf, "{d}", .{block.gas_used}),
+            try std.fmt.bufPrint(&gl_buf, "{d}", .{block.gas_limit}),
+            block.base_fee_per_gas,
+            try std.fmt.bufPrint(&tc_buf, "{d}", .{block.transaction_count}),
+            block.chain,
+        };
+        _ = try self.pgconn.?.execParams(sql, &args);
+    }
+
+    pub fn queryBlocks(
+        self: *Client,
+        chain: []const u8,
+        from_block: ?u64,
+        to_block: ?u64,
+        limit: u32,
+        offset: u32,
+    ) ![]u8 {
+        if (self.backend_type == .rocksdb) return self.queryBlocksRocks(chain, from_block, to_block, limit, offset);
+        if (self.backend_type == .postgresql) return self.queryBlocksPG(chain, from_block, to_block, limit, offset);
+
+        var sql_buf: std.Io.Writer.Allocating = .init(self.alloc);
+        defer sql_buf.deinit();
+        const w = &sql_buf.writer;
+        try w.writeAll("SELECT * FROM blocks WHERE chain = ?");
+        if (from_block) |_| try w.writeAll(" AND block_number >= ?");
+        if (to_block) |_| try w.writeAll(" AND block_number <= ?");
+        try w.writeAll(" ORDER BY block_number DESC LIMIT ? OFFSET ?;");
+        var sql_list = sql_buf.toArrayList();
+        defer sql_list.deinit(self.alloc);
+        var stmt: ?*c.sqlite3_stmt = null;
+        const rc = c.sqlite3_prepare_v2(self.db, sql_list.items.ptr, @intCast(sql_list.items.len), &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        var bind_idx: c_int = 1;
+        if (c.sqlite3_bind_text(stmt, bind_idx, chain.ptr, @intCast(chain.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.BindFailed;
+        bind_idx += 1;
+        if (from_block) |bf| { if (c.sqlite3_bind_int64(stmt, bind_idx, @intCast(bf)) != c.SQLITE_OK) return error.BindFailed; bind_idx += 1; }
+        if (to_block) |bt| { if (c.sqlite3_bind_int64(stmt, bind_idx, @intCast(bt)) != c.SQLITE_OK) return error.BindFailed; bind_idx += 1; }
+        if (c.sqlite3_bind_int64(stmt, bind_idx, @intCast(limit)) != c.SQLITE_OK) return error.BindFailed; bind_idx += 1;
+        if (c.sqlite3_bind_int64(stmt, bind_idx, @intCast(offset)) != c.SQLITE_OK) return error.BindFailed;
+
+        var result_buf: std.Io.Writer.Allocating = .init(self.alloc);
+        defer result_buf.deinit();
+        const rw = &result_buf.writer;
+        try rw.writeByte('[');
+        var row_count: usize = 0;
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            if (row_count > 0) try rw.writeByte(',');
+            try rw.writeByte('{');
+            const col_count = c.sqlite3_column_count(stmt);
+            var col_idx: c_int = 0;
+            while (col_idx < col_count) : (col_idx += 1) {
+                if (col_idx > 0) try rw.writeByte(',');
+                const col_name = std.mem.sliceTo(c.sqlite3_column_name(stmt, col_idx), 0);
+                try rw.print("\"{s}\":", .{col_name});
+                const col_type = c.sqlite3_column_type(stmt, col_idx);
+                switch (col_type) {
+                    c.SQLITE_INTEGER => try rw.print("{}", .{c.sqlite3_column_int64(stmt, col_idx)}),
+                    c.SQLITE_FLOAT => try rw.print("{}", .{c.sqlite3_column_double(stmt, col_idx)}),
+                    c.SQLITE_NULL => try rw.writeAll("null"),
+                    else => {
+                        const val = std.mem.sliceTo(c.sqlite3_column_text(stmt, col_idx), 0);
+                        try rw.writeByte('"');
+                        try utils.jsonEscapeString(rw, val);
+                        try rw.writeByte('"');
+                    },
+                }
+            }
+            try rw.writeByte('}');
+            row_count += 1;
+        }
+        try rw.writeByte(']');
+        var list = result_buf.toArrayList();
+        defer list.deinit(self.alloc);
+        return try self.alloc.dupe(u8, list.items);
+    }
+
+    fn queryBlocksRocks(self: *Client, chain: []const u8, from_block: ?u64, to_block: ?u64, limit: u32, offset: u32) ![]u8 {
+        var prefix_buf: [128]u8 = undefined;
+        const prefix = try std.fmt.bufPrint(&prefix_buf, "b:{s}:", .{chain});
+        var seek_buf: [256]u8 = undefined;
+        const seek_key = if (from_block) |bf|
+            try std.fmt.bufPrint(&seek_buf, "b:{s}:{d:0>20}", .{ chain, bf })
+        else
+            prefix;
+        var end_buf: [256]u8 = undefined;
+        const end_key = if (to_block) |bt|
+            try std.fmt.bufPrint(&end_buf, "b:{s}:{d:0>20}:\xff", .{ chain, bt })
+        else
+            try std.fmt.bufPrint(&end_buf, "b:{s}:\xff", .{chain});
+
+        var iter = self.rocks.?.iterator();
+        defer iter.deinit();
+        iter.seek(seek_key);
+
+        var result_buf = std.ArrayList(u8).empty;
+        defer result_buf.deinit(self.alloc);
+        try result_buf.append(self.alloc, '[');
+        var row_count: u32 = 0;
+        var skipped: u32 = 0;
+        while (iter.valid() and row_count < limit) {
+            const key = iter.key();
+            if (std.mem.order(u8, key, end_key) != .lt) break;
+            if (skipped < offset) { skipped += 1; iter.next(); continue; }
+            if (row_count > 0) try result_buf.append(self.alloc, ',');
+            try result_buf.appendSlice(self.alloc, iter.value());
+            row_count += 1;
+            iter.next();
+        }
+        try result_buf.append(self.alloc, ']');
+        return try result_buf.toOwnedSlice(self.alloc);
+    }
+
+    fn queryBlocksPG(self: *Client, chain: []const u8, from_block: ?u64, to_block: ?u64, limit: u32, offset: u32) ![]u8 {
+        var sql_buf: std.Io.Writer.Allocating = .init(self.alloc);
+        defer sql_buf.deinit();
+        const w = &sql_buf.writer;
+        try w.writeAll("SELECT * FROM blocks WHERE chain = $1");
+        var param_count: usize = 1;
+        if (from_block != null) { param_count += 1; try w.print(" AND block_number >= ${d}", .{param_count}); }
+        if (to_block != null) { param_count += 1; try w.print(" AND block_number <= ${d}", .{param_count}); }
+        param_count += 1; try w.print(" ORDER BY block_number DESC LIMIT ${d}", .{param_count});
+        param_count += 1; try w.print(" OFFSET ${d}", .{param_count});
+        var sql_list = sql_buf.toArrayList();
+        defer sql_list.deinit(self.alloc);
+
+        var args = std.ArrayList([]const u8).init(self.alloc);
+        defer args.deinit();
+        try args.append(chain);
+        if (from_block) |fb| {
+            const buf = try self.alloc.alloc(u8, 32);
+            _ = try std.fmt.bufPrint(buf, "{d}", .{fb});
+            try args.append(buf);
+        }
+        if (to_block) |tb| {
+            const buf = try self.alloc.alloc(u8, 32);
+            _ = try std.fmt.bufPrint(buf, "{d}", .{tb});
+            try args.append(buf);
+        }
+        {
+            const buf = try self.alloc.alloc(u8, 32);
+            _ = try std.fmt.bufPrint(buf, "{d}", .{limit});
+            try args.append(buf);
+        }
+        {
+            const buf = try self.alloc.alloc(u8, 32);
+            _ = try std.fmt.bufPrint(buf, "{d}", .{offset});
+            try args.append(buf);
+        }
+        defer for (args.items) |a| self.alloc.free(a);
+        return try self.pgconn.?.execParams(sql_list.items, args.items);
+    }
+
+    // ========================================================================
+    // call_cache
+    // ========================================================================
+    pub fn getCachedCall(self: *Client, cache_key: []const u8) !?[]u8 {
+        if (self.backend_type == .rocksdb) {
+            var key_buf: [256]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buf, "c:{s}", .{cache_key});
+            return try self.rocks.?.get(key);
+        }
+        if (self.backend_type == .postgresql) {
+            const sql = "SELECT result FROM call_cache WHERE cache_key = $1;";
+            var result = try self.pgconn.?.execParams(sql, &.{cache_key});
+            defer result.deinit();
+            if (result.rows() > 0 and !result.isNull(0, 0)) {
+                const val = result.get(0, 0);
+                return try self.alloc.dupe(u8, val);
+            }
+            return null;
+        }
+        const sql = "SELECT result FROM call_cache WHERE cache_key = ?;";
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_bind_text(stmt, 1, cache_key.ptr, @intCast(cache_key.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.BindFailed;
+        rc = c.sqlite3_step(stmt);
+        if (rc == c.SQLITE_ROW) {
+            const val = std.mem.sliceTo(c.sqlite3_column_text(stmt, 0), 0);
+            return try self.alloc.dupe(u8, val);
+        }
+        return null;
+    }
+
+    pub fn setCachedCall(self: *Client, cache_key: []const u8, result: []const u8, block_number: u64) !void {
+        if (self.backend_type == .rocksdb) {
+            var key_buf: [256]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buf, "c:{s}", .{cache_key});
+            const value = try std.fmt.allocPrint(self.alloc, "{{\"result\":\"{s}\",\"block_number\":{d}}}", .{ result, block_number });
+            defer self.alloc.free(value);
+            try self.rocks.?.put(key, value);
+            return;
+        }
+        if (self.backend_type == .postgresql) {
+            var bn_buf: [32]u8 = undefined;
+            const bn_str = try std.fmt.bufPrint(&bn_buf, "{d}", .{block_number});
+            const sql =
+                \\INSERT INTO call_cache (cache_key, result, block_number)
+                \\VALUES ($1, $2, $3)
+                \\ON CONFLICT(cache_key) DO UPDATE SET result = EXCLUDED.result, block_number = EXCLUDED.block_number;
+            ;
+            _ = try self.pgconn.?.execParams(sql, &.{ cache_key, result, bn_str });
+            return;
+        }
+        const sql =
+            \\INSERT INTO call_cache (cache_key, result, block_number)
+            \\VALUES (?, ?, ?)
+            \\ON CONFLICT(cache_key) DO UPDATE SET result = excluded.result, block_number = excluded.block_number;
+        ;
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_bind_text(stmt, 1, cache_key.ptr, @intCast(cache_key.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.BindFailed;
+        if (c.sqlite3_bind_text(stmt, 2, result.ptr, @intCast(result.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.BindFailed;
+        if (c.sqlite3_bind_int64(stmt, 3, @intCast(block_number)) != c.SQLITE_OK) return error.BindFailed;
+        rc = c.sqlite3_step(stmt);
+        if (rc != c.SQLITE_DONE) return error.ExecFailed;
+    }
+
+    // ========================================================================
     // rollback
     // ========================================================================
     pub fn rollbackFromBlock(self: *Client, contract_address: []const u8, contract_name: []const u8, event_names: []const []const u8, from_block: u64) !void {
@@ -998,6 +1324,31 @@ pub const Client = struct {
             \\  UNIQUE(contract_address, block_number)
             \\);
             \\CREATE INDEX IF NOT EXISTS idx_block_hashes ON block_hashes(contract_address, block_number);
+
+            \\CREATE TABLE IF NOT EXISTS blocks (
+            \\  id SERIAL PRIMARY KEY,
+            \\  block_number BIGINT NOT NULL,
+            \\  block_hash TEXT NOT NULL,
+            \\  timestamp BIGINT NOT NULL,
+            \\  miner TEXT DEFAULT '',
+            \\  gas_used BIGINT DEFAULT 0,
+            \\  gas_limit BIGINT DEFAULT 0,
+            \\  base_fee_per_gas TEXT DEFAULT '0',
+            \\  transaction_count BIGINT DEFAULT 0,
+            \\  chain TEXT NOT NULL DEFAULT '',
+            \\  created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+            \\  UNIQUE(chain, block_number)
+            \\);
+            \\CREATE INDEX IF NOT EXISTS idx_blocks_chain_number ON blocks(chain, block_number);
+
+            \\CREATE TABLE IF NOT EXISTS call_cache (
+            \\  id SERIAL PRIMARY KEY,
+            \\  cache_key TEXT NOT NULL UNIQUE,
+            \\  result TEXT NOT NULL,
+            \\  block_number BIGINT NOT NULL,
+            \\  created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+            \\);
+            \\CREATE INDEX IF NOT EXISTS idx_call_cache_key ON call_cache(cache_key);
         ;
         try self.pgconn.?.exec(sql);
     }

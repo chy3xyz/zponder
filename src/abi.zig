@@ -526,3 +526,143 @@ test "AbiContract findEventByName and findEventByTopic0" {
     @memset(&sig3, 0xCC);
     try std.testing.expect(contract.findEventByTopic0(&sig3) == null);
 }
+
+// ============================================================================
+// eth_call ABI encoding / decoding
+// ============================================================================
+
+/// Compute the 4-byte function selector from a signature like "balanceOf(address)".
+pub fn encodeFunctionCall(alloc: std.mem.Allocator, signature: []const u8, args: []const []const u8) ![]u8 {
+    // Compute selector: keccak256(signature)[0..4]
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha3.Keccak256.hash(signature, &hash, .{});
+
+    // Build result: "0x" + 8-char selector + 64-char-per-arg
+    const prefix = "0x";
+    const total_len = prefix.len + 8 + (64 * args.len);
+    const result = try alloc.alloc(u8, total_len);
+    errdefer alloc.free(result);
+    @memcpy(result[0..prefix.len], prefix);
+    var pos: usize = prefix.len;
+
+    // Append selector (first 4 bytes as hex)
+    for (hash[0..4]) |byte| {
+        result[pos] = std.fmt.digitToChar(byte >> 4, .lower);
+        result[pos + 1] = std.fmt.digitToChar(byte & 0x0F, .lower);
+        pos += 2;
+    }
+
+    for (args) |arg| {
+        const clean = if (std.mem.startsWith(u8, arg, "0x") or std.mem.startsWith(u8, arg, "0X")) arg[2..] else arg;
+        const pad_count = if (clean.len < 64) 64 - clean.len else 0;
+        @memset(result[pos .. pos + pad_count], '0');
+        pos += pad_count;
+        @memcpy(result[pos .. pos + clean.len], clean);
+        pos += clean.len;
+    }
+
+    return result;
+}
+
+/// Decode the result of an eth_call into a human-readable string.
+/// abi_type is like "uint256", "address", "bool", etc.
+pub fn decodeCallResult(alloc: std.mem.Allocator, abi_type: []const u8, result_hex: []const u8) ![]u8 {
+    const hex = if (std.mem.startsWith(u8, result_hex, "0x") or std.mem.startsWith(u8, result_hex, "0X"))
+        result_hex[2..]
+    else
+        result_hex;
+
+    if (std.mem.eql(u8, abi_type, "bool")) {
+        // Check if any non-zero byte exists in the first word
+        if (hex.len >= 64) {
+            for (hex[0..64]) |c| {
+                if (c != '0') return try alloc.dupe(u8, "true");
+            }
+        }
+        return try alloc.dupe(u8, "false");
+    }
+
+    if (std.mem.eql(u8, abi_type, "address")) {
+        // address is right-aligned in a 32-byte word: take last 40 chars
+        if (hex.len >= 64) {
+            const addr = hex[hex.len - 40 ..];
+            return try std.fmt.allocPrint(alloc, "0x{s}", .{addr});
+        }
+    }
+
+    if (std.mem.startsWith(u8, abi_type, "uint") or std.mem.startsWith(u8, abi_type, "int")) {
+        // Return as decimal string
+        if (hex.len >= 64) {
+            const word = hex[0..64];
+            // Strip leading zeros
+            var start: usize = 0;
+            while (start < word.len and word[start] == '0') : (start += 1) {}
+            if (start == word.len) return try alloc.dupe(u8, "0");
+            const trimmed = word[start..];
+            // Parse hex → decimal
+            const val = std.fmt.parseInt(u256, trimmed, 16) catch return try alloc.dupe(u8, hex);
+            return try std.fmt.allocPrint(alloc, "{d}", .{val});
+        }
+    }
+
+    if (std.mem.eql(u8, abi_type, "bytes32")) {
+        // Return as-is with 0x prefix
+        if (hex.len >= 64) {
+            return try std.fmt.allocPrint(alloc, "0x{s}", .{hex[0..64]});
+        }
+    }
+
+    // Fallback: return raw hex
+    return try std.fmt.allocPrint(alloc, "0x{s}", .{hex});
+}
+
+test "encodeFunctionCall basic" {
+    const alloc = std.testing.allocator;
+
+    // balanceOf(address)
+    const result = try encodeFunctionCall(alloc, "balanceOf(address)", &.{"0x6b175474e89094c44da98b954eedeac495271d0f"});
+    defer alloc.free(result);
+
+    try std.testing.expect(std.mem.startsWith(u8, result, "0x"));
+    try std.testing.expectEqual(@as(usize, 74), result.len); // 2 + 8 + 64
+}
+
+test "encodeFunctionCall multi-arg" {
+    const alloc = std.testing.allocator;
+
+    const result = try encodeFunctionCall(alloc, "transfer(address,uint256)", &.{ "0x1111111111111111111111111111111111111111", "0x00000000000000000000000000000000000000000000000000000000000003e8" });
+    defer alloc.free(result);
+
+    try std.testing.expect(std.mem.startsWith(u8, result, "0x"));
+    try std.testing.expectEqual(@as(usize, 2 + 8 + 64 + 64), result.len);
+}
+
+test "decodeCallResult uint256" {
+    const alloc = std.testing.allocator;
+
+    const result = try decodeCallResult(alloc, "uint256", "0x00000000000000000000000000000000000000000000000000000000000003e8");
+    defer alloc.free(result);
+
+    try std.testing.expectEqualStrings("1000", result);
+}
+
+test "decodeCallResult address" {
+    const alloc = std.testing.allocator;
+
+    const result = try decodeCallResult(alloc, "address", "0x0000000000000000000000006b175474e89094c44da98b954eedeac495271d0f");
+    defer alloc.free(result);
+
+    try std.testing.expectEqualStrings("0x6b175474e89094c44da98b954eedeac495271d0f", result);
+}
+
+test "decodeCallResult bool" {
+    const alloc = std.testing.allocator;
+
+    const t = try decodeCallResult(alloc, "bool", "0x0000000000000000000000000000000000000000000000000000000000000001");
+    defer alloc.free(t);
+    try std.testing.expectEqualStrings("true", t);
+
+    const f = try decodeCallResult(alloc, "bool", "0x0000000000000000000000000000000000000000000000000000000000000000");
+    defer alloc.free(f);
+    try std.testing.expectEqualStrings("false", f);
+}

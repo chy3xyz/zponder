@@ -3,7 +3,12 @@
     .version = "0.1.0",
     .fingerprint = 0xf792d1784b9db5e6,
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .zgraphql = .{
+            .url = "https://github.com/chy3xyz/zgraphql/archive/refs/tags/v0.2.0.tar.gz",
+            .hash = "zgraphql-0.1.0-bxNFFgtECADh6rZDcu03XkjKuAsOzzsc0DfkEuRCEhIU",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

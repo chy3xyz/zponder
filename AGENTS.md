@@ -1,270 +1,181 @@
-# AGENTS.md — zponder 项目指南
+# AGENTS.md — zponder Project Guide
 
-> 本文档面向 AI 编程助手，用于快速了解项目现状、技术选型与开发约定。
-
----
-
-## 项目概述
-
-**zponder** 是一个基于 Zig 语言开发的生产级以太坊事件索引器，功能对标 TypeScript 生态的 [Ponder](https://ponder.sh)。项目目前处于**极早期/设计阶段**，仓库中仅包含设计文档，尚未创建源代码、构建脚本或测试文件。
-
-核心目标：利用 Zig 的零开销抽象、无 GC、静态编译等特性，打造「轻量、高速、安全、可扩展」的链上数据索引服务，解决 Ponder 在性能、内存占用与部署复杂度上的痛点。
+> AI coding assistant reference for the zponder codebase: current state, conventions, and module map.
 
 ---
 
-## 当前项目状态
+## Project Overview
 
-| 检查项 | 状态 |
-|--------|------|
-| `build.zig` | ❌ 不存在 |
-| `src/` 源码目录 | ❌ 不存在 |
-| 配置文件（`config.toml` 等） | ❌ 不存在 |
-| 测试文件 | ❌ 不存在 |
-| CI/CD 脚本 | ❌ 不存在 |
-| 设计文档 | ✅ `docs/dev.md`（中文，364 行，末尾截断） |
-| `README.md` | ❌ 不存在 |
-
-### 唯一现有文件
-
-- `docs/dev.md` — 完整的产品需求与架构设计文档，涵盖：
-  - 技术栈选型（Zig 0.16.0 + eth.zig + PostgreSQL/SQLite）
-  - 五层架构设计（基础层 → 数据层 → 以太坊层 → 核心业务层 → 接口层）
-  - 数据模型（`sync_state`、`events`、`account_states`、`snapshots`）
-  - 核心流程（启动、同步、重放、故障自愈）
-  -  planned 项目结构（见下方「计划中的目录结构」）
-  - 示例 `config.toml` 配置
-  - 部分 `main.zig` 入口代码（文档末尾截断，未完结）
-
-> **注意**：`docs/dev.md` 末尾在 `main.zig` 的协程启动代码处中断（`const thread = try`），文档本身不完整。
+**zponder** is a production-grade EVM event indexer written in Zig 0.16.0, inspired by [Ponder](https://ponder.sh). It indexes smart contract events from EVM-compatible chains and stores them in SQLite, RocksDB, or PostgreSQL. Includes a built-in REST API, GraphQL API, dashboard UI, factory contract support, and eth_call for reading on-chain state.
 
 ---
 
-## 计划中的技术栈
+## Current Project State
 
-| 领域 | 选型 | 说明 |
-|------|------|------|
-| 主语言 | Zig 0.16.0+ | 零开销抽象、无 GC、手动内存管理、静态编译 |
-| 以太坊交互 | [eth.zig](https://github.com/rafaelrcamargo/eth.zig)（最新版） | 纯 Zig 实现，支持 RPC、ABI 编解码、日志过滤 |
-| 主存储 | PostgreSQL | 高并发、事务、索引优化，适配生产环境 |
-| 轻量存储备选 | SQLite | 单机/开发环境快速部署 |
-| HTTP 服务 | Zig `std.http` 或 `zig-http` | 原生异步 I/O，无额外依赖 |
-| 日志 | Zig `std.log` + 文件持久化 | 支持 DEBUG/INFO/WARN/ERROR 分级 |
-| 监控（可选） | Prometheus | 指标采集（同步进度、QPS 等） |
-| 部署 | 单二进制文件 + Docker | 静态编译后 < 1MB，零依赖运行 |
+| Item                    | Status       |
+|-------------------------|--------------|
+| `build.zig` + `build.zig.zon` | Complete |
+| `src/` source files     | 19 Zig files |
+| `config.toml`           | Complete     |
+| Unit tests              | 20+ passing  |
+| REST API                | Production   |
+| GraphQL API             | Production   |
+| Factory contracts       | Implemented  |
+| Block-level indexing     | Implemented  |
+| eth_call support         | Implemented  |
+| Docs                    | README, API, ARCHITECTURE, dev.md, EVALUATION |
 
 ---
 
-## 计划中的目录结构
+## Tech Stack
 
-根据 `docs/dev.md`，项目应组织如下：
+| Layer              | Technology                                    |
+|--------------------|-----------------------------------------------|
+| Language           | Zig 0.16.0                                    |
+| Storage            | SQLite / RocksDB / PostgreSQL                 |
+| HTTP Server        | `std.http.Server` + `std.Io`                 |
+| GraphQL Engine     | [zgraphql](https://github.com/chy3xyz/zgraphql) v0.2.0 |
+| RPC Client         | Custom JSON-RPC (retry + circuit breaker)     |
+| Build              | `build.zig` + `build.zig.zon`                 |
+| Dependencies       | zgraphql (fetched via `zig fetch`)            |
+
+---
+
+## Directory Structure
 
 ```
 zponder/
 ├── src/
-│   ├── main.zig          # 入口：启动索引器、协调各模块
-│   ├── config.zig        # 配置管理（TOML 解析、全局配置访问）
-│   ├── log.zig           # 日志模块（分级、格式化、文件轮转）
-│   ├── eth_rpc.zig       # 以太坊 RPC 客户端（基于 eth.zig 封装）
-│   ├── db.zig            # 数据库客户端（PostgreSQL/SQLite 抽象）
-│   ├── indexer.zig       # 核心索引模块（同步、事件处理、重放、回滚）
-│   ├── http_server.zig   # HTTP 查询与监控服务
-│   ├── abi.zig           # ABI 解析辅助
-│   └── utils.zig         # 工具函数（地址转换、大数字处理等）
-├── config.toml           # 运行时配置文件
-├── build.zig             # Zig 构建脚本
-└── README.md             # 部署与使用说明
+│   ├── main.zig          # Entry point: signal handling, module orchestration
+│   ├── config.zig        # TOML config parser + validation (all sections)
+│   ├── log.zig           # Structured logging (JSON/text, file+stderr, thread-safe)
+│   ├── eth_rpc.zig       # JSON-RPC: getLogs, getBlockData, ethCall, retry, circuit breaker
+│   ├── db.zig            # Database: SQLite + RocksDB + PostgreSQL, unified interface
+│   ├── rocksdb.zig       # RocksDB C bindings wrapper
+│   ├── pg.zig            # PostgreSQL libpq wrapper
+│   ├── indexer.zig       # Per-contract sync loop, reorg handling, replay, snapshot
+│   ├── factory.zig       # Factory contract manager: child discovery + lifecycle
+│   ├── http_server.zig   # REST API: routing, CORS, caching, metrics, dashboards
+│   ├── graphql.zig       # GraphQL API: zgraphql schema, resolvers, rate limiting
+│   ├── abi.zig           # ABI parsing, log decoding, eth_call encode/decode
+│   ├── cache.zig         # Thread-safe LRU cache
+│   ├── etherscan.zig     # Etherscan/BscScan/PolygonScan ABI fetcher
+│   ├── template.zig      # Server-side HTML template rendering
+│   ├── dashboard.zig     # Dashboard widget logic
+│   ├── utils.zig         # Hex parsing, JSON escaping, address validation
+│   └── root.zig          # Public API re-exports
+├── abis/                 # Contract ABI JSON files
+├── pages/                # Static HTML pages (dashboard, kline, etc.)
+├── docs/                 # Documentation
+│   ├── API.md            # REST + GraphQL API reference
+│   ├── ARCHITECTURE.md   # Architecture overview and data flow
+│   ├── dev.md            # Original design document
+│   └── EVALUATION.md     # Code quality evaluation report
+├── config.toml           # Runtime configuration
+├── build.zig             # Build script (embeds git commit + version)
+├── build.zig.zon         # Package manifest (includes zgraphql dependency)
+└── README.md             # Project readme
 ```
 
 ---
 
-## 计划中的模块职责
+## Module Map
 
-### 1. 配置管理（`config.zig`）
-- 加载并解析 `config.toml`
-- 提供全局配置访问
-- 核心配置域：`global`、`rpc`、`database`、`http`、`contracts`（数组）
+### Foundation
+- **config.zig** — TOML parser, validation, Config struct. Sections: global, rpc, database, http, graphql, contracts, factories, queries, dashboards.
+- **log.zig** — Thread-safe structured logging. `init(alloc, io, level, file)`, `deinit()`. Supports text and JSON formats.
 
-### 2. 日志（`log.zig`）
-- 基于 `std.log` 封装
-- 分级输出：DEBUG / INFO / WARN / ERROR
-- 输出到控制台 + 文件，按日期分割，限制单文件大小
+### Data Layer
+- **db.zig** — Multi-backend `Client`. System tables via `migrate()`. Event tables via `autoMigrateContract()`. Methods: insertEventLog, queryEventLogs, upsertBlock, queryBlocks, getCachedCall, setCachedCall, rollbackFromBlock, etc.
+- **rocksdb.zig** — RocksDB C API wrapper. Put, get, delete, iterator, write batch.
+- **pg.zig** — PostgreSQL libpq wrapper. exec, execParams, PgResult with rows/cols/get.
+- **cache.zig** — Thread-safe LRU cache. Dual limits (entries + bytes). Block-aware TTL. Prefix invalidation.
 
-### 3. 以太坊 RPC（`eth_rpc.zig`）
-- 初始化与重连逻辑
-- 批量拉取区块与日志（支持按合约地址、事件主题过滤）
-- ABI 加载与事件解析
-- 辅助接口：获取最新区块号、查询余额、验证地址格式
+### Ethereum Layer
+- **eth_rpc.zig** — JSON-RPC `Client`. Methods: getBlockNumber, getBlockHash, getBlockData, getLogs, ethCall. Circuit breaker + exponential backoff. Concurrency limiting.
+- **abi.zig** — ABI JSON parsing, Keccak-256 event signatures, log decoding, encodeFunctionCall, decodeCallResult.
+- **etherscan.zig** — ABI fetching from Etherscan/BscScan/PolygonScan. Known contract addresses per chain.
 
-### 4. 数据持久化（`db.zig`）
-- 数据库初始化与自动建表（`migrate`）
-- 批量写入事件、更新账户状态、保证幂等性
-- 支持 PostgreSQL 与 SQLite 切换
-- 快照生成与恢复
+### Indexing Layer
+- **indexer.zig** — Per-contract `Indexer`. Threaded runLoop: batch sync, reorg detection, replay, snapshots. Factory callback hook after event insert. Fields: contract, state, current_block, track_blocks, chain.
+- **factory.zig** — `FactoryManager` for dynamic child contract discovery. Thread-safe children list (atomic mutex). Idempotency via sync_state check. Callback adapter for Indexer hook.
 
-### 5. 核心索引（`indexer.zig`）
-- 同步管理：断点续传、批量同步、实时追块
-- 事件处理：根据事件类型执行状态更新（如 ERC20 Transfer → 余额更新）
-- 重放与回滚：指定区块范围重放，异常时回滚到稳定状态
-- 多合约并行：每个合约独立协程处理
+### API Layer
+- **http_server.zig** — REST API. Thread-per-connection model. Whitelist validation. LRU cache integration. CORS. Prometheus metrics. Dashboard HTML rendering.
+- **graphql.zig** — zgraphql integration. Compile-time `SchemaBuilder`. Resolvers access db + rpc + indexers via `Context` userdata. Optional rate limiting. Shutdown coordination via atomic flag.
 
-### 6. HTTP 服务（`http_server.zig`）
-- 查询接口：账户余额、事件历史、同步状态、合约信息
-- 监控接口：运行状态、同步进度、QPS
-- 管理接口（可选）：手动触发重放、回滚、快照
-
-### 7. ABI 辅助（`abi.zig`）
-- ABI JSON 解析
-- 日志数据解码为 Zig 结构体
-
-### 8. 工具函数（`utils.zig`）
-- 以太坊地址大小写转换与校验
-- 大数字（uint256）处理辅助
+### Entry
+- **main.zig** — Config loading, RPC/DB init, Indexer creation (with factory linkage), HTTP server start, GraphQL server start (optional), shutdown orchestration.
+- **root.zig** — Public API re-exports for use as a library.
 
 ---
 
-## 计划中的数据模型
-
-数据库应包含以下四张核心表：
-
-### `sync_state` — 同步状态
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `id` | SERIAL | 主键 |
-| `contract_address` | VARCHAR(42) | 合约地址（小写），索引 |
-| `last_synced_block` | BIGINT | 最后同步区块号 |
-| `status` | VARCHAR(20) | running / stopped / error |
-| `updated_at` | TIMESTAMP | 最后更新时间 |
-
-### `events` — 事件数据
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `id` | SERIAL | 主键 |
-| `contract_address` | VARCHAR(42) | 合约地址，索引 |
-| `event_name` | VARCHAR(100) | 事件名（如 Transfer），索引 |
-| `block_number` | BIGINT | 区块号，索引 |
-| `transaction_hash` | VARCHAR(66) | 交易哈希，索引 |
-| `log_index` | INT | 日志索引 |
-| `data` | JSONB | 解析后的结构化事件数据 |
-| `created_at` | TIMESTAMP | 写入时间 |
-
-### `account_states` — 账户状态
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `id` | SERIAL | 主键 |
-| `contract_address` | VARCHAR(42) | 合约地址，联合索引 |
-| `account_address` | VARCHAR(42) | 账户地址，联合索引 |
-| `balance` | NUMERIC(78) | 余额（支持大数字） |
-| `last_updated_block` | BIGINT | 最后更新区块号 |
-| `updated_at` | TIMESTAMP | 最后更新时间 |
-
-### `snapshots` — 数据快照
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| `id` | SERIAL | 主键 |
-| `contract_address` | VARCHAR(42) | 合约地址，索引 |
-| `block_number` | BIGINT | 快照区块号，索引 |
-| `snapshot_data` | JSONB | 账户状态快照 |
-| `created_at` | TIMESTAMP | 快照创建时间 |
-
----
-
-## 计划中的核心流程
-
-### 启动流程
-1. 加载 `config.toml`
-2. 初始化日志、数据库客户端、RPC 客户端
-3. 检查并自动创建数据表（`migrate`）
-4. 读取 `sync_state`，获取各合约断点
-5. 为每个合约启动独立同步协程
-6. 启动 HTTP 服务
-
-### 同步流程（核心循环）
-1. 获取链上最新区块号
-2. 按 `batch_size` 拉取日志
-3. 过滤目标合约与目标事件
-4. ABI 解析日志 → Zig 结构体
-5. 执行对应状态更新逻辑
-6. 批量写入数据库（事件、状态、同步进度），保证事务与幂等
-7. 追块完成后，按固定间隔轮询最新区块
-
-### 重放流程
-1. 接收重放请求（指定合约、起止区块）
-2. 暂停该合约同步，备份当前状态
-3. 删除目标区块范围内的事件与状态数据
-4. 从起始区块重新同步
-5. 完成后恢复常态同步
-
-### 故障自愈
-- **RPC 异常**：自动重试（按配置次数），失败后暂停并定时再试
-- **数据库异常**：自动重连，恢复后从断点续传
-- **解析异常**：跳过单条日志，输出 WARN，不中断整体同步
-- **进程崩溃**：重启后读取 `sync_state` 断点续传
-
----
-
-## 构建与运行（计划中）
-
-由于项目尚未创建源码，以下命令基于设计文档推导，**目前均无法执行**：
+## Build & Run
 
 ```bash
-# 克隆依赖（待添加 build.zig 后）
+# Debug build
 zig build
 
-# 运行索引器
+# Run
 zig build run -- -c config.toml
 
-# 运行测试
+# Tests
 zig build test
 
-# 生产构建（静态链接、ReleaseSmall/ReleaseFast）
+# Production build
 zig build -Doptimize=ReleaseFast
 ```
 
----
-
-## 开发约定（建议）
-
-项目尚未形成正式约定，以下根据设计文档与 Zig 社区最佳实践推导：
-
-- **语言**：源码与注释以**中文**为主（设计文档为中文，面向中文开发者）。
-- **内存管理**：使用 `GeneralPurposeAllocator` 或 `ArenaAllocator`；所有模块提供 `init` / `deinit` 对。
-- **错误处理**：使用 Zig 错误联合类型（`try` / `catch`），关键路径错误必须记录日志。
-- **命名风格**：
-  - 函数、变量：`snake_case`
-  - 类型、结构体：`PascalCase`
-  - 常量：`SCREAMING_SNAKE_CASE`
-- **模块依赖**：禁止循环依赖；`main.zig` 负责统筹初始化顺序。
-- **数据库迁移**：所有表结构变更必须通过 `db.migrate()` 管理，不支持手动改表。
-- **配置敏感信息**：`config.toml` 中的 RPC API Key、数据库密码应支持环境变量覆盖，避免提交密钥到仓库。
+**Dependencies:**
+- System libraries: sqlite3, rocksdb, libpq (PostgreSQL)
+- Zig package: zgraphql (auto-fetched by `zig fetch`)
+- macOS: `brew install sqlite3 rocksdb libpq`
 
 ---
 
-## 测试策略（计划中）
+## Code Conventions
 
-设计文档中未明确测试细节，建议按以下分层补充：
+### Patterns
+- **Lifecycle**: `init(alloc, ...)` → use → `deinit()`. All modules follow this.
+- **Memory**: Caller allocates, callee takes ownership (or duplicates). `errdefer` for cleanup on error.
+- **Threading**: `std.Thread.spawn` for indexers, HTTP handlers, GraphQL server. Atomic values for shared state. Spinlock mutexes for protected sections.
+- **Error handling**: Zig error unions throughout. No panics on recoverable failures. Errors are logged, never silently swallowed.
+- **Database**: Parameterized queries only (SQL injection prevention). All `sqlite3_bind_*` calls checked.
 
-| 层级 | 范围 | 工具 |
-|------|------|------|
-| 单元测试 | 各模块内部函数（ABI 解析、工具函数、配置解析） | Zig 内置 `test` |
-| 集成测试 | 数据库读写、RPC 客户端交互 | Zig `test` + 本地 PostgreSQL / 模拟 RPC |
-| 端到端测试 | 完整同步流程、HTTP API | 本地 Anvil/Hardhat 节点 + 脚本 |
+### Naming
+- Functions/variables: `snake_case`
+- Types/structs: `PascalCase`
+- Constants: `lowercase` (Zig convention)
+- Log scopes: `.indexer`, `.graphql`, `.factory`, etc.
+
+### File Organization
+- One module per file in `src/`
+- Tests co-located with source (Zig `test` blocks within each file)
+- Config constants in `config.zig`, not scattered
 
 ---
 
-## 安全与部署注意事项
+## Database Schema
 
-- **密钥管理**：`config.toml` 不应提交到版本控制；API Key、数据库密码通过环境变量注入。
-- **SQL 注入**：所有数据库查询必须使用参数化语句，禁止字符串拼接 SQL。
-- **Docker**：建议使用多阶段构建，基于 `scratch` 或 `distroless` 镜像，利用 Zig 静态编译特性实现最小攻击面。
-- **网络**：HTTP 管理接口（如重放、回滚）如需暴露，必须增加鉴权机制。
-- **日志**：避免在日志中输出完整 `config.toml` 内容或密钥信息。
+### System Tables
+`schema_version`, `sync_state`, `account_states`, `snapshots`, `raw_logs`, `block_hashes`, `blocks`, `call_cache`
+
+### Event Tables
+`event_{contract_name}_{event_name}` — auto-created from ABI. Columns: ABI inputs prefixed `evt_` + `block_number`, `tx_hash`, `log_index`, `created_at`. `UNIQUE(tx_hash, log_index)`.
+
+### RocksDB Key Scheme
+`e:` events, `s:` sync state, `a:` account state, `p:` snapshots, `r:` raw logs, `h:` block hashes, `b:` blocks, `c:` call cache.
 
 ---
 
-## 给 AI 助手的快速参考
+## Config Sections
 
-- 本项目**尚无可用代码**，所有实现需从零开始。
-- 唯一权威参考是 `docs/dev.md`，但该文档**末尾截断**，`main.zig` 的协程启动示例未写完。
-- 技术栈锁定为 **Zig 0.16.0+** 与 **eth.zig**，请勿引入其他语言运行时（如 Node.js、Python）。
-- 如需补全 `docs/dev.md` 中缺失的代码片段，应基于 Zig 0.16 的语法与标准库实现，避免使用已废弃的 API。
-- 下一步建议：创建 `build.zig`、初始化 `src/` 目录骨架、补全 `config.toml` 示例、实现 `config.zig` 与 `log.zig` 两个最基础的模块。
+`[global]` — log_level, chain, etherscan_api_key, snapshot_interval, track_blocks
+`[rpc]` — url, timeout, retry_count, retry_delay_ms, max_concurrent
+`[database]` — type, db_name, wal_mode, busy_timeout_ms, max_connections
+`[http]` — host, port, cors, cors_origins, rate_limit_rps, rate_limit_burst
+`[graphql]` — enabled, host, port, enable_playground, max_query_depth, max_query_complexity, rate_limit_rps, rate_limit_burst
+`[[contracts]]` — name, address, abi_path, from_block, events, filters, poll_interval_ms, block_batch_size, max_reorg_depth
+`[[factories]]` — name, address, creation_event, child_address_field, child_abi_path, child_events, max_children
+`[[queries]]` — name, path, sql, params, cache_ttl_blocks
+`[[dashboards]]` + `[[dashboards.widgets]]` — name, title, widgets with id, type, endpoint, refresh, columns

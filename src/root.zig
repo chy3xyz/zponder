@@ -18,6 +18,8 @@ pub const pg = @import("pg.zig");
 pub const etherscan = @import("etherscan.zig");
 pub const template = @import("template.zig");
 pub const dashboard = @import("dashboard.zig");
+pub const graphql = @import("graphql.zig");
+pub const factory = @import("factory.zig");
 
 test {
     _ = config;

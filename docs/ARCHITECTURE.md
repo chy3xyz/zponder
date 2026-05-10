@@ -12,22 +12,25 @@
 zponder is a layered Ethereum event indexer. Each layer has a single responsibility and communicates through well-defined interfaces.
 
 ```
-┌─────────────────────────────────────────────┐
-│  HTTP Layer   (http_server.zig)             │
-│  REST API / CORS / Cache / Metrics          │
-├─────────────────────────────────────────────┤
-│  Indexer Layer (indexer.zig)                │
-│  Per-contract sync loop / Replay / Snapshot │
-├─────────────────────────────────────────────┤
-│  Ethereum Layer (eth_rpc.zig + abi.zig)     │
-│  JSON-RPC / Retry / Circuit Breaker / ABI   │
-├─────────────────────────────────────────────┤
-│  Data Layer   (db.zig + cache.zig)          │
-│  SQLite WAL / Auto-migration / LRU Cache    │
-├─────────────────────────────────────────────┤
-│  Foundation   (config.zig + log.zig)        │
-│  TOML Config / Structured Logging           │
-└─────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  API Layer    (http_server.zig + graphql.zig)                 │
+│  REST API / GraphQL / Playground / CORS / Cache / Metrics     │
+├──────────────────────────────────────────────────────────────┤
+│  Factory Layer (factory.zig)                                  │
+│  Factory event detection / Child indexer lifecycle            │
+├──────────────────────────────────────────────────────────────┤
+│  Indexer Layer (indexer.zig)                                  │
+│  Per-contract sync loop / Reorg handling / Replay / Snapshot │
+├──────────────────────────────────────────────────────────────┤
+│  Ethereum Layer (eth_rpc.zig + abi.zig)                       │
+│  JSON-RPC / eth_call / Retry / Circuit Breaker / ABI encode  │
+├──────────────────────────────────────────────────────────────┤
+│  Data Layer   (db.zig + cache.zig)                           │
+│  SQLite WAL / RocksDB / PostgreSQL / LRU / Call Cache        │
+├──────────────────────────────────────────────────────────────┤
+│  Foundation   (config.zig + log.zig)                          │
+│  TOML Config / Structured Logging                            │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -51,23 +54,34 @@ zponder is a layered Ethereum event indexer. Each layer has a single responsibil
 
 #### 3. ETH RPC (`eth_rpc.zig`)
 
-- Built on `std.http.Client`
+- Built on `std.http.Client` with `std.Io` async I/O
 - **Retry**: exponential backoff (500ms × 2^attempt, capped at 16s)
 - **Circuit Breaker**: 5 consecutive failures → OPEN for 30s
 - **Half-Open**: one trial request after timeout; closes on success, re-opens on failure
 - Parses JSON-RPC errors and returns `error.RpcError`
-- Parses log arrays with memory-safe allocation
+- Methods:
+  - `getBlockNumber()` — eth_blockNumber → u64
+  - `getBlockHash(block_number)` — eth_getBlockByNumber → block hash
+  - `getBlockData(block_number)` — eth_getBlockByNumber → full block metadata (timestamp, miner, gas, etc.)
+  - `getLogs(filter)` — eth_getLogs → parsed log array
+  - `ethCall(to, data, block_number)` — eth_call → raw hex result
 
 #### 4. DB (`db.zig`)
 
+- Multi-backend: SQLite, RocksDB, PostgreSQL — unified `Client` interface
 - SQLite with WAL mode, foreign keys, NORMAL synchronous
+- **System tables**: `sync_state`, `account_states`, `snapshots`, `raw_logs`, `block_hashes`, `blocks`, `call_cache`
 - **Auto-migration**: reads ABI events and creates tables dynamically
   - Table name: `event_{contract_name}_{EventName}`
   - Columns: block_number, transaction_hash, log_index, + event fields
 - **Bind safety**: all `sqlite3_bind_*` calls check return value
-- **Sync state table**: stores `last_synced_block` per contract
+- **Sync state table**: stores `last_synced_block` per contract (resume support)
 - **Snapshot table**: stores periodic JSON snapshots
+- **blocks table**: chain-wide block metadata with UNIQUE(chain, block_number)
+- **call_cache table**: eth_call result cache keyed by `{address}:{data}:{block}`
 - Invalidates cache on insert
+- **Block methods**: `upsertBlock`, `queryBlocks` (with from/to/limit/offset)
+- **Call cache methods**: `getCachedCall`, `setCachedCall`
 
 #### 5. Cache (`cache.zig`)
 
@@ -96,15 +110,42 @@ zponder is a layered Ethereum event indexer. Each layer has a single responsibil
 - **Prometheus metrics**: `/metrics` returns gauge metrics
 - **Dynamic JSON**: uses `std.Io.Writer.Allocating` (no fixed buffer limit)
 
-#### 8. ABI (`abi.zig`)
+#### 8. GraphQL (`graphql.zig`)
+
+- Uses [zgraphql](https://github.com/chy3xyz/zgraphql) for parsing, validation, and execution
+- **Compile-time schema**: generated via `zg.SchemaBuilder` from a Zig struct literal
+- **Resolvers**: access `db.Client`, `eth_rpc.Client`, and indexer state through `Context` userdata
+- **Rate limiting**: optional token-bucket via zgraphql's built-in `RateLimiter`
+- **Server**: runs `zg.GraphQLServer.listen()` in a dedicated thread with its own `std.Io` backend
+- **Shutdown coordination**: sets a shared atomic flag when server exits, triggering main loop shutdown
+- Schema fields:
+  - `health`, `version` — static metadata
+  - `contracts`, `contract(name)` — contract list from runtime indexers
+  - `syncStates` — per-contract sync progress (atomic reads on indexer state)
+  - `latestEvents` — paginated DB queries with `blockFrom`, `blockTo`, `offset` filters
+  - `contractCall` — eth_call with ABI encoding and result caching
+
+#### 9. Factory (`factory.zig`)
+
+- Manages dynamic child contract discovery from factory contracts
+- **`FactoryManager`**: owns child indexer lifecycle, thread-safe child list (atomic mutex)
+- **`ChildIndexer`**: heap-allocated wrapper holding an owned `ContractConfig` + `Indexer`
+- **Callback pattern**: factory indexer calls `FactoryManager.onFactoryEvent` via `FactoryCallback` function pointer
+- **Idempotency**: checks `sync_state` table before creating child; deduplicates in-memory
+- **Safety**: validates child address format (42-char hex with `0x` prefix); enforces `max_children` limit
+- **Lifecycle**: children are created from `creation_event` field match, started immediately, and stopped during shutdown via `stopChildren()`
+
+#### 10. ABI (`abi.zig`)
 
 - Parses ABI JSON arrays; extracts `type: "event"` entries
 - Computes event signature hash with **Keccak-256** (not SHA3-256)
   - `EventName(type1,type2,...)` → 32-byte topic0
 - Decodes logs: indexed params from topics[1..], non-indexed from data
 - Maps ABI types to SQLite types (`address` → `TEXT`, `bool` → `INTEGER`, etc.)
+- **`encodeFunctionCall`**: computes 4-byte selector + ABI-encodes arguments for eth_call
+- **`decodeCallResult`**: decodes eth_call hex results (uint256 → decimal, address → 0x format, bool)
 
-#### 9. Utils (`utils.zig`)
+#### 11. Utils (`utils.zig`)
 
 - `parseHexU64` / `parseHexU256`: hex string → integer
 - `isValidAddress`: 42 chars, `0x` prefix, hex digits
@@ -113,31 +154,68 @@ zponder is a layered Ethereum event indexer. Each layer has a single responsibil
 
 ---
 
+### Database Schema
+
+**System Tables** (created by `migrate()`):
+
+| Table            | Key                          | Purpose                                  |
+|------------------|------------------------------|------------------------------------------|
+| `sync_state`     | `UNIQUE(contract_address)`   | Per-contract sync progress               |
+| `account_states` | `UNIQUE(contract, account)`  | Account balance snapshots                |
+| `snapshots`      | —                            | Periodic indexer state snapshots         |
+| `raw_logs`       | —                            | Dead letter queue for undecodable logs   |
+| `block_hashes`   | `UNIQUE(contract, block)`    | Per-contract block hashes (reorg detect) |
+| `blocks`         | `UNIQUE(chain, block_number)`| Chain-wide block metadata               |
+| `call_cache`     | `UNIQUE(cache_key)`          | eth_call result cache                    |
+
+**Event Tables** (created by `autoMigrateContract()`):
+- Named `event_{contract_name}_{event_name}`
+- Columns from ABI inputs + `block_number`, `tx_hash`, `log_index`, `created_at`
+- `UNIQUE(tx_hash, log_index)` for idempotent inserts
+- Indexes on `block_number` and `tx_hash`
+
+**RocksDB Key Scheme**:
+| Prefix | Key Pattern                               | Content      |
+|--------|-------------------------------------------|--------------|
+| `e:`   | `e:{contract}:{event}:{block}:{tx}:{idx}` | JSON fields  |
+| `s:`   | `s:{contract_address}`                    | JSON state   |
+| `h:`   | `h:{contract}:{block:0>20}`               | block hash   |
+| `b:`   | `b:{chain}:{block:0>20}`                 | JSON block   |
+| `c:`   | `c:{cache_key}`                           | JSON result  |
+
+---
+
 ### Data Flow
 
 ```
 config.toml ──► config.zig ──► main.zig
                                    │
-                                   ▼
-                    ┌────────────────────────────┐
-                    │      indexer.zig           │
-                    │  (per-contract thread)     │
-                    └────────────┬───────────────┘
-                                 │
-            ┌────────────────────┼────────────────────┐
-            ▼                    ▼                    ▼
-     eth_rpc.zig          abi.zig               db.zig
-   (fetch logs)      (decode events)      (insert / query)
-            │                    │                    │
-            └────────────────────┼────────────────────┘
-                                 ▼
-                          cache.zig
-                      (invalidate / put)
-                                 │
-                                 ▼
-                    http_server.zig
-                 (GET /events → cache → db)
+                    ┌──────────────┼──────────────┐
+                    ▼              ▼              ▼
+              indexer.zig    http_server.zig   graphql.zig
+         (per-contract)     (REST API)       (GraphQL API)
+                    │              │              │
+                    │              │              ▼
+                    │              │        factory.zig
+                    │              │     (child discovery)
+                    │              │              │
+            ┌───────┼──────┐       │              │
+            ▼       ▼       ▼       │              │
+     eth_rpc.zig  abi.zig  db.zig ◄─┼──────────────┘
+   (fetch logs,  (decode,  (insert, │
+    eth_call,    encode)   query,   │
+    block data)            cache)   │
+            │       │       │       │
+            └───────┼───────┘       │
+                    ▼               │
+              cache.zig ◄───────────┘
+          (LRU invalidation)
 ```
+
+**Indexing flow**: RPC → ABI decode → DB insert → cache invalidation
+**Query flow (REST)**: HTTP → whitelist check → cache lookup → DB query → JSON response
+**Query flow (GraphQL)**: HTTP → parse → validate → execute resolvers → DB/RPC queries → JSON response
+**Factory flow**: Indexer processes event → factory callback → extract child address → create child Indexer → start syncing
 
 ---
 
@@ -154,12 +232,14 @@ config.toml ──► config.zig ──► main.zig
 
 ```
 Main Thread
-  └── Signal handler (SIGINT / SIGTERM → g_running = false)
-  └── HTTP accept thread
+  └── Signal handler (SIGINT / SIGTERM → shutdown coordination)
+  └── HTTP accept thread (REST API)
         └── handler thread per TCP connection
+  └── GraphQL thread (zgraphql server with its own Io backend)
   └── Indexer thread #1 (contract A)
-  └── Indexer thread #2 (contract B)
-  └── ...
+  ├── Indexer thread #2 (contract B)
+  ├── Indexer thread #3 (factory: watches creation events)
+  └── Child Indexer thread(s) (dynamically created by factory)
 ```
 
 - Shared data (`cache`, `db`, `indexers`) protected by:
@@ -172,13 +252,15 @@ Main Thread
 
 ### Error Handling Strategy
 
-| Layer | Strategy |
-|-------|----------|
-| Config | Validation returns `error.InvalidConfig` with log messages |
-| RPC | Retry + circuit breaker; unrecoverable → propagate error |
-| DB | `sqlite3_*` errors mapped to Zig error unions |
-| HTTP | 4xx for client errors, 5xx for server errors, always JSON |
-| Indexer | Log warning and continue; never crash the sync loop |
+| Layer       | Strategy                                                          |
+|-------------|-------------------------------------------------------------------|
+| Config      | Validation returns `error.InvalidConfig` with log messages        |
+| RPC         | Retry + circuit breaker; unrecoverable → propagate error          |
+| DB          | `sqlite3_*` errors mapped to Zig error unions                     |
+| REST API    | 4xx for client errors, 5xx for server errors, always JSON         |
+| GraphQL     | Resolver errors → field null + errors[] array; never crashes      |
+| Indexer     | Log warning and continue; never crash the sync loop               |
+| Factory     | Log error and skip child; factory indexer continues               |
 
 ---
 
@@ -190,22 +272,25 @@ Main Thread
 zponder 采用分层架构，每层职责单一，通过明确的接口通信。
 
 ```
-┌─────────────────────────────────────────────┐
-│  HTTP 层   (http_server.zig)                │
-│  REST API / CORS / 缓存 / 指标              │
-├─────────────────────────────────────────────┤
-│  索引器层 (indexer.zig)                     │
-│  单合约同步循环 / 重放 / 快照               │
-├─────────────────────────────────────────────┤
-│  以太坊层 (eth_rpc.zig + abi.zig)           │
-│  JSON-RPC / 重试 / 熔断器 / ABI 解析        │
-├─────────────────────────────────────────────┤
-│  数据层   (db.zig + cache.zig)              │
-│  SQLite WAL / 自动迁移 / LRU 缓存           │
-├─────────────────────────────────────────────┤
-│  基础层   (config.zig + log.zig)            │
-│  TOML 配置 / 结构化日志                     │
-└─────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  API 层     (http_server.zig + graphql.zig)                  │
+│  REST API / GraphQL / Playground / CORS / 缓存 / 指标        │
+├──────────────────────────────────────────────────────────────┤
+│  工厂层     (factory.zig)                                    │
+│  工厂事件检测 / 子索引器生命周期                             │
+├──────────────────────────────────────────────────────────────┤
+│  索引器层   (indexer.zig)                                    │
+│  单合约同步循环 / 重组处理 / 重放 / 快照                     │
+├──────────────────────────────────────────────────────────────┤
+│  以太坊层   (eth_rpc.zig + abi.zig)                          │
+│  JSON-RPC / eth_call / 重试 / 熔断器 / ABI 编解码            │
+├──────────────────────────────────────────────────────────────┤
+│  数据层     (db.zig + cache.zig)                             │
+│  SQLite WAL / RocksDB / PG / LRU / 调用缓存                  │
+├──────────────────────────────────────────────────────────────┤
+│  基础层     (config.zig + log.zig)                            │
+│  TOML 配置 / 结构化日志                                       │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -274,15 +359,34 @@ zponder 采用分层架构，每层职责单一，通过明确的接口通信。
 - **Prometheus 指标**：`/metrics` 返回 gauge 格式指标
 - **动态响应**：使用 `std.Io.Writer.Allocating`（无固定缓冲区限制）
 
-#### 8. ABI 模块 (`abi.zig`)
+#### 8. GraphQL 模块 (`graphql.zig`)
+
+- 使用 [zgraphql](https://github.com/chy3xyz/zgraphql) 进行解析、验证和执行
+- **编译时 Schema**：通过 `zg.SchemaBuilder` 从 Zig 结构体字面量生成
+- **Resolver**：通过 `Context` 用户数据访问 `db.Client`、`eth_rpc.Client` 和索引器状态
+- **速率限制**：通过 zgraphql 内置 `RateLimiter` 实现可选令牌桶
+- **服务器**：在独立线程中运行 `zg.GraphQLServer.listen()`，使用自有 `std.Io` 后端
+- **优雅关闭**：服务器退出时设置共享原子标志，触发主循环关闭
+
+#### 9. 工厂模块 (`factory.zig`)
+
+- 管理工厂合约创建的子合约的动态发现
+- **`FactoryManager`**：所有权管理子索引器生命周期，线程安全的子列表（原子互斥锁）
+- **`ChildIndexer`**：堆分配的包装器，持有自有 `ContractConfig` + `Indexer`
+- **回调模式**：工厂索引器通过 `FactoryCallback` 函数指针调用 `FactoryManager.onFactoryEvent`
+- **幂等性**：创建前检查 `sync_state` 表；内存中已存在则去重
+
+#### 10. ABI 模块 (`abi.zig`)
 
 - 解析 ABI JSON 数组，提取 `type: "event"` 的条目
 - 使用 **Keccak-256**（非 SHA3-256）计算事件签名哈希
   - `EventName(type1,type2,...)` → 32 字节 topic0
 - 解码日志：indexed 参数从 topics[1..] 取，non-indexed 从 data 取
 - ABI 类型映射到 SQLite 类型（`address` → `TEXT`，`bool` → `INTEGER` 等）
+- **`encodeFunctionCall`**：计算 4 字节选择器 + ABI 编码参数用于 eth_call
+- **`decodeCallResult`**：解码 eth_call 十六进制结果
 
-#### 9. 工具模块 (`utils.zig`)
+#### 11. 工具模块 (`utils.zig`)
 
 - `parseHexU64` / `parseHexU256`：十六进制字符串转整数
 - `isValidAddress`：42 字符、`0x` 前缀、十六进制字符
@@ -296,26 +400,32 @@ zponder 采用分层架构，每层职责单一，通过明确的接口通信。
 ```
 config.toml ──► config.zig ──► main.zig
                                    │
-                                   ▼
-                    ┌────────────────────────────┐
-                    │      indexer.zig           │
-                    │  (per-contract thread)     │
-                    └────────────┬───────────────┘
-                                 │
-            ┌────────────────────┼────────────────────┐
-            ▼                    ▼                    ▼
-     eth_rpc.zig          abi.zig               db.zig
-   (拉取日志)          (解码事件)            (写入 / 查询)
-            │                    │                    │
-            └────────────────────┼────────────────────┘
-                                 ▼
-                          cache.zig
-                      (失效 / 写入)
-                                 │
-                                 ▼
-                    http_server.zig
-              (GET /events → 缓存 → 数据库)
+                    ┌──────────────┼──────────────┐
+                    ▼              ▼              ▼
+              indexer.zig    http_server.zig   graphql.zig
+           (单合约线程)      (REST API)       (GraphQL API)
+                    │              │              │
+                    │              │              ▼
+                    │              │        factory.zig
+                    │              │     (子合约发现)
+                    │              │              │
+            ┌───────┼──────┐       │              │
+            ▼       ▼       ▼       │              │
+     eth_rpc.zig  abi.zig  db.zig ◄─┼──────────────┘
+   (拉取日志,   (解码,    (写入, │
+    eth_call,    编码)    查询,    │
+    区块数据)            缓存)     │
+            │       │       │       │
+            └───────┼───────┘       │
+                    ▼               │
+              cache.zig ◄───────────┘
+           (LRU 缓存失效)
 ```
+
+**索引流程**：RPC → ABI 解码 → 数据库写入 → 缓存失效
+**REST 查询流程**：HTTP → 白名单检查 → 缓存查找 → 数据库查询 → JSON 响应
+**GraphQL 查询流程**：HTTP → 解析 → 验证 → 执行 resolver → 数据库/RPC 查询 → JSON 响应
+**工厂流程**：索引器处理事件 → 工厂回调 → 提取子地址 → 创建子索引器 → 开始同步
 
 ---
 
@@ -332,12 +442,14 @@ config.toml ──► config.zig ──► main.zig
 
 ```
 主线程
-  └── 信号处理器 (SIGINT / SIGTERM → g_running = false)
-  └── HTTP accept 线程
+  └── 信号处理器 (SIGINT / SIGTERM → 关闭协调)
+  └── HTTP accept 线程 (REST API)
         └── 每 TCP 连接一个 handler 线程
+  └── GraphQL 线程 (zgraphql 服务器，独立 Io 后端)
   └── 索引器线程 #1 (合约 A)
-  └── 索引器线程 #2 (合约 B)
-  └── ...
+  ├── 索引器线程 #2 (合约 B)
+  ├── 索引器线程 #3 (工厂：监听创建事件)
+  └── 子索引器线程 (由工厂动态创建)
 ```
 
 - 共享数据（`cache`、`db`、`indexers`）的保护机制：
@@ -350,10 +462,12 @@ config.toml ──► config.zig ──► main.zig
 
 ### 错误处理策略
 
-| 层级 | 策略 |
-|------|------|
-| 配置 | 验证返回 `error.InvalidConfig` 并打印日志 |
-| RPC | 重试 + 熔断；不可恢复时向上传播错误 |
-| 数据库 | `sqlite3_*` 错误映射为 Zig 错误联合类型 |
-| HTTP | 4xx 客户端错误，5xx 服务端错误，始终返回 JSON |
-| 索引器 | 打印警告并继续；同步循环永不崩溃 |
+| 层级       | 策略                                                      |
+|------------|-----------------------------------------------------------|
+| 配置       | 验证返回 `error.InvalidConfig` 并打印日志                    |
+| RPC        | 重试 + 熔断；不可恢复时向上传播错误                          |
+| 数据库     | `sqlite3_*` 错误映射为 Zig 错误联合类型                     |
+| REST API   | 4xx 客户端错误，5xx 服务端错误，始终返回 JSON                |
+| GraphQL    | Resolver 错误 → 字段为 null + errors[] 数组；永不崩溃        |
+| 索引器     | 打印警告并继续；同步循环永不崩溃                            |
+| 工厂       | 打印错误并跳过子合约；工厂索引器继续运行                     |
