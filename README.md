@@ -44,7 +44,7 @@ A production-grade EVM event indexer written in Zig, inspired by [Ponder](https:
 
 | Layer              | Technology                                          |
 |--------------------|-----------------------------------------------------|
-| Language           | Zig 0.16.0+                                         |
+| Language           | Zig 0.17.0+                                         |
 | Storage            | SQLite / RocksDB / PostgreSQL                       |
 | HTTP Server        | `std.http.Server` + `std.Io` (io_uring on Linux)   |
 | GraphQL Engine     | [zgraphql](https://github.com/chy3xyz/zgraphql) v0.2.0 |
@@ -99,7 +99,7 @@ zponder/
 brew install zig sqlite3 rocksdb libpq
 
 # Verify
-zig version  # >= 0.16.0
+zig version  # >= 0.17.0
 ```
 
 ### 2. Build

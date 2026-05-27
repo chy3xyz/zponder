@@ -19,7 +19,7 @@ on a local Anvil Ethereum node.
 
 ## Prerequisites
 
-- [Zig](https://ziglang.org/) 0.16.0+
+- [Zig](https://ziglang.org/) 0.17.0+
 - [Foundry](https://book.getfoundry.sh/) (provides `anvil` + `cast`)
 - `brew install zig sqlite3 rocksdb libpq` (macOS)
 

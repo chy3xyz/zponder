@@ -10,7 +10,7 @@ indexes Transfer events with zponder, and queries both REST and GraphQL APIs.
 bash examples/local-demo/run.sh
 ```
 
-**Prerequisites:** Zig 0.16.0+, Foundry (anvil + cast), solc, sqlite3
+**Prerequisites:** Zig 0.17.0+, Foundry (anvil + cast), solc, sqlite3
 
 **What it does:**
 1. Starts Anvil (local Ethereum node on port 8545)

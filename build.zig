@@ -34,11 +34,21 @@ pub fn build(b: *std.Build) void {
     const zgraphql_dep = b.dependency("zgraphql", .{});
     const zgraphql_mod = zgraphql_dep.module("zgraphql");
 
+    const c_translate = b.addTranslateC(.{
+        .root_source_file = b.path("src/c.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    c_translate.addIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/libpq/include" });
+    c_translate.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
+    const c_mod = c_translate.createModule();
+
     const mod = b.addModule("zponder", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .imports = &.{
             .{ .name = "zgraphql", .module = zgraphql_mod },
+            .{ .name = "c", .module = c_mod },
         },
     });
     mod.linkSystemLibrary("sqlite3", .{});
@@ -58,6 +68,7 @@ pub fn build(b: *std.Build) void {
                 .{ .name = "zponder", .module = mod },
                 .{ .name = "build_options", .module = options.createModule() },
                 .{ .name = "zgraphql", .module = zgraphql_mod },
+                .{ .name = "c", .module = c_mod },
             },
         }),
     });

@@ -1,9 +1,7 @@
 const std = @import("std");
 const log = @import("log.zig");
 
-const c = @cImport({
-    @cInclude("libpq-fe.h");
-});
+const c = @import("c");
 
 pub const Client = struct {
     alloc: std.mem.Allocator,

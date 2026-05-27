@@ -1,9 +1,7 @@
 const std = @import("std");
 const log = @import("log.zig");
 
-const c = @cImport({
-    @cInclude("rocksdb/c.h");
-});
+const c = @import("c");
 
 const ROCKSDB_OK: [*c]u8 = null;
 

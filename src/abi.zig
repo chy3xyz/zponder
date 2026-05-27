@@ -369,7 +369,7 @@ test "decodeLog static types" {
             .{ .name = "to", .type = "address", .indexed = true },
             .{ .name = "value", .type = "uint256", .indexed = false },
         },
-        .signature = .{0} ** 32,
+        .signature = std.mem.zeroes([32]u8),
     };
 
     // topic0 = 事件签名，topic1 = from，topic2 = to
@@ -404,7 +404,7 @@ test "decodeLog string dynamic type" {
             .{ .name = "sender", .type = "address", .indexed = false },
             .{ .name = "content", .type = "string", .indexed = false },
         },
-        .signature = .{0} ** 32,
+        .signature = std.mem.zeroes([32]u8),
     };
 
     const topics = &.{};
@@ -439,7 +439,7 @@ test "decodeLog bytes dynamic type" {
         .inputs = &.{
             .{ .name = "payload", .type = "bytes", .indexed = false },
         },
-        .signature = .{0} ** 32,
+        .signature = std.mem.zeroes([32]u8),
     };
 
     const topics = &.{};

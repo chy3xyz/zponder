@@ -1,8 +1,8 @@
 .{
     .name = .zponder,
-    .version = "0.3.0",
+    .version = "0.4.0",
     .fingerprint = 0xf792d1784b9db5e6,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .zgraphql = .{
             .url = "https://github.com/chy3xyz/zgraphql/archive/refs/tags/v0.2.0.tar.gz",

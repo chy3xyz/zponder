@@ -6,7 +6,7 @@
 
 ## Project Overview
 
-**zponder** is a production-grade EVM event indexer written in Zig 0.16.0, inspired by [Ponder](https://ponder.sh). It indexes smart contract events from EVM-compatible chains and stores them in SQLite, RocksDB, or PostgreSQL. Includes a built-in REST API, GraphQL API, dashboard UI, factory contract support, and eth_call for reading on-chain state.
+**zponder** is a production-grade EVM event indexer written in Zig 0.17.0, inspired by [Ponder](https://ponder.sh). It indexes smart contract events from EVM-compatible chains and stores them in SQLite, RocksDB, or PostgreSQL. Includes a built-in REST API, GraphQL API, dashboard UI, factory contract support, and eth_call for reading on-chain state.
 
 ---
 
@@ -31,7 +31,7 @@
 
 | Layer              | Technology                                    |
 |--------------------|-----------------------------------------------|
-| Language           | Zig 0.16.0                                    |
+| Language           | Zig 0.17.0                                    |
 | Storage            | SQLite / RocksDB / PostgreSQL                 |
 | HTTP Server        | `std.http.Server` + `std.Io`                 |
 | GraphQL Engine     | [zgraphql](https://github.com/chy3xyz/zgraphql) v0.2.0 |

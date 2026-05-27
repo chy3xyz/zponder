@@ -14,26 +14,21 @@ const abi = @import("abi.zig");
 
 var g_running = std.atomic.Value(bool).init(true);
 
-const c_signal = @cImport({
-    @cInclude("signal.h");
-});
+const posix = std.posix;
 
-fn signalHandler(sig: c_int) callconv(.c) void {
+fn signalHandler(sig: posix.SIG) callconv(.c) void {
     _ = sig;
     g_running.store(false, .monotonic);
 }
 
 fn setupSignals() void {
-    var sa: c_signal.struct_sigaction = undefined;
-    if (@import("builtin").os.tag.isDarwin()) {
-        sa.__sigaction_u.__sa_handler = signalHandler;
-    } else {
-        sa.sa_handler = signalHandler;
-    }
-    _ = c_signal.sigemptyset(&sa.sa_mask);
-    sa.sa_flags = c_signal.SA_RESTART;
-    _ = c_signal.sigaction(c_signal.SIGINT, &sa, null);
-    _ = c_signal.sigaction(c_signal.SIGTERM, &sa, null);
+    var sa: posix.Sigaction = .{
+        .handler = .{ .handler = signalHandler },
+        .mask = posix.sigemptyset(),
+        .flags = posix.SA.RESTART,
+    };
+    posix.sigaction(posix.SIG.INT, &sa, null);
+    posix.sigaction(posix.SIG.TERM, &sa, null);
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -139,10 +134,17 @@ pub fn main(init: std.process.Init) !void {
 
     for (cfg.contracts, 0..) |_, i| {
         const idx = try indexer.Indexer.init(
-            alloc, init.io, &rpc, &database,
-            &resolved.contracts[i], cfg.global.snapshot_interval,
-            cfg.global.track_blocks, cfg.global.chain,
-            null, null, 0,
+            alloc,
+            init.io,
+            &rpc,
+            &database,
+            &resolved.contracts[i],
+            cfg.global.snapshot_interval,
+            cfg.global.track_blocks,
+            cfg.global.chain,
+            null,
+            null,
+            0,
         );
         try indexers.append(alloc, idx);
         log.info("索引器: {s} ({s}) 起始={d} 事件={d}", .{
@@ -158,9 +160,14 @@ pub fn main(init: std.process.Init) !void {
     var factory_manager: ?factory.FactoryManager = null;
     if (cfg.factories.len > 0) {
         factory_manager = try factory.FactoryManager.init(
-            alloc, init.io, &rpc, &database,
-            cfg.factories, cfg.global.snapshot_interval,
-            cfg.global.chain, cfg.global.track_blocks,
+            alloc,
+            init.io,
+            &rpc,
+            &database,
+            cfg.factories,
+            cfg.global.snapshot_interval,
+            cfg.global.chain,
+            cfg.global.track_blocks,
         );
 
         // 将工厂回调关联到匹配的索引器

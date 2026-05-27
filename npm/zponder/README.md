@@ -49,7 +49,7 @@ zig build -Doptimize=ReleaseFast
 ./zig-out/bin/zponder -c config.toml
 ```
 
-Requirements: [Zig](https://ziglang.org/) 0.16.0+, sqlite3, rocksdb (optional), libpq (optional for PostgreSQL)
+Requirements: [Zig](https://ziglang.org/) 0.17.0+, sqlite3, rocksdb (optional), libpq (optional for PostgreSQL)
 
 ## Documentation
 

@@ -1,7 +1,5 @@
 const std = @import("std");
-const c = @cImport({
-    @cInclude("sqlite3.h");
-});
+const c = @import("c");
 const abi = @import("abi.zig");
 const cache = @import("cache.zig");
 const log = @import("log.zig");
@@ -1914,7 +1912,7 @@ test "db event table insert and query" {
     var client = try Client.init(alloc, &cfg);
     defer client.deinit();
     try client.migrate();
-    const test_evt = abi.AbiEvent{ .name = "Transfer", .inputs = &.{ .{ .name = "from", .type = "address", .indexed = true }, .{ .name = "to", .type = "address", .indexed = true }, .{ .name = "value", .type = "uint256", .indexed = false } }, .signature = .{0} ** 32 };
+    const test_evt = abi.AbiEvent{ .name = "Transfer", .inputs = &.{ .{ .name = "from", .type = "address", .indexed = true }, .{ .name = "to", .type = "address", .indexed = true }, .{ .name = "value", .type = "uint256", .indexed = false } }, .signature = std.mem.zeroes([32]u8) };
     var events = try alloc.alloc(abi.AbiEvent, 1);
     events[0] = test_evt;
     defer alloc.free(events);
@@ -1950,7 +1948,7 @@ test "db rollbackFromBlock" {
     var client = try Client.init(alloc, &cfg);
     defer client.deinit();
     try client.migrate();
-    const test_evt = abi.AbiEvent{ .name = "Transfer", .inputs = &.{ .{ .name = "from", .type = "address", .indexed = true }, .{ .name = "to", .type = "address", .indexed = true }, .{ .name = "value", .type = "uint256", .indexed = false } }, .signature = .{0} ** 32 };
+    const test_evt = abi.AbiEvent{ .name = "Transfer", .inputs = &.{ .{ .name = "from", .type = "address", .indexed = true }, .{ .name = "to", .type = "address", .indexed = true }, .{ .name = "value", .type = "uint256", .indexed = false } }, .signature = std.mem.zeroes([32]u8) };
     var events = try alloc.alloc(abi.AbiEvent, 1);
     events[0] = test_evt;
     defer alloc.free(events);
@@ -2007,7 +2005,7 @@ test "db deleteEventLogsInRange" {
     var client = try Client.init(alloc, &cfg);
     defer client.deinit();
     try client.migrate();
-    const test_evt = abi.AbiEvent{ .name = "Transfer", .inputs = &.{ .{ .name = "from", .type = "address", .indexed = true }, .{ .name = "to", .type = "address", .indexed = true }, .{ .name = "value", .type = "uint256", .indexed = false } }, .signature = .{0} ** 32 };
+    const test_evt = abi.AbiEvent{ .name = "Transfer", .inputs = &.{ .{ .name = "from", .type = "address", .indexed = true }, .{ .name = "to", .type = "address", .indexed = true }, .{ .name = "value", .type = "uint256", .indexed = false } }, .signature = std.mem.zeroes([32]u8) };
     var events = try alloc.alloc(abi.AbiEvent, 1);
     events[0] = test_evt;
     defer alloc.free(events);

@@ -46,7 +46,7 @@ Version information.
 {
   "version": "0.1.0",
   "commit": "a1b2c3d",
-  "zig_version": "0.16.0"
+  "zig_version": "0.17.0"
 }
 ```
 
@@ -538,7 +538,7 @@ HTTP status: `429 Too Many Requests`.
 {
   "version": "0.1.0",
   "commit": "a1b2c3d",
-  "zig_version": "0.16.0"
+  "zig_version": "0.17.0"
 }
 ```
 

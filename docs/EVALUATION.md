@@ -134,7 +134,7 @@
 | L9 | `cors_origins` 配置解析后未区分具体 origin | `http_server.zig` | ~~始终返回 `*`，不支持按配置精确控制~~ ✅ 已修复 |
 | L10 | 无配置文件热重载 | `config.zig` | 修改 `config.toml` 后必须重启进程 |
 | L11 | `version` 硬编码在 build.zig | `build.zig` | ~~硬编码~~ ✅ 自动从 `build.zig.zon` 读取 |
-| L12 | `handleVersion` 中 zig_version 硬编码 | `http_server.zig` | `"0.16.0"` 是字面量，应使用 `@import("builtin").zig_version` |
+| L12 | `handleVersion` 中 zig_version 硬编码 | `http_server.zig` | `"0.17.0"` 是字面量，应使用 `@import("builtin").zig_version` |
 | L13 | 缺少 `start_block` 与 `from_block` 的语义区分 | `config.zig` | `ContractConfig` 同时有 `from_block` 和 `start_block(?)</u64>`，文档未说明区别 |
 
 ---
