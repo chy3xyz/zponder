@@ -36,3 +36,4 @@ npm/zponder/bin/linux-arm64/zponder
 # Environment
 .env
 .gstack/
+zponder
