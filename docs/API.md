@@ -37,6 +37,28 @@ Health check with indexer and cache status.
 
 ---
 
+### `GET /stream` (or `GET /api/v1/stream`)
+
+Server-Sent Events (SSE) real-time event streaming endpoint.
+
+**Headers:**
+`Content-Type: text/event-stream`
+`Cache-Control: no-cache`
+`Connection: keep-alive`
+
+**Event Stream Format:**
+```text
+retry: 3000
+
+event: connected
+data: {"status":"connected","service":"zponder SSE real-time stream"}
+
+event: log
+data: {"contract":"PancakePair","event":"Swap","block_number":20123456,"fields":{"amount0In":"100000","amount1Out":"500"}}
+```
+
+---
+
 ### `GET /version`
 
 Version information.

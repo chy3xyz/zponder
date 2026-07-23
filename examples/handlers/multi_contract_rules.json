@@ -1,0 +1,24 @@
+[
+  {
+    "contract": "*",
+    "event": "*",
+    "field": "*",
+    "op": "always",
+    "val": "0",
+    "action": {
+      "type": "log",
+      "msg": "ℹ️ [全量日志 Hook] 收到链上新事件"
+    }
+  },
+  {
+    "contract": "UniswapV3Pool",
+    "event": "Swap",
+    "field": "amount0",
+    "op": "gt",
+    "val": "0",
+    "action": {
+      "type": "webhook",
+      "url": "http://127.0.0.1:3000/api/webhooks/uniswap-swap"
+    }
+  }
+]

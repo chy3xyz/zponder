@@ -23,6 +23,14 @@ pub const FactoryCallback = *const fn (
     block_number: u64,
 ) void;
 
+pub const EventHookCallback = *const fn (
+    ctx: ?*anyopaque,
+    contract_name: []const u8,
+    event_name: []const u8,
+    fields: []const db.DecodedField,
+    block_number: u64,
+) void;
+
 /// 核心索引器
 pub const Indexer = struct {
     alloc: std.mem.Allocator,
@@ -42,6 +50,8 @@ pub const Indexer = struct {
     factory_ctx: ?*anyopaque,
     factory_callback: ?FactoryCallback,
     factory_idx: usize,
+    event_callback_ctx: ?*anyopaque = null,
+    event_callback: ?EventHookCallback = null,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -108,6 +118,11 @@ pub const Indexer = struct {
             .factory_callback = factory_callback,
             .factory_idx = factory_idx,
         };
+    }
+
+    pub fn setEventCallback(self: *Indexer, ctx: ?*anyopaque, cb: EventHookCallback) void {
+        self.event_callback_ctx = ctx;
+        self.event_callback = cb;
     }
 
     pub fn deinit(self: *Indexer) void {
@@ -409,12 +424,19 @@ pub const Indexer = struct {
                         lg.log_index,
                     );
 
+                    if (std.mem.eql(u8, evt.name, "Transfer")) {
+                        self.trackTokenTransferState(db_fields.items, lg.block_number);
+                    }
+
                     log.debug("已写入 {s}.{s} @ 区块 {}", .{ self.contract.name, evt.name, lg.block_number });
 
                     if (self.factory_callback) |cb| {
                         if (self.factory_ctx) |fctx| {
                             cb(fctx, self.factory_idx, evt.name, db_fields.items, lg.block_number);
                         }
+                    }
+                    if (self.event_callback) |cb| {
+                        cb(self.event_callback_ctx, self.contract.name, evt.name, db_fields.items, lg.block_number);
                     }
                     return;
                 }
@@ -423,6 +445,64 @@ pub const Indexer = struct {
 
         // ABI 无法解析：返回错误让调用方记录，避免静默丢弃
         return error.AbiMismatch;
+    }
+
+    /// 自动追踪 ERC-20 / Token 的 Transfer 事件，更新 account_states 表余额
+    fn trackTokenTransferState(self: *Indexer, fields: []const db.DecodedField, block_number: u64) void {
+        var from_addr: ?[]const u8 = null;
+        var to_addr: ?[]const u8 = null;
+        var val_str: ?[]const u8 = null;
+
+        for (fields) |f| {
+            if (std.mem.eql(u8, f.name, "from") or std.mem.eql(u8, f.name, "_from")) {
+                from_addr = f.value;
+            } else if (std.mem.eql(u8, f.name, "to") or std.mem.eql(u8, f.name, "_to")) {
+                to_addr = f.value;
+            } else if (std.mem.eql(u8, f.name, "value") or std.mem.eql(u8, f.name, "_value") or std.mem.eql(u8, f.name, "tokens") or std.mem.eql(u8, f.name, "amount")) {
+                val_str = f.value;
+            }
+        }
+
+        const transfer_val = parseU256(val_str orelse return) catch return;
+        const zero_addr = "0x0000000000000000000000000000000000000000";
+
+        if (from_addr) |fa| {
+            if (!std.mem.eql(u8, fa, zero_addr) and fa.len > 0) {
+                const current_bal_str = (self.database.getAccountBalance(self.contract.address, fa) catch null) orelse "0";
+                defer if (current_bal_str.ptr != "0".ptr) self.alloc.free(current_bal_str);
+                const current_bal = parseU256(current_bal_str) catch 0;
+                const new_bal = if (current_bal > transfer_val) current_bal - transfer_val else 0;
+                var buf: [128]u8 = undefined;
+                const new_bal_str = std.fmt.bufPrint(&buf, "{d}", .{new_bal}) catch return;
+                self.database.upsertAccountState(.{
+                    .contract_address = self.contract.address,
+                    .account_address = fa,
+                    .balance = new_bal_str,
+                    .last_updated_block = block_number,
+                }) catch |e| {
+                    log.warn("更新账户 {s} 余额失败: {any}", .{ fa, e });
+                };
+            }
+        }
+
+        if (to_addr) |ta| {
+            if (!std.mem.eql(u8, ta, zero_addr) and ta.len > 0) {
+                const current_bal_str = (self.database.getAccountBalance(self.contract.address, ta) catch null) orelse "0";
+                defer if (current_bal_str.ptr != "0".ptr) self.alloc.free(current_bal_str);
+                const current_bal = parseU256(current_bal_str) catch 0;
+                const new_bal = current_bal + transfer_val;
+                var buf: [128]u8 = undefined;
+                const new_bal_str = std.fmt.bufPrint(&buf, "{d}", .{new_bal}) catch return;
+                self.database.upsertAccountState(.{
+                    .contract_address = self.contract.address,
+                    .account_address = ta,
+                    .balance = new_bal_str,
+                    .last_updated_block = block_number,
+                }) catch |e| {
+                    log.warn("更新账户 {s} 余额失败: {any}", .{ ta, e });
+                };
+            }
+        }
     }
 
     /// 存储区块元数据到 blocks 表

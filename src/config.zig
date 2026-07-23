@@ -39,6 +39,7 @@ pub const IndexerConfig = struct {
 
 pub const RpcConfig = struct {
     url: []const u8,
+    urls: []const []const u8 = &.{},
     retry_count: u32,
     retry_delay_ms: u32,
     request_timeout_ms: u32,
@@ -135,6 +136,10 @@ pub const Config = struct {
         alloc.free(self.global.etherscan_api_key);
         alloc.free(self.global.chain);
         alloc.free(self.rpc.url);
+        if (self.rpc.urls.len > 0) {
+            for (self.rpc.urls) |u| alloc.free(u);
+            alloc.free(self.rpc.urls);
+        }
         alloc.free(self.http.host);
         if (self.http.cors_origins.len > 0) {
             for (self.http.cors_origins) |o| alloc.free(o);
@@ -206,16 +211,24 @@ fn trim(s: []const u8) []const u8 {
     return s[start..end];
 }
 
+fn stripInlineComment(s: []const u8) []const u8 {
+    const t = trim(s);
+    if (std.mem.indexOfScalar(u8, t, '#')) |hash_idx| {
+        return trim(t[0..hash_idx]);
+    }
+    return t;
+}
+
 fn parseU64(s: []const u8) !u64 {
-    return std.fmt.parseInt(u64, trim(s), 10);
+    return std.fmt.parseInt(u64, stripInlineComment(s), 10);
 }
 
 fn parseU32(s: []const u8) !u32 {
-    return std.fmt.parseInt(u32, trim(s), 10);
+    return std.fmt.parseInt(u32, stripInlineComment(s), 10);
 }
 
 fn parseU16(s: []const u8) !u16 {
-    return std.fmt.parseInt(u16, trim(s), 10);
+    return std.fmt.parseInt(u16, stripInlineComment(s), 10);
 }
 
 fn parseBool(s: []const u8) bool {
@@ -754,6 +767,8 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
                 if (std.mem.eql(u8, key, "url")) {
                     alloc.free(rpc.url);
                     rpc.url = try unquote(alloc, value);
+                } else if (std.mem.eql(u8, key, "urls")) {
+                    rpc.urls = try parseEvents(alloc, value);
                 } else if (std.mem.eql(u8, key, "timeout")) {
                     rpc.request_timeout_ms = try parseU32(value);
                 } else if (std.mem.eql(u8, key, "retry_count")) {

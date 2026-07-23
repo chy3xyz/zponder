@@ -9,7 +9,7 @@ fn getGitCommit(b: *std.Build) []const u8 {
 }
 
 fn getVersionFromZon(b: *std.Build) []const u8 {
-    const argv = &.{ "grep", "version", b.pathFromRoot("build.zig.zon") };
+    const argv = &.{ "grep", "version", "build.zig.zon" };
     var out_code: u8 = 0;
     const stdout = b.runAllowFail(argv, &out_code, .ignore) catch return "0.1.0";
     const trimmed = std.mem.trim(u8, stdout, " \n\r\t,");
@@ -69,10 +69,13 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    c_translate.addIncludePath(b.path("src"));
     for (include_paths) |p| {
         c_translate.addIncludePath(.{ .cwd_relative = p });
     }
     const c_mod = c_translate.createModule();
+
+    const qjs_flags = &.{ "-D_GNU_SOURCE", "-DCONFIG_VERSION=\"0.8.0\"" };
 
     const mod = b.addModule("zponder", .{
         .root_source_file = b.path("src/root.zig"),
@@ -81,6 +84,15 @@ pub fn build(b: *std.Build) void {
             .{ .name = "zgraphql", .module = zgraphql_mod },
             .{ .name = "c", .module = c_mod },
         },
+    });
+    mod.addCSourceFiles(.{
+        .files = &.{
+            "src/quickjs/quickjs.c",
+            "src/quickjs/libregexp.c",
+            "src/quickjs/libunicode.c",
+            "src/quickjs/dtoa.c",
+        },
+        .flags = qjs_flags,
     });
     mod.linkSystemLibrary("sqlite3", .{});
     mod.linkSystemLibrary("rocksdb", .{});
@@ -126,9 +138,7 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
     run_cmd.step.dependOn(b.getInstallStep());
 
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+
 
     const mod_tests = b.addTest(.{
         .root_module = mod,

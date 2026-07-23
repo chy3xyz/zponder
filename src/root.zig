@@ -20,6 +20,9 @@ pub const template = @import("template.zig");
 pub const dashboard = @import("dashboard.zig");
 pub const graphql = @import("graphql.zig");
 pub const factory = @import("factory.zig");
+pub const webhook = @import("webhook.zig");
+pub const script_engine = @import("script_engine.zig");
+pub const js_engine = @import("js_engine.zig");
 
 test {
     _ = config;
@@ -29,4 +32,7 @@ test {
     _ = db;
     _ = indexer;
     _ = http_server;
+    _ = webhook;
+    _ = script_engine;
+    _ = js_engine;
 }

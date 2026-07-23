@@ -51,6 +51,7 @@ pub const Client = struct {
     config: *const DatabaseConfig,
     backend_type: BackendType,
     db: ?*c.sqlite3,
+    read_db: ?*c.sqlite3 = null,
     rocks: ?rocksdb.Client,
     pgconn: ?pg.Client,
     cache: ?*cache.Cache = null,
@@ -74,24 +75,39 @@ pub const Client = struct {
         try checkPragma(db, "PRAGMA foreign_keys = ON;");
         try checkPragma(db, "PRAGMA journal_mode = WAL;");
         try checkPragma(db, "PRAGMA synchronous = NORMAL;");
-        return .{ .alloc = alloc, .config = config, .backend_type = .sqlite, .db = db, .rocks = null, .pgconn = null };
+
+        var read_db: ?*c.sqlite3 = null;
+        if (!std.mem.eql(u8, path, ":memory:")) {
+            const flags: c_int = c.SQLITE_OPEN_READONLY | c.SQLITE_OPEN_FULLMUTEX;
+            if (c.sqlite3_open_v2(path.ptr, &read_db, flags, null) != c.SQLITE_OK) {
+                read_db = null;
+            }
+        }
+        return .{ .alloc = alloc, .config = config, .backend_type = .sqlite, .db = db, .read_db = read_db, .rocks = null, .pgconn = null };
     }
 
     fn initRocksDB(alloc: std.mem.Allocator, config: *const DatabaseConfig) !Client {
         const path = if (config.db_name.len > 0) config.db_name else "rocksdb_data";
         const rc = try rocksdb.Client.init(alloc, path);
-        return .{ .alloc = alloc, .config = config, .backend_type = .rocksdb, .db = null, .rocks = rc, .pgconn = null };
+        return .{ .alloc = alloc, .config = config, .backend_type = .rocksdb, .db = null, .read_db = null, .rocks = rc, .pgconn = null };
     }
 
     fn initPostgreSQL(alloc: std.mem.Allocator, config: *const DatabaseConfig) !Client {
         const conninfo = if (config.db_name.len > 0) config.db_name else "host=localhost port=5432 dbname=zponder";
         const conn = try pg.Client.init(alloc, conninfo);
-        return .{ .alloc = alloc, .config = config, .backend_type = .postgresql, .db = null, .rocks = null, .pgconn = conn };
+        return .{ .alloc = alloc, .config = config, .backend_type = .postgresql, .db = null, .read_db = null, .rocks = null, .pgconn = conn };
+    }
+
+    pub fn getReadDb(self: *Client) ?*c.sqlite3 {
+        return self.read_db orelse self.db;
     }
 
     pub fn deinit(self: *Client) void {
         switch (self.backend_type) {
-            .sqlite => { if (self.db) |db| { _ = c.sqlite3_close(db); self.db = null; } },
+            .sqlite => {
+                if (self.read_db) |rdb| { _ = c.sqlite3_close(rdb); self.read_db = null; }
+                if (self.db) |db| { _ = c.sqlite3_close(db); self.db = null; }
+            },
             .rocksdb => { if (self.rocks) |*r| { r.deinit(); self.rocks = null; } },
             .postgresql => { if (self.pgconn) |*p| { p.deinit(); self.pgconn = null; } },
         }
@@ -620,7 +636,7 @@ pub const Client = struct {
 
         const sql = "SELECT balance FROM account_states WHERE contract_address = ? AND account_address = ?;";
         var stmt: ?*c.sqlite3_stmt = null;
-        var rc = c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null);
+        var rc = c.sqlite3_prepare_v2(self.getReadDb(), sql.ptr, @intCast(sql.len), &stmt, null);
         if (rc != c.SQLITE_OK) return error.PrepareFailed;
         defer _ = c.sqlite3_finalize(stmt);
         if (c.sqlite3_bind_text(stmt, 1, contract_address.ptr, @intCast(contract_address.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.BindFailed;
@@ -928,7 +944,7 @@ pub const Client = struct {
         var sql_list = sql_buf.toArrayList();
         defer sql_list.deinit(self.alloc);
         var stmt: ?*c.sqlite3_stmt = null;
-        const rc = c.sqlite3_prepare_v2(self.db, sql_list.items.ptr, @intCast(sql_list.items.len), &stmt, null);
+        const rc = c.sqlite3_prepare_v2(self.getReadDb(), sql_list.items.ptr, @intCast(sql_list.items.len), &stmt, null);
         if (rc != c.SQLITE_OK) return error.PrepareFailed;
         defer _ = c.sqlite3_finalize(stmt);
         var bind_idx: c_int = 1;
@@ -1072,7 +1088,7 @@ pub const Client = struct {
         }
         const sql = "SELECT result FROM call_cache WHERE cache_key = ?;";
         var stmt: ?*c.sqlite3_stmt = null;
-        var rc = c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null);
+        var rc = c.sqlite3_prepare_v2(self.getReadDb(), sql.ptr, @intCast(sql.len), &stmt, null);
         if (rc != c.SQLITE_OK) return error.PrepareFailed;
         defer _ = c.sqlite3_finalize(stmt);
         if (c.sqlite3_bind_text(stmt, 1, cache_key.ptr, @intCast(cache_key.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.BindFailed;
@@ -1904,6 +1920,25 @@ test "db account_states" {
     alloc.free(bal2.?);
     const bal3 = try client.getAccountBalance("0xabc", "0x999");
     try std.testing.expect(bal3 == null);
+}
+
+test "db sqlite file read pool" {
+    const alloc = std.testing.allocator;
+    const db_path = "test_read_pool.db";
+    defer _ = c.remove(db_path.ptr);
+
+    const cfg = DatabaseConfig{ .db_type = "sqlite", .db_name = db_path, .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var client = try Client.init(alloc, &cfg);
+    defer client.deinit();
+    try client.migrate();
+
+    try std.testing.expect(client.read_db != null);
+
+    try client.upsertAccountState(.{ .contract_address = "0xtoken", .account_address = "0xuser", .balance = "500", .last_updated_block = 10 });
+    const bal = try client.getAccountBalance("0xtoken", "0xuser");
+    try std.testing.expect(bal != null);
+    try std.testing.expectEqualStrings("500", bal.?);
+    alloc.free(bal.?);
 }
 
 test "db event table insert and query" {

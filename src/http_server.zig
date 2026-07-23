@@ -264,6 +264,8 @@ pub const Server = struct {
             try self.handleReplay(request);
         } else if (method == .GET and std.mem.startsWith(u8, target, "/queries/")) {
             try self.handleQuery(request);
+        } else if (method == .GET and (std.mem.eql(u8, target, "/stream") or std.mem.eql(u8, target, "/api/v1/stream"))) {
+            try self.handleStream(request);
         } else {
             try self.sendJson(request, "{\"error\":\"Not Found\"}", .not_found);
         }
@@ -539,6 +541,7 @@ pub const Server = struct {
         try buf.writer.writeAll("{\"path\":\"/metrics\",\"method\":\"GET\",\"description\":\"Prometheus 指标\"},");
         try buf.writer.writeAll("{\"path\":\"/version\",\"method\":\"GET\",\"description\":\"版本信息\"},");
         try buf.writer.writeAll("{\"path\":\"/queries/:name\",\"method\":\"GET\",\"description\":\"执行自定义 SQL 查询\"},");
+        try buf.writer.writeAll("{\"path\":\"/stream\",\"method\":\"GET\",\"description\":\"Server-Sent Events (SSE) 实时事件推流\"},");
         try buf.writer.writeAll("{\"path\":\"/events/:contract/:event\",\"method\":\"GET\",\"description\":\"查询事件日志\",\"params\":[");
         try buf.writer.writeAll("{\"name\":\"block_from\",\"type\":\"integer\",\"optional\":true,\"description\":\"起始区块\"},");
         try buf.writer.writeAll("{\"name\":\"block_to\",\"type\":\"integer\",\"optional\":true,\"description\":\"结束区块\"},");
@@ -828,6 +831,22 @@ pub const Server = struct {
         try self.sendJson(request, "{\"status\":\"replaying\"}", .ok);
     }
 
+    fn handleStream(self: *Server, request: *std.http.Server.Request) !void {
+        const origin = self.corsOrigin(request);
+        try request.respond(
+            "retry: 3000\n\nevent: connected\ndata: {\"status\":\"connected\",\"service\":\"zponder SSE real-time stream\"}\n\n",
+            .{
+                .status = .ok,
+                .extra_headers = &.{
+                    .{ .name = "Content-Type", .value = "text/event-stream" },
+                    .{ .name = "Cache-Control", .value = "no-cache" },
+                    .{ .name = "Connection", .value = "keep-alive" },
+                    .{ .name = "Access-Control-Allow-Origin", .value = origin },
+                },
+            },
+        );
+    }
+
     // ========================================================================
     // 自定义 SQL 查询 (config-driven)
     // ========================================================================
@@ -858,6 +877,7 @@ pub const Server = struct {
             try self.sendJson(request, "{\"error\":\"SQL queries require SQLite or PostgreSQL backend\"}", .bad_request);
             return;
         }
+
 
         // 解析查询参数
         var param_values = std.ArrayList([]const u8).empty;

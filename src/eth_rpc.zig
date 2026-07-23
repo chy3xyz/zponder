@@ -38,6 +38,7 @@ pub const Client = struct {
     config: *const RpcConfig,
     http_client: std.http.Client,
     next_id: std.atomic.Value(u64),
+    url_index: std.atomic.Value(usize),
     // 并发限制
     concurrent_requests: std.atomic.Value(u32),
     // 熔断器状态
@@ -54,6 +55,7 @@ pub const Client = struct {
             .config = rpc_config,
             .http_client = .{ .allocator = alloc, .io = io },
             .next_id = std.atomic.Value(u64).init(1),
+            .url_index = std.atomic.Value(usize).init(0),
             .concurrent_requests = std.atomic.Value(u32).init(0),
             .circuit_state = std.atomic.Value(CircuitState).init(.closed),
             .circuit_failures = std.atomic.Value(u32).init(0),
@@ -227,6 +229,7 @@ pub const Client = struct {
                 if (e == error.RpcLimitExceeded) return e;
 
                 attempt += 1;
+                _ = self.url_index.fetchAdd(1, .monotonic);
                 const failures = self.circuit_failures.fetchAdd(1, .monotonic) + 1;
 
                 if (failures >= CIRCUIT_THRESHOLD) {
@@ -273,11 +276,6 @@ pub const Client = struct {
     }
 
     /// 执行一次 RPC 调用
-    ///
-    /// 注意：Zig 0.16 的 `std.http.Client.fetch` 尚未暴露 `timeout` 参数
-    /// （`Request.timeout` 字段在标准库中已声明但未实际使用）。
-    /// 超时控制需等待标准库后续版本支持，当前依赖熔断器和指数退避
-    /// 来缓解长时间挂起的问题。
     fn rpcCall(self: *Client, method: []const u8, params: []const u8) ![]u8 {
         self.acquireSlot();
         defer self.releaseSlot();
@@ -295,8 +293,13 @@ pub const Client = struct {
         var response_writer: std.Io.Writer.Allocating = .init(self.alloc);
         defer response_writer.deinit();
 
+        const target_url = if (self.config.urls.len > 0)
+            self.config.urls[self.url_index.load(.monotonic) % self.config.urls.len]
+        else
+            self.config.url;
+
         const result = try self.http_client.fetch(.{
-            .location = .{ .url = self.config.url },
+            .location = .{ .url = target_url },
             .method = .POST,
             .payload = req_buf.items,
             .extra_headers = &.{

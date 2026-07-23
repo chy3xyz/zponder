@@ -1,0 +1,24 @@
+[
+  {
+    "contract": "busd",
+    "event": "Transfer",
+    "field": "value",
+    "op": "gte",
+    "val": "50000000000000000000000",
+    "action": {
+      "type": "log",
+      "msg": "💰 [BUSD 提醒] 50,000+ BUSD 变动通知"
+    }
+  },
+  {
+    "contract": "*",
+    "event": "Transfer",
+    "field": "to",
+    "op": "eq",
+    "val": "0x0000000000000000000000000000000000000000",
+    "action": {
+      "type": "log",
+      "msg": "🔥 [Burn 销毁] 监听到 Token 销毁 (Burn) 事件"
+    }
+  }
+]

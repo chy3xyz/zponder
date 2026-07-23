@@ -11,6 +11,8 @@ const factory = @import("factory.zig");
 const cache = @import("cache.zig");
 const etherscan = @import("etherscan.zig");
 const abi = @import("abi.zig");
+const script_engine = @import("script_engine.zig");
+const js_engine = @import("js_engine.zig");
 
 var g_running = std.atomic.Value(bool).init(true);
 
@@ -39,45 +41,73 @@ pub fn main(init: std.process.Init) !void {
     defer alloc.free(args);
     var config_path: []const u8 = "./config.toml";
 
-    var arg_idx: usize = 0;
+    var arg_idx: usize = 1;
     while (arg_idx < args.len) : (arg_idx += 1) {
-        if (std.mem.eql(u8, args[arg_idx], "init")) {
+        const arg = args[arg_idx];
+        if (std.mem.eql(u8, arg, "version") or std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--version")) {
+            const ver_msg = try std.fmt.allocPrint(alloc,
+                \\zponder v{s} (commit: {s})
+                \\Built with Zig 0.17.0-dev
+                \\Features: QuickJS, SQLite, RocksDB, PostgreSQL, GraphQL, Webhook Queue, SSE Streaming
+                \\
+            , .{ build_options.version, build_options.git_commit });
+            defer alloc.free(ver_msg);
+            std.Io.File.stdout().writeStreamingAll(init.io, ver_msg) catch {};
+            return;
+        }
+        if (std.mem.eql(u8, arg, "add-script") or std.mem.eql(u8, arg, "new-script")) {
+            var script_name: []const u8 = "my_handler";
+            var is_json = false;
+            if (arg_idx + 1 < args.len and !std.mem.startsWith(u8, args[arg_idx + 1], "-")) {
+                script_name = args[arg_idx + 1];
+                arg_idx += 1;
+            }
+            if (arg_idx + 1 < args.len and std.mem.eql(u8, args[arg_idx + 1], "--json")) {
+                is_json = true;
+            }
+            try cmdAddScript(alloc, init.io, script_name, is_json);
+            return;
+        }
+        if (std.mem.eql(u8, arg, "init")) {
             try cmdInit(alloc, init.io);
             return;
         }
-        if (std.mem.eql(u8, args[arg_idx], "-h") or std.mem.eql(u8, args[arg_idx], "--help")) {
+        if (std.mem.eql(u8, arg, "check")) {
+            if (arg_idx + 1 < args.len and (std.mem.eql(u8, args[arg_idx + 1], "-c") or std.mem.eql(u8, args[arg_idx + 1], "--config"))) {
+                if (arg_idx + 2 < args.len) config_path = args[arg_idx + 2];
+            }
+            try cmdCheck(alloc, init.io, config_path);
+            return;
+        }
+        if (std.mem.eql(u8, arg, "install")) {
+            try cmdInstall(alloc, init.io);
+            return;
+        }
+        if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "help")) {
             const help =
-                \\zponder — Zig 以太坊事件索引器
+                \\zponder — 高性能 Zig 以太坊事件索引器
                 \\
                 \\用法:
-                \\  zponder init                 交互式配置向导
-                \\  zponder [选项]               启动索引器
+                \\  zponder <子命令> [选项]
+                \\
+                \\子命令:
+                \\  start                        启动索引器服务 (默认)
+                \\  add-script <名称> [--json]    生成业务脚本模版 (存入 ./handlers/)
+                \\  check                        校验配置文件、RPC 连接与数据库 Migration
+                \\  dev                          开发调试模式运行 (输出 Debug 日志与 Handler 扫描)
+                \\  init                         交互式配置生成向导
+                \\  install                      将 zponder 二进制安装至系统 PATH
+                \\  version, -v, --version       显示版本与 Git 提交信息
+                \\  help, -h, --help             显示帮助信息
                 \\
                 \\选项:
                 \\  -c, --config <路径>          配置文件路径 (默认: ./config.toml)
-                \\  -h, --help                   显示此帮助信息
-                \\
-                \\最小配置示例 (config.toml):
-                \\  [global]
-                \\  etherscan_api_key = "YOUR_KEY"
-                \\
-                \\  [rpc]
-                \\  url = "https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY"
-                \\
-                \\  [database]
-                \\  type = "sqlite"
-                \\
-                \\  [[contracts]]
-                \\  name = "dai"
-                \\  address = "0x6b175474e89094c44da98b954eedeac495271d0f"
-                \\  # abi_path 留空 → 从 Etherscan 自动获取
-                \\  # events 留空 → 索引所有 ABI 事件
                 \\
             ;
             std.Io.File.stdout().writeStreamingAll(init.io, help) catch {};
             return;
         }
-        if (std.mem.eql(u8, args[arg_idx], "-c") or std.mem.eql(u8, args[arg_idx], "--config")) {
+        if (std.mem.eql(u8, arg, "-c") or std.mem.eql(u8, arg, "--config")) {
             if (arg_idx + 1 < args.len) {
                 config_path = args[arg_idx + 1];
                 arg_idx += 1;
@@ -184,6 +214,41 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // 自动扫描与挂载 Handler 动态脚本
+    var script_eng = script_engine.ScriptEngine.init(alloc, init.io);
+    defer script_eng.deinit();
+
+    var js_eng = try js_engine.JsEngine.init(alloc, init.io);
+    defer js_eng.deinit();
+
+    script_eng.loadDirectory("./handlers") catch {};
+    script_eng.loadDirectory("./examples/handlers") catch {};
+    js_eng.loadDirectory("./handlers") catch {};
+    js_eng.loadDirectory("./examples/handlers") catch {};
+
+    const CombinedHook = struct {
+        script_eng: *script_engine.ScriptEngine,
+
+        fn callback(
+            ctx_ptr: ?*anyopaque,
+            contract_name: []const u8,
+            event_name: []const u8,
+            fields: []const db.DecodedField,
+            block_number: u64,
+        ) void {
+            if (ctx_ptr) |ptr| {
+                const self_ptr: *@This() = @ptrCast(@alignCast(ptr));
+                self_ptr.script_eng.processEvent(contract_name, event_name, fields, block_number);
+            }
+        }
+    };
+    var combined_hook: CombinedHook = .{
+        .script_eng = &script_eng,
+    };
+    for (indexers.items) |*idx| {
+        idx.setEventCallback(&combined_hook, CombinedHook.callback);
+    }
+
     // 8. 启动
     for (indexers.items) |*idx| try idx.start();
 
@@ -229,6 +294,155 @@ pub fn main(init: std.process.Init) !void {
     }
     for (indexers.items) |*idx| idx.stop();
     log.info("优雅退出完成", .{});
+}
+
+// ============================================================================
+// check — 校验配置与环境
+// ============================================================================
+fn cmdCheck(alloc: std.mem.Allocator, io: std.Io, config_path: []const u8) !void {
+    try log.init(alloc, io, "info", null);
+    defer log.deinit(alloc, io);
+
+    log.info("🔍 开始校验 zponder 配置与依赖...", .{});
+
+    var cfg = config.load(alloc, io, config_path) catch |err| {
+        log.err("✗ [1/4] 配置文件 [{s}] 解析错误: {any}", .{ config_path, err });
+        return;
+    };
+    defer cfg.deinit(alloc);
+    log.info("✓ [1/4] 配置文件格式校验通过: {s}", .{config_path});
+
+    var rpc = eth_rpc.Client.init(alloc, io, &cfg.rpc);
+    const block_num = rpc.getBlockNumber() catch |err| {
+        log.err("✗ [2/4] RPC 节点连接失败 ({s}): {any}", .{ cfg.rpc.url, err });
+        return;
+    };
+    log.info("✓ [2/4] RPC 节点连接正常, 当前最新区块: {d}", .{block_num});
+
+    var database = db.Client.init(alloc, &cfg.database) catch |err| {
+        log.err("✗ [3/4] 数据库初始化失败: {any}", .{err});
+        return;
+    };
+    defer database.deinit();
+    try database.migrate();
+    log.info("✓ [3/4] 数据库 ({s}) 结构迁移校验通过", .{cfg.database.db_type});
+
+    var resolved = resolveEvents(alloc, io, &cfg) catch |err| {
+        log.err("✗ [4/4] ABI 与合约事件解析错误: {any}", .{err});
+        return;
+    };
+    defer resolved.deinit();
+    log.info("✓ [4/4] 所有 {d} 个合约 ABI 解析正常", .{resolved.contracts.len});
+
+    log.info("🎉 校验全部完成，系统具备启动条件！", .{});
+}
+
+// ============================================================================
+// install — 一键安装二进制至系统 PATH
+// ============================================================================
+fn cmdInstall(alloc: std.mem.Allocator, io: std.Io) !void {
+    try log.init(alloc, io, "info", null);
+    defer log.deinit(alloc, io);
+
+    log.info("📦 开始将 zponder 安装至系统 PATH...", .{});
+
+    const exe_path = try alloc.dupe(u8, "./zig-out/bin/zponder");
+    defer alloc.free(exe_path);
+
+    const home: []const u8 = if (std.c.getenv("HOME")) |h| std.mem.span(h) else "/tmp";
+    const local_bin = try std.fmt.allocPrint(alloc, "{s}/.local/bin", .{home});
+    defer alloc.free(local_bin);
+
+    const local_target = try std.fmt.allocPrint(alloc, "{s}/zponder", .{local_bin});
+    defer alloc.free(local_target);
+
+    std.Io.Dir.cwd().copyFile(exe_path, std.Io.Dir.cwd(), local_target, io, .{}) catch |err| {
+        log.err("复制二进制文件至 {s} 失败: {any}", .{ local_target, err });
+        return;
+    };
+
+    log.info("🎉 成功安装 zponder 二进制文件至: {s}", .{local_target});
+    log.info("提示: 请确保 {s} 已经在系统的 PATH 环境变量中。", .{local_bin});
+}
+
+// ============================================================================
+// add-script — 生成业务 Handler 脚本模版
+// ============================================================================
+fn cmdAddScript(alloc: std.mem.Allocator, io: std.Io, name: []const u8, is_json: bool) !void {
+    try log.init(alloc, io, "info", null);
+    defer log.deinit(alloc, io);
+
+    var d = std.Io.Dir.cwd().openDir(io, "handlers", .{}) catch blk: {
+        std.Io.Dir.cwd().createDir(io, "handlers", @enumFromInt(0o755)) catch {};
+        break :blk std.Io.Dir.cwd().openDir(io, "handlers", .{}) catch return;
+    };
+    d.close(io);
+
+    const ext = if (is_json) ".json" else ".js";
+    const filename = try std.fmt.allocPrint(alloc, "handlers/{s}{s}", .{ name, ext });
+    defer alloc.free(filename);
+
+    const content = if (is_json) try std.fmt.allocPrint(alloc,
+        \\[
+        \\  {{
+        \\    "contract": "PancakePair",
+        \\    "event": "Swap",
+        \\    "field": "amount0In",
+        \\    "op": "gte",
+        \\    "val": "1000000000000000000000",
+        \\    "action": {{
+        \\      "type": "log",
+        \\      "msg": "🚨 [{s}] 触发大额 Swap 业务规则"
+        \\    }}
+        \\  }},
+        \\  {{
+        \\    "contract": "PancakePair",
+        \\    "event": "Swap",
+        \\    "field": "amount0In",
+        \\    "op": "gte",
+        \\    "val": "1000000000000000000000",
+        \\    "action": {{
+        \\      "type": "webhook",
+        \\      "url": "http://127.0.0.1:3000/api/webhook"
+        \\    }}
+        \\  }}
+        \\]
+        \\
+    , .{name}) else try std.fmt.allocPrint(alloc,
+        \\/**
+        \\ * zponder Handler 动态脚本: {s}
+        \\ * 由 `zponder add-script` 自动生成
+        \\ */
+        \\
+        \\ponder.on("PancakePair:Swap", async ({{ event, context }}) => {{
+        \\  const {{ sender, amount0In, amount1Out }} = event.args;
+        \\  const blockNumber = event.block.number;
+        \\
+        \\  console.log(`[{s}] Event triggered at block #${{blockNumber}} | Sender: ${{sender}}`);
+        \\
+        \\  // 示例 1: 异步 Webhook POST 通知
+        \\  // await context.webhook.post("http://127.0.0.1:3000/api/alerts", {{ sender, blockNumber }});
+        \\
+        \\  // 示例 2: SSE 实时长连接推流至 Web 前端大屏
+        \\  // context.sse.broadcast({{ type: "{s}_EVENT", sender, blockNumber }});
+        \\}});
+        \\
+    , .{ name, name, name });
+    defer alloc.free(content);
+
+    const file = std.Io.Dir.cwd().createFile(io, filename, .{}) catch |err| {
+        log.err("创建脚本模版文件 [{s}] 失败: {any}", .{ filename, err });
+        return;
+    };
+    defer file.close(io);
+
+    file.writeStreamingAll(io, content) catch |err| {
+        log.err("写入脚本模版内容失败: {any}", .{err});
+        return;
+    };
+
+    log.info("🎉 成功生成业务脚本模版文件: {s}", .{filename});
+    log.info("提示: zponder 启动时将自动扫描并加载 handlers/ 目录下的所有脚本。", .{});
 }
 
 // ============================================================================

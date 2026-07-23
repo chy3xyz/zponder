@@ -1,0 +1,24 @@
+[
+  {
+    "contract": "PancakePair",
+    "event": "Swap",
+    "field": "amount0In",
+    "op": "gte",
+    "val": "1000000000000000000000",
+    "action": {
+      "type": "log",
+      "msg": "🚨 [巨鲸告警] 检测到大额 PancakeSwap 交易，Token0 输入大于 1,000 单位！"
+    }
+  },
+  {
+    "contract": "PancakePair",
+    "event": "Swap",
+    "field": "amount0In",
+    "op": "gte",
+    "val": "1000000000000000000000",
+    "action": {
+      "type": "webhook",
+      "url": "https://api.telegram.org/botYOUR_BOT_TOKEN/sendMessage"
+    }
+  }
+]
