@@ -1,6 +1,7 @@
 const std = @import("std");
 const config = @import("config.zig");
 const eth_rpc = @import("eth_rpc.zig");
+const ws_rpc = @import("ws_rpc.zig");
 const db = @import("db.zig");
 const abi = @import("abi.zig");
 const utils = @import("utils.zig");
@@ -52,6 +53,8 @@ pub const Indexer = struct {
     factory_idx: usize,
     event_callback_ctx: ?*anyopaque = null,
     event_callback: ?EventHookCallback = null,
+    /// Set while runLiveWs owns a Session (for stop() to unblock).
+    ws_session: ?*ws_rpc.Session = null,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -149,6 +152,14 @@ pub const Indexer = struct {
     /// 停止同步
     pub fn stop(self: *Indexer) void {
         self.state.store(.stopped, .monotonic);
+        if (self.ws_session) |s| s.close();
+    }
+
+    fn hasWsConfig(self: *Indexer) bool {
+        const c = self.rpc.config;
+        if (c.ws_urls.len > 0) return true;
+        if (c.ws_url) |u| return u.len > 0;
+        return false;
     }
 
     /// 设置重放模式
@@ -195,6 +206,12 @@ pub const Indexer = struct {
 
             const current = self.current_block.load(.monotonic);
             if (current >= latest_block) {
+                if (self.hasWsConfig()) {
+                    log.info("合约 {s} 已追上 tip (#{d})，切换到 WSS 订阅模式", .{ self.contract.name, latest_block });
+                    self.runLiveWs();
+                    // runLiveWs 仅在停止时返回
+                    break;
+                }
                 std.Io.sleep(self.rpc.io, std.Io.Duration.fromMilliseconds(self.poll_interval_ms), .real) catch {};
                 continue;
             }
@@ -281,11 +298,10 @@ pub const Indexer = struct {
         log.info("索引器已停止: {s}", .{self.contract.name});
     }
 
-    /// 同步指定区块范围
-    fn syncRange(self: *Indexer, from_block: u64, to_block: u64) !void {
-        // 构建事件 topic0 过滤
+    /// 构建合约事件 topic0 列表（调用方释放每个元素及 slice）
+    fn buildEventTopics(self: *Indexer) ![][]const u8 {
         var topics: std.ArrayList([]const u8) = .empty;
-        defer {
+        errdefer {
             for (topics.items) |t| self.alloc.free(t);
             topics.deinit(self.alloc);
         }
@@ -300,10 +316,234 @@ pub const Indexer = struct {
                 }
             }
         }
+        return try topics.toOwnedSlice(self.alloc);
+    }
+
+    fn freeEventTopics(self: *Indexer, topics: [][]const u8) void {
+        for (topics) |t| self.alloc.free(t);
+        self.alloc.free(topics);
+    }
+
+    /// HTTP 追到 tip，用于切入/重连 WSS 前的 gap bridge
+    fn bridgeToTip(self: *Indexer) !void {
+        while (self.state.load(.monotonic) == .running or self.state.load(.monotonic) == .replaying) {
+            const latest = try self.rpc.getBlockNumber();
+            const current = self.current_block.load(.monotonic);
+            if (current >= latest) return;
+
+            const to_block = @min(current + self.batch_size, latest);
+            self.syncRange(current, to_block) catch |e| {
+                if (e == error.RpcLimitExceeded) {
+                    self.batch_size = @max(self.batch_size / 2, 100);
+                    continue;
+                }
+                return e;
+            };
+
+            if (self.rpc.getBlockHash(to_block)) |hash| {
+                defer if (hash) |h| self.alloc.free(h);
+                if (hash) |h| {
+                    self.database.upsertBlockHash(self.contract.address, to_block, h) catch {};
+                }
+            } else |_| {}
+
+            self.current_block.store(to_block + 1, .monotonic);
+            self.database.upsertSyncState(.{
+                .contract_address = self.contract.address,
+                .last_synced_block = to_block,
+                .status = "running",
+            }) catch {};
+        }
+    }
+
+    fn advanceAfterLiveLog(self: *Indexer, block_number: u64) void {
+        const cur = self.current_block.load(.monotonic);
+        if (block_number + 1 > cur) {
+            self.current_block.store(block_number + 1, .monotonic);
+        }
+        self.database.upsertSyncState(.{
+            .contract_address = self.contract.address,
+            .last_synced_block = block_number,
+            .status = "running",
+        }) catch |e| {
+            log.warn("WSS 更新同步状态失败: {any}", .{e});
+        };
+
+        if (self.rpc.getBlockHash(block_number)) |hash| {
+            defer if (hash) |h| self.alloc.free(h);
+            if (hash) |h| {
+                self.database.upsertBlockHash(self.contract.address, block_number, h) catch {};
+            }
+        } else |_| {}
+
+        if (self.track_blocks and block_number > 0) {
+            self.storeBlockMetadata(block_number) catch {};
+        }
+    }
+
+    fn handleRemovedLog(self: *Indexer, block_number: u64) void {
+        log.warn("合约 {s} 收到 removed 日志 @ 区块 {d}，回滚", .{ self.contract.name, block_number });
+        self.database.rollbackFromBlock(
+            self.contract.address,
+            self.contract.name,
+            self.contract.events,
+            block_number,
+        ) catch |e| {
+            log.err("removed 日志回滚失败: {any}", .{e});
+        };
+        self.current_block.store(block_number, .monotonic);
+        self.database.upsertSyncState(.{
+            .contract_address = self.contract.address,
+            .last_synced_block = if (block_number > 0) block_number - 1 else 0,
+            .status = "running",
+        }) catch {};
+    }
+
+    /// Tip 阶段：WSS eth_subscribe(logs)，断线后 HTTP bridge + 重连
+    fn runLiveWs(self: *Indexer) void {
+        var session = ws_rpc.Session.init(self.alloc, self.rpc.io);
+        self.ws_session = &session;
+        defer {
+            self.ws_session = null;
+            session.unsubscribe();
+            session.deinit();
+        }
+
+        var reconnect_attempt: u32 = 0;
+        var last_reorg_check_ms: i64 = 0;
+
+        while (self.state.load(.monotonic) == .running or self.state.load(.monotonic) == .replaying) {
+            self.bridgeToTip() catch |e| {
+                log.err("WSS bridge 失败: {any}", .{e});
+                std.Io.sleep(self.rpc.io, std.Io.Duration.fromMilliseconds(self.poll_interval_ms), .real) catch {};
+                continue;
+            };
+
+            if (self.state.load(.monotonic) != .running and self.state.load(.monotonic) != .replaying) break;
+
+            session.connectWithFailover(self.rpc.config.ws_url, self.rpc.config.ws_urls) catch |e| {
+                reconnect_attempt += 1;
+                const backoff_ms = 500 * std.math.pow(u32, 2, @min(reconnect_attempt, 5));
+                log.warn("WSS 连接失败（{d}），{d}ms 后重试: {any}", .{ reconnect_attempt, backoff_ms, e });
+                std.Io.sleep(self.rpc.io, std.Io.Duration.fromMilliseconds(backoff_ms), .real) catch {};
+                continue;
+            };
+
+            const topics = self.buildEventTopics() catch |e| {
+                log.err("构建 WSS topics 失败: {any}", .{e});
+                session.close();
+                session.detachConnection();
+                break;
+            };
+            defer self.freeEventTopics(topics);
+
+            const filter = eth_rpc.LogFilter{
+                .address = self.contract.address,
+                .topics = if (topics.len > 0) topics else null,
+            };
+            const filter_obj = self.rpc.formatSubscribeLogsFilter(filter) catch |e| {
+                log.err("格式化 WSS filter 失败: {any}", .{e});
+                session.close();
+                session.detachConnection();
+                break;
+            };
+            defer self.alloc.free(filter_obj);
+
+            _ = session.subscribeLogs(filter_obj) catch |e| {
+                reconnect_attempt += 1;
+                const backoff_ms = 500 * std.math.pow(u32, 2, @min(reconnect_attempt, 5));
+                log.warn("eth_subscribe 失败，{d}ms 后重试: {any}", .{ backoff_ms, e });
+                session.close();
+                session.detachConnection();
+                std.Io.sleep(self.rpc.io, std.Io.Duration.fromMilliseconds(backoff_ms), .real) catch {};
+                continue;
+            };
+
+            reconnect_attempt = 0;
+            log.info("合约 {s} WSS 订阅已激活", .{self.contract.name});
+
+            // 二次 bridge：覆盖 subscribe 前后可能漏掉的块
+            self.bridgeToTip() catch |e| {
+                log.warn("订阅后 bridge 失败: {any}", .{e});
+            };
+
+            while (self.state.load(.monotonic) == .running or self.state.load(.monotonic) == .replaying) {
+                const event = session.readEvent() catch |e| {
+                    log.warn("WSS 读事件失败: {any}，准备重连", .{e});
+                    break;
+                };
+
+                switch (event) {
+                    .closed => break,
+                    .ping_handled => {},
+                    .log => |lg| {
+                        defer eth_rpc.freeLog(self.alloc, lg);
+
+                        if (lg.removed) {
+                            self.handleRemovedLog(lg.block_number);
+                            continue;
+                        }
+
+                        self.processLog(lg) catch |e| {
+                            log.warn("WSS 日志处理失败 (tx: {s}): {any}", .{ lg.transaction_hash, e });
+                            const topics_json = formatTopicsJson(self.alloc, lg.topics) catch continue;
+                            defer self.alloc.free(topics_json);
+                            self.database.insertRawLog(
+                                self.contract.address,
+                                lg.block_number,
+                                lg.transaction_hash,
+                                lg.log_index,
+                                topics_json,
+                                lg.data,
+                                @errorName(e),
+                            ) catch {};
+                            continue;
+                        };
+
+                        self.advanceAfterLiveLog(lg.block_number);
+
+                        // 周期性重组检测（约每 30s）
+                        const now_ms = std.Io.Timestamp.now(self.rpc.io, .real).toMilliseconds();
+                        if (now_ms - last_reorg_check_ms >= 30_000) {
+                            last_reorg_check_ms = now_ms;
+                            const cur = self.current_block.load(.monotonic);
+                            if (cur > self.contract.from_block) {
+                                if (self.detectAndHandleReorg(cur - 1)) |fork| {
+                                    if (fork < cur - 1) {
+                                        log.warn("WSS 模式检测到重组，回滚到 {}", .{fork});
+                                        self.current_block.store(fork, .monotonic);
+                                        break; // 退出读循环，bridge 再追上
+                                    }
+                                } else |_| {}
+                            }
+                        }
+
+                        self.checkSnapshot() catch {};
+                    },
+                }
+            }
+
+            session.unsubscribe();
+            session.close();
+            session.detachConnection();
+
+            if (self.state.load(.monotonic) != .running and self.state.load(.monotonic) != .replaying) break;
+
+            reconnect_attempt += 1;
+            const backoff_ms = 500 * std.math.pow(u32, 2, @min(reconnect_attempt, 5));
+            log.info("合约 {s} WSS 将在 {d}ms 后重连", .{ self.contract.name, backoff_ms });
+            std.Io.sleep(self.rpc.io, std.Io.Duration.fromMilliseconds(backoff_ms), .real) catch {};
+        }
+    }
+
+    /// 同步指定区块范围
+    fn syncRange(self: *Indexer, from_block: u64, to_block: u64) !void {
+        const topics = try self.buildEventTopics();
+        defer self.freeEventTopics(topics);
 
         const filter = eth_rpc.LogFilter{
             .address = self.contract.address,
-            .topics = if (topics.items.len > 0) topics.items else null,
+            .topics = if (topics.len > 0) topics else null,
             .from_block = from_block,
             .to_block = to_block,
         };

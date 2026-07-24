@@ -48,7 +48,7 @@ pub fn main(init: std.process.Init) !void {
             const ver_msg = try std.fmt.allocPrint(alloc,
                 \\zponder v{s} (commit: {s})
                 \\Built with Zig 0.17.0-dev
-                \\Features: QuickJS, SQLite, RocksDB, PostgreSQL, GraphQL, Webhook Queue, SSE Streaming
+                \\Features: QuickJS, SQLite, RocksDB, PostgreSQL, GraphQL, Webhook Queue, SSE Streaming, WSS Subscribe
                 \\
             , .{ build_options.version, build_options.git_commit });
             defer alloc.free(ver_msg);

@@ -9,6 +9,9 @@ chain = "ethereum"              # ethereum | bsc | polygon
 # RPC 配置
 [rpc]
 url = "https://eth-mainnet.g.alchemy.com/v2/your-api-key"
+# 可选：配置后追上 tip 时切换到 eth_subscribe(logs)，降低轮询成本
+# ws_url = "wss://eth-mainnet.g.alchemy.com/v2/your-api-key"
+# ws_urls = ["wss://...", "wss://..."]  # 可选故障转移
 timeout = 10000             # 超时时间（毫秒）
 retry_count = 3             # 重试次数
 

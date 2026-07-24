@@ -11,6 +11,8 @@ pub const Log = struct {
     block_number: u64,
     transaction_hash: []const u8,
     log_index: u64,
+    /// eth_subscribe may mark reorged logs as removed
+    removed: bool = false,
 };
 
 /// 日志过滤条件
@@ -193,7 +195,10 @@ pub const Client = struct {
 
     /// 获取日志列表
     pub fn getLogs(self: *Client, filter: LogFilter) ![]Log {
-        const params = try self.formatLogFilter(filter);
+        const filter_obj = try self.formatLogFilter(filter);
+        defer self.alloc.free(filter_obj);
+
+        const params = try std.fmt.allocPrint(self.alloc, "[{s}]", .{filter_obj});
         defer self.alloc.free(params);
 
         const raw = try self.rpcCallWithRetry("eth_getLogs", params);
@@ -340,40 +345,55 @@ pub const Client = struct {
         return try self.alloc.dupe(u8, body.items);
     }
 
-    /// 格式化日志过滤条件为 JSON 参数
-    fn formatLogFilter(self: *Client, filter: LogFilter) ![]u8 {
-        var buf: std.Io.Writer.Allocating = .init(self.alloc);
-        defer buf.deinit();
+    /// 格式化 eth_getLogs 过滤条件为 JSON 参数
+    pub fn formatLogFilter(self: *Client, filter: LogFilter) ![]u8 {
+        return formatLogFilterObject(self.alloc, filter, true);
+    }
 
-        try buf.writer.writeAll("[{\"address\":");
-        if (filter.address) |addr| {
-            try buf.writer.print("\"{s}\"", .{addr});
-        } else {
-            try buf.writer.writeAll("null");
-        }
+    /// 格式化 eth_subscribe("logs") 过滤对象（不含区块范围，外层由调用方包 params）
+    pub fn formatSubscribeLogsFilter(self: *Client, filter: LogFilter) ![]u8 {
+        return formatLogFilterObject(self.alloc, filter, false);
+    }
+};
 
+/// 将 LogFilter 格式化为 JSON 对象字符串（非数组包裹）。
+/// `include_block_range` 为 true 时写入 fromBlock/toBlock（eth_getLogs）；
+/// topics 按 topic0 OR 语义写成 `[["sig1","sig2",...]]`。
+pub fn formatLogFilterObject(alloc: std.mem.Allocator, filter: LogFilter, include_block_range: bool) ![]u8 {
+    var buf: std.Io.Writer.Allocating = .init(alloc);
+    defer buf.deinit();
+
+    try buf.writer.writeAll("{\"address\":");
+    if (filter.address) |addr| {
+        try buf.writer.print("\"{s}\"", .{addr});
+    } else {
+        try buf.writer.writeAll("null");
+    }
+
+    if (include_block_range) {
         if (filter.from_block) |fb| {
             try buf.writer.print(",\"fromBlock\":\"0x{x}\"", .{fb});
         }
         if (filter.to_block) |tb| {
             try buf.writer.print(",\"toBlock\":\"0x{x}\"", .{tb});
         }
-
-        if (filter.topics) |topics| {
-            try buf.writer.writeAll(",\"topics\":[");
-            for (topics, 0..) |t, i| {
-                if (i > 0) try buf.writer.writeByte(',');
-                try buf.writer.print("\"{s}\"", .{t});
-            }
-            try buf.writer.writeAll("]");
-        }
-
-        try buf.writer.writeAll("}]");
-        var list = buf.toArrayList();
-        defer list.deinit(self.alloc);
-        return try self.alloc.dupe(u8, list.items);
     }
-};
+
+    if (filter.topics) |topics| {
+        // topic0 OR: [["0xaaa","0xbbb"]]
+        try buf.writer.writeAll(",\"topics\":[[");
+        for (topics, 0..) |t, i| {
+            if (i > 0) try buf.writer.writeByte(',');
+            try buf.writer.print("\"{s}\"", .{t});
+        }
+        try buf.writer.writeAll("]]");
+    }
+
+    try buf.writer.writeByte('}');
+    var list = buf.toArrayList();
+    defer list.deinit(alloc);
+    return try alloc.dupe(u8, list.items);
+}
 
 /// 从 JSON-RPC 响应中提取十六进制 u64 结果
 fn extractHexU64Result(alloc: std.mem.Allocator, raw: []const u8) !u64 {
@@ -393,7 +413,66 @@ fn extractHexU64Result(alloc: std.mem.Allocator, raw: []const u8) !u64 {
     return utils.parseHexU64(hex_str);
 }
 
-/// 解析日志列表 JSON
+/// 解析单条日志 JSON 对象（eth_getLogs 元素或 eth_subscription result）
+pub fn parseLogObject(alloc: std.mem.Allocator, obj: std.json.ObjectMap) !Log {
+    var topics: std.ArrayList([]const u8) = .empty;
+    errdefer {
+        for (topics.items) |t| alloc.free(t);
+        topics.deinit(alloc);
+    }
+
+    if (obj.get("topics")) |t| {
+        if (t == .array) {
+            for (t.array.items) |topic| {
+                if (topic != .string) continue;
+                try topics.append(alloc, try alloc.dupe(u8, topic.string));
+            }
+        }
+    }
+
+    const block_number = blk: {
+        if (obj.get("blockNumber")) |bn| {
+            if (bn == .string) break :blk utils.parseHexU64(bn.string) catch 0;
+        }
+        break :blk 0;
+    };
+
+    const log_index = blk: {
+        if (obj.get("logIndex")) |li| {
+            if (li == .string) break :blk utils.parseHexU64(li.string) catch 0;
+        }
+        break :blk 0;
+    };
+
+    const address_str = if (obj.get("address")) |a| switch (a) {
+        .string => |v| v,
+        else => "",
+    } else "";
+    const data_str = if (obj.get("data")) |d| switch (d) {
+        .string => |v| v,
+        else => "",
+    } else "";
+    const tx_str = if (obj.get("transactionHash")) |th| switch (th) {
+        .string => |v| v,
+        else => "",
+    } else "";
+    const removed = if (obj.get("removed")) |r| switch (r) {
+        .bool => |v| v,
+        else => false,
+    } else false;
+
+    return .{
+        .address = try alloc.dupe(u8, address_str),
+        .topics = try topics.toOwnedSlice(alloc),
+        .data = try alloc.dupe(u8, data_str),
+        .block_number = block_number,
+        .transaction_hash = try alloc.dupe(u8, tx_str),
+        .log_index = log_index,
+        .removed = removed,
+    };
+}
+
+/// 解析日志列表 JSON（eth_getLogs 完整响应）
 fn parseLogs(alloc: std.mem.Allocator, raw: []const u8) ![]Log {
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
     defer parsed.deinit();
@@ -403,11 +482,16 @@ fn parseLogs(alloc: std.mem.Allocator, raw: []const u8) ![]Log {
         return error.InvalidResponse;
     }
 
-    // 检查 JSON-RPC 错误
     if (parsed.value.object.get("error")) |err| {
         if (err != .object) return error.InvalidResponse;
-        const code = if (err.object.get("code")) |c| switch (c) { .integer => |v| v, else => -1 } else -1;
-        const msg = if (err.object.get("message")) |m| switch (m) { .string => |v| v, else => "unknown" } else "unknown";
+        const code = if (err.object.get("code")) |c| switch (c) {
+            .integer => |v| v,
+            else => -1,
+        } else -1;
+        const msg = if (err.object.get("message")) |m| switch (m) {
+            .string => |v| v,
+            else => "unknown",
+        } else "unknown";
         log.err("RPC error: code={d}, msg={s}", .{ code, msg });
         if (code == -32005) return error.RpcLimitExceeded;
         return error.RpcError;
@@ -418,75 +502,48 @@ fn parseLogs(alloc: std.mem.Allocator, raw: []const u8) ![]Log {
 
     var logs: std.ArrayList(Log) = .empty;
     errdefer {
-        for (logs.items) |l| {
-            alloc.free(l.address);
-            for (l.topics) |t| alloc.free(t);
-            alloc.free(l.topics);
-            alloc.free(l.data);
-            alloc.free(l.transaction_hash);
-        }
+        for (logs.items) |l| freeLog(alloc, l);
         logs.deinit(alloc);
     }
 
     for (result.array.items) |item| {
         if (item != .object) continue;
-        const obj = item.object;
-
-        var topics: std.ArrayList([]const u8) = .empty;
-        errdefer {
-            for (topics.items) |t| alloc.free(t);
-            topics.deinit(alloc);
-        }
-
-        if (obj.get("topics")) |t| {
-            if (t == .array) {
-                for (t.array.items) |topic| {
-                    if (topic != .string) continue;
-                    try topics.append(alloc, try alloc.dupe(u8, topic.string));
-                }
-            }
-        }
-
-        const block_number = blk: {
-            if (obj.get("blockNumber")) |bn| {
-                if (bn == .string) break :blk utils.parseHexU64(bn.string) catch 0;
-            }
-            break :blk 0;
-        };
-
-        const log_index = blk: {
-            if (obj.get("logIndex")) |li| {
-                if (li == .string) break :blk utils.parseHexU64(li.string) catch 0;
-            }
-            break :blk 0;
-        };
-
-        const address_str = if (obj.get("address")) |a| switch (a) { .string => |v| v, else => "" } else "";
-        const data_str = if (obj.get("data")) |d| switch (d) { .string => |v| v, else => "" } else "";
-        const tx_str = if (obj.get("transactionHash")) |th| switch (th) { .string => |v| v, else => "" } else "";
-
-        try logs.append(alloc, .{
-            .address = try alloc.dupe(u8, address_str),
-            .topics = try topics.toOwnedSlice(alloc),
-            .data = try alloc.dupe(u8, data_str),
-            .block_number = block_number,
-            .transaction_hash = try alloc.dupe(u8, tx_str),
-            .log_index = log_index,
-        });
+        try logs.append(alloc, try parseLogObject(alloc, item.object));
     }
 
     return try logs.toOwnedSlice(alloc);
 }
 
+/// 解析 eth_subscription 通知；若不是订阅推送则返回 null。
+/// 调用方拥有返回的 Log，需 freeLog。
+pub fn parseSubscriptionNotification(alloc: std.mem.Allocator, raw: []const u8) !?Log {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return null;
+    const method = parsed.value.object.get("method") orelse return null;
+    if (method != .string or !std.mem.eql(u8, method.string, "eth_subscription")) return null;
+
+    const params = parsed.value.object.get("params") orelse return null;
+    if (params != .object) return null;
+    const result = params.object.get("result") orelse return null;
+    if (result != .object) return null;
+
+    return try parseLogObject(alloc, result.object);
+}
+
+/// 释放单条日志内存
+pub fn freeLog(alloc: std.mem.Allocator, l: Log) void {
+    alloc.free(l.address);
+    for (l.topics) |t| alloc.free(t);
+    alloc.free(l.topics);
+    alloc.free(l.data);
+    alloc.free(l.transaction_hash);
+}
+
 /// 释放日志列表内存
 pub fn freeLogs(alloc: std.mem.Allocator, logs: []Log) void {
-    for (logs) |l| {
-        alloc.free(l.address);
-        for (l.topics) |t| alloc.free(t);
-        alloc.free(l.topics);
-        alloc.free(l.data);
-        alloc.free(l.transaction_hash);
-    }
+    for (logs) |l| freeLog(alloc, l);
     alloc.free(logs);
 }
 
@@ -517,6 +574,19 @@ test "parseLogs basic" {
     try std.testing.expectEqualStrings("0x6b175474e89094c44da98b954eedeac495271d0f", logs[0].address);
     try std.testing.expectEqual(@as(u64, 256), logs[0].block_number);
     try std.testing.expectEqual(@as(usize, 2), logs[0].topics.len);
+    try std.testing.expect(!logs[0].removed);
+}
+
+test "parseSubscriptionNotification removed" {
+    const alloc = std.testing.allocator;
+    const raw =
+        \\{"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":"0x1","result":{"address":"0xabc","topics":["0xt0"],"data":"0x","blockNumber":"0x10","transactionHash":"0xtx","logIndex":"0x0","removed":true}}}
+    ;
+    const maybe = try parseSubscriptionNotification(alloc, raw);
+    try std.testing.expect(maybe != null);
+    defer freeLog(alloc, maybe.?);
+    try std.testing.expect(maybe.?.removed);
+    try std.testing.expectEqual(@as(u64, 16), maybe.?.block_number);
 }
 
 test "parseLogs empty result" {
@@ -549,6 +619,8 @@ test "formatLogFilter" {
     try std.testing.expect(std.mem.indexOf(u8, params, "0x64") != null);
     try std.testing.expect(std.mem.indexOf(u8, params, "0xc8") != null);
     try std.testing.expect(std.mem.indexOf(u8, params, "0x123") != null);
+    // topic0 OR 语义
+    try std.testing.expect(std.mem.indexOf(u8, params, "[[\"0x123\",\"0x456\"]]") != null);
 }
 
 test "freeLogs" {

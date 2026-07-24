@@ -14,6 +14,9 @@ snapshot_interval = 3600
 #   - QuickNode: https://your-endpoint.bsc.quiknode.pro/
 #   - GetBlock: https://bsc.getblock.io/mainnet/
 url = "https://bsc-dataseed.binance.org"
+# 可选：专业节点通常提供 WSS；追上 tip 后用 eth_subscribe 降轮询成本
+# ws_url = "wss://your-bsc-endpoint/ws"
+# 详见 docs/WSS.md
 retry_count = 3
 max_concurrent = 10
 

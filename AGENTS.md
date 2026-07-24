@@ -6,7 +6,7 @@
 
 ## Project Overview
 
-**zponder** is a production-grade EVM event indexer written in Zig 0.17.0, inspired by [Ponder](https://ponder.sh). It indexes smart contract events from EVM-compatible chains and stores them in SQLite, RocksDB, or PostgreSQL. Includes a built-in REST API, GraphQL API, QuickJS JavaScript Handler Engine, Async Webhook Worker Queue, SSE Stream, dashboard UI, factory contract support, and eth_call for reading on-chain state.
+**zponder** is a production-grade EVM event indexer written in Zig 0.17.0, inspired by [Ponder](https://ponder.sh). It indexes smart contract events from EVM-compatible chains and stores them in SQLite, RocksDB, or PostgreSQL. Includes a built-in REST API, GraphQL API, QuickJS JavaScript Handler Engine, Async Webhook Worker Queue, SSE Stream, optional WSS `eth_subscribe` live indexing, dashboard UI, factory contract support, and eth_call for reading on-chain state.
 
 ---
 
@@ -15,16 +15,17 @@
 | Item                    | Status       |
 |-------------------------|--------------|
 | `build.zig` + `build.zig.zon` | Complete (embeds QuickJS + zgraphql v0.3.1) |
-| `src/` source files     | 21 Zig files |
-| `config.toml`           | Complete     |
+| `src/` source files     | 22+ Zig files |
+| `config.toml`           | Complete (`ws_url` / `ws_urls` optional) |
 | Unit tests              | 70+ passing  |
 | QuickJS Script Engine   | Production (Ponder-style `ponder.on` JS API) |
 | Async Webhook Queue     | Production   |
 | SSE Stream API          | Production (`/stream`, `/api/v1/stream`) |
+| WSS Live Subscribe      | Production (HTTP catch-up → tip `eth_subscribe(logs)`) |
 | CLI Tools               | `start`, `check`, `dev`, `add-script`, `install`, `version` |
 | REST & GraphQL API      | Production   |
 | Factory contracts       | Implemented  |
-| Docs                    | README, API, ARCHITECTURE, dev.md, EVALUATION, examples |
+| Docs                    | README, API, ARCHITECTURE, WSS, dev.md, EVALUATION, examples |
 
 ---
 
@@ -37,7 +38,7 @@
 | Storage            | SQLite (with `read_db` pool) / RocksDB / PostgreSQL |
 | HTTP Server        | `std.http.Server` + `std.Io`                 |
 | GraphQL Engine     | [zgraphql](https://github.com/chy3xyz/zgraphql) v0.3.1 |
-| RPC Client         | Multi-node failover JSON-RPC with backoff     |
+| RPC Client         | HTTP JSON-RPC failover + optional WSS `eth_subscribe` |
 | Build              | `build.zig` + `build.zig.zon`                 |
 
 ---
@@ -54,8 +55,9 @@ zponder/
 │   ├── config.zig        # TOML config parser + validation (all sections)
 │   ├── log.zig           # Structured logging (JSON/text, file+stderr, thread-safe)
 │   ├── eth_rpc.zig       # JSON-RPC: getLogs, getBlockData, ethCall, failover rotation
+│   ├── ws_rpc.zig        # WebSocket: eth_subscribe(logs), ping/pong, reconnect
 │   ├── db.zig            # Database: SQLite (with read_db isolation) + RocksDB + PostgreSQL
-│   ├── indexer.zig       # Per-contract sync loop, reorg handling, generic event_callback
+│   ├── indexer.zig       # Per-contract sync loop, WSS live mode, reorg, event_callback
 │   ├── factory.zig       # Factory contract manager: child discovery + lifecycle
 │   ├── http_server.zig   # REST API: routing, CORS, SSE stream (/stream), metrics
 │   ├── graphql.zig       # GraphQL API: zgraphql schema, resolvers, rate limiting
@@ -68,7 +70,7 @@ zponder/
 ├── install.sh            # One-command ReleaseFast binary installer
 ├── abis/                 # Contract ABI JSON files
 ├── pages/                # Static HTML pages (dashboard, kline, etc.)
-├── docs/                 # Documentation (API.md, ARCHITECTURE.md, EVALUATION.md)
+├── docs/                 # Documentation (API.md, ARCHITECTURE.md, WSS.md, EVALUATION.md)
 ├── config.toml           # Runtime configuration
 ├── build.zig             # Build script (embeds git commit + version)
 └── build.zig.zon         # Package manifest

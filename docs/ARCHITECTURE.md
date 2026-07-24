@@ -22,8 +22,8 @@ zponder is a layered Ethereum event indexer. Each layer has a single responsibil
 │  Indexer Layer (indexer.zig)                                  │
 │  Per-contract sync loop / Reorg handling / Replay / Snapshot │
 ├──────────────────────────────────────────────────────────────┤
-│  Ethereum Layer (eth_rpc.zig + abi.zig)                       │
-│  JSON-RPC / eth_call / Retry / Circuit Breaker / ABI encode  │
+│  Ethereum Layer (eth_rpc.zig + ws_rpc.zig + abi.zig)          │
+│  HTTP JSON-RPC / WSS eth_subscribe / Retry / ABI encode      │
 ├──────────────────────────────────────────────────────────────┤
 │  Data Layer   (db.zig + cache.zig)                           │
 │  SQLite WAL / RocksDB / PostgreSQL / LRU / Call Cache        │
@@ -52,7 +52,7 @@ zponder is a layered Ethereum event indexer. Each layer has a single responsibil
 - JSON format escapes special characters properly
 - Gracefully no-ops if uninitialized (safe for tests)
 
-#### 3. ETH RPC (`eth_rpc.zig`)
+#### 3. ETH RPC (`eth_rpc.zig` + `ws_rpc.zig`)
 
 - Built on `std.http.Client` with `std.Io` async I/O
 - **Retry**: exponential backoff (500ms × 2^attempt, capped at 16s)
@@ -65,6 +65,13 @@ zponder is a layered Ethereum event indexer. Each layer has a single responsibil
   - `getBlockData(block_number)` — eth_getBlockByNumber → full block metadata (timestamp, miner, gas, etc.)
   - `getLogs(filter)` — eth_getLogs → parsed log array
   - `ethCall(to, data, block_number)` — eth_call → raw hex result
+- **WSS live path** (`ws_rpc.zig`, optional):
+  - Config: `[rpc] ws_url` / `ws_urls` (`ws://` or `wss://`)
+  - Historical catch-up still uses HTTP `eth_getLogs`
+  - At tip: HTTP gap bridge → `eth_subscribe("logs")` → process notifications
+  - Handles ping/pong, reconnect with exponential backoff, `removed` logs → rollback
+  - Without `ws_url`, tip phase keeps polling `eth_blockNumber` as before
+  - Full guide: [WSS.md](WSS.md)
 
 #### 4. DB (`db.zig`)
 
@@ -99,6 +106,7 @@ zponder is a layered Ethereum event indexer. Each layer has a single responsibil
 - **Resume**: reads `sync_state` table on start; falls back to `from_block`
 - **Replay**: stops sync, deletes range, restarts from `from_block`
 - **Snapshot**: creates JSON snapshot every `snapshot_interval` seconds
+- **Hybrid live mode**: when `rpc.ws_url` is set and catch-up reaches tip, switches to WSS `eth_subscribe(logs)` (per-indexer connection); disconnect → HTTP bridge → resubscribe
 - States: `running`, `stopped`, `error`, `replaying`
 
 #### 7. HTTP Server (`http_server.zig`)
@@ -282,8 +290,8 @@ zponder 采用分层架构，每层职责单一，通过明确的接口通信。
 │  索引器层   (indexer.zig)                                    │
 │  单合约同步循环 / 重组处理 / 重放 / 快照                     │
 ├──────────────────────────────────────────────────────────────┤
-│  以太坊层   (eth_rpc.zig + abi.zig)                          │
-│  JSON-RPC / eth_call / 重试 / 熔断器 / ABI 编解码            │
+│  以太坊层   (eth_rpc.zig + ws_rpc.zig + abi.zig)             │
+│  HTTP JSON-RPC / WSS eth_subscribe / 重试 / ABI 编解码       │
 ├──────────────────────────────────────────────────────────────┤
 │  数据层     (db.zig + cache.zig)                             │
 │  SQLite WAL / RocksDB / PG / LRU / 调用缓存                  │
@@ -312,14 +320,19 @@ zponder 采用分层架构，每层职责单一，通过明确的接口通信。
 - JSON 格式正确转义特殊字符
 - 未初始化时安全返回（测试环境不崩溃）
 
-#### 3. RPC 模块 (`eth_rpc.zig`)
+#### 3. RPC 模块 (`eth_rpc.zig` + `ws_rpc.zig`)
 
-- 基于 `std.http.Client`
+- 基于 `std.http.Client`（HTTP JSON-RPC）
 - **重试机制**：指数退避（500ms × 2^attempt，上限 16s）
 - **熔断器**：连续 5 次失败 → OPEN 状态 30s
 - **半开状态**：超时后发送试探请求；成功则关闭，失败则重新熔断
 - 解析 JSON-RPC error 字段，返回 `error.RpcError`
-- 安全分配内存解析日志数组
+- 安全分配内存解析日志数组；`Log.removed` 支持订阅重组标记
+- **WSS 直播路径**（可选，`ws_rpc.zig`）：
+  - 配置：`[rpc] ws_url` / `ws_urls`（`ws://` 或 `wss://`）
+  - 历史回填仍用 HTTP `eth_getLogs`；追上 tip 后 `eth_subscribe("logs")`
+  - 断线指数退避重连 + HTTP gap bridge；未配置 `ws_url` 时 tip 仍轮询
+  - 详见 [WSS.md](WSS.md)
 
 #### 4. 数据库模块 (`db.zig`)
 
@@ -348,6 +361,7 @@ zponder 采用分层架构，每层职责单一，通过明确的接口通信。
 - **断点续传**：启动时读取 `sync_state` 表，否则回退到 `from_block`
 - **重放**：停止同步、删除范围数据、从起始区块重新同步
 - **快照**：每 `snapshot_interval` 秒创建 JSON 快照
+- **混合直播模式**：配置 `rpc.ws_url` 且追上 tip 后切换到 WSS `eth_subscribe(logs)`（每索引器一条连接）；断线 → HTTP bridge → 重订阅
 - 状态机：`running`、`stopped`、`error`、`replaying`
 
 #### 7. HTTP 服务模块 (`http_server.zig`)

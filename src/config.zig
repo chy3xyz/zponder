@@ -40,6 +40,10 @@ pub const IndexerConfig = struct {
 pub const RpcConfig = struct {
     url: []const u8,
     urls: []const []const u8 = &.{},
+    /// Optional WebSocket URL for tip-phase eth_subscribe (ws:// or wss://).
+    ws_url: ?[]const u8 = null,
+    /// Optional WS failover URLs (same style as `urls`).
+    ws_urls: []const []const u8 = &.{},
     retry_count: u32,
     retry_delay_ms: u32,
     request_timeout_ms: u32,
@@ -140,6 +144,11 @@ pub const Config = struct {
             for (self.rpc.urls) |u| alloc.free(u);
             alloc.free(self.rpc.urls);
         }
+        if (self.rpc.ws_url) |wu| alloc.free(wu);
+        if (self.rpc.ws_urls.len > 0) {
+            for (self.rpc.ws_urls) |u| alloc.free(u);
+            alloc.free(self.rpc.ws_urls);
+        }
         alloc.free(self.http.host);
         if (self.http.cors_origins.len > 0) {
             for (self.http.cors_origins) |o| alloc.free(o);
@@ -229,6 +238,10 @@ fn parseU32(s: []const u8) !u32 {
 
 fn parseU16(s: []const u8) !u16 {
     return std.fmt.parseInt(u16, stripInlineComment(s), 10);
+}
+
+fn isWsScheme(url: []const u8) bool {
+    return std.mem.startsWith(u8, url, "ws://") or std.mem.startsWith(u8, url, "wss://");
 }
 
 fn parseBool(s: []const u8) bool {
@@ -769,6 +782,15 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
                     rpc.url = try unquote(alloc, value);
                 } else if (std.mem.eql(u8, key, "urls")) {
                     rpc.urls = try parseEvents(alloc, value);
+                } else if (std.mem.eql(u8, key, "ws_url")) {
+                    if (rpc.ws_url) |wu| alloc.free(wu);
+                    rpc.ws_url = try unquote(alloc, value);
+                } else if (std.mem.eql(u8, key, "ws_urls")) {
+                    if (rpc.ws_urls.len > 0) {
+                        for (rpc.ws_urls) |u| alloc.free(u);
+                        alloc.free(rpc.ws_urls);
+                    }
+                    rpc.ws_urls = try parseEvents(alloc, value);
                 } else if (std.mem.eql(u8, key, "timeout")) {
                     rpc.request_timeout_ms = try parseU32(value);
                 } else if (std.mem.eql(u8, key, "retry_count")) {
@@ -926,6 +948,18 @@ pub fn validate(cfg: *const Config) !void {
         log.err("配置错误: rpc.url 不能为空", .{});
         errors += 1;
     }
+    if (cfg.rpc.ws_url) |wu| {
+        if (!isWsScheme(wu)) {
+            log.err("配置错误: rpc.ws_url 必须以 ws:// 或 wss:// 开头", .{});
+            errors += 1;
+        }
+    }
+    for (cfg.rpc.ws_urls) |wu| {
+        if (!isWsScheme(wu)) {
+            log.err("配置错误: rpc.ws_urls 中的 URL 必须以 ws:// 或 wss:// 开头: {s}", .{wu});
+            errors += 1;
+        }
+    }
     if (cfg.database.db_name.len == 0) {
         log.err("配置错误: database.db_name 不能为空", .{});
         errors += 1;
@@ -1047,6 +1081,7 @@ test "config parse basic" {
     try std.testing.expectEqualStrings("debug", cfg.global.log_level);
     try std.testing.expectEqual(@as(u64, 3600), cfg.global.snapshot_interval);
     try std.testing.expectEqualStrings("https://example.com", cfg.rpc.url);
+    try std.testing.expect(cfg.rpc.ws_url == null);
     try std.testing.expectEqual(@as(u32, 5000), cfg.rpc.request_timeout_ms);
     try std.testing.expectEqual(@as(u32, 5), cfg.rpc.retry_count);
     try std.testing.expectEqualStrings("test.db", cfg.database.db_name);
@@ -1087,6 +1122,45 @@ test "config parse multiple contracts" {
     try std.testing.expectEqual(@as(usize, 2), cfg.contracts.len);
     try std.testing.expectEqualStrings("a", cfg.contracts[0].name);
     try std.testing.expectEqualStrings("b", cfg.contracts[1].name);
+}
+
+test "config parse ws_url" {
+    const alloc = std.testing.allocator;
+    const toml =
+        \\[rpc]
+        \\url = "https://rpc.example.com"
+        \\ws_url = "wss://rpc.example.com/ws"
+        \\
+        \\[[contracts]]
+        \\name = "a"
+        \\address = "0x1111111111111111111111111111111111111111"
+        \\abi_path = "./a.abi"
+        \\from_block = 100
+        \\events = ["Evt"]
+    ;
+    var cfg = try loadFromString(alloc, toml);
+    defer cfg.deinit(alloc);
+    try validate(&cfg);
+    try std.testing.expectEqualStrings("wss://rpc.example.com/ws", cfg.rpc.ws_url.?);
+}
+
+test "config validate rejects invalid ws_url scheme" {
+    const alloc = std.testing.allocator;
+    const toml =
+        \\[rpc]
+        \\url = "https://rpc.example.com"
+        \\ws_url = "https://rpc.example.com/ws"
+        \\
+        \\[[contracts]]
+        \\name = "a"
+        \\address = "0x1111111111111111111111111111111111111111"
+        \\abi_path = "./a.abi"
+        \\from_block = 100
+        \\events = ["Evt"]
+    ;
+    var cfg = try loadFromString(alloc, toml);
+    defer cfg.deinit(alloc);
+    try std.testing.expectError(error.InvalidConfig, validate(&cfg));
 }
 
 test "config validate rejects empty rpc url" {

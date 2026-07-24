@@ -13,12 +13,13 @@ A production-grade EVM event indexer written in Zig 0.17.0, inspired by [Ponder]
 - **Async Webhook Queue** — Non-blocking worker queue for pushing event payloads asynchronously.
 - **Server-Sent Events (SSE)** — Real-time event streaming endpoint (`GET /api/v1/stream`).
 - **Multi-Contract & Parallel Sync** — Threaded per-contract syncing loops.
+- **WSS Live Subscribe** — Optional `ws_url` / `eth_subscribe("logs")` at tip to cut HTTP polling RPC cost ([docs/WSS.md](docs/WSS.md)).
 - **Chain Reorg Handling** — Auto-detects chain reorganizations and safely rolls back stale blocks.
 - **Auto ABI Fetch** — Downloads contract ABIs automatically from Etherscan / BscScan / PolygonScan.
 
 ### 💾 Storage & Failover
 - **Multi-Backend Storage** — SQLite (with isolated `read_db` pool in WAL mode), RocksDB, or PostgreSQL.
-- **Multi-RPC Failover** — Multi-node URL array rotation on network timeouts or rate limits.
+- **Multi-RPC Failover** — Multi-node HTTP URL array rotation; optional WSS URL failover for live subscribe.
 - **LRU Query Cache** — Thread-safe, memory-bounded cache with block-aware TTL invalidation.
 - **State Tracking** — ERC-20 token transfer state & balance tracking out-of-the-box.
 
@@ -39,7 +40,7 @@ A production-grade EVM event indexer written in Zig 0.17.0, inspired by [Ponder]
 | Storage            | SQLite / RocksDB / PostgreSQL                       |
 | HTTP / SSE Server  | `std.http.Server` + `std.Io`                        |
 | GraphQL Engine     | [zgraphql](https://github.com/chy3xyz/zgraphql) v0.3.1 |
-| RPC Client         | Multi-node failover JSON-RPC with backoff           |
+| RPC Client         | HTTP JSON-RPC failover + optional WSS `eth_subscribe` |
 | Build              | `build.zig` + `build.zig.zon`                        |
 
 ---
@@ -56,10 +57,11 @@ zponder/
 │   ├── config.zig        # TOML config parser with validation (all sections)
 │   ├── log.zig           # Structured logging (JSON/text, file+stderr)
 │   ├── eth_rpc.zig       # JSON-RPC client: multi-node failover, retry, circuit breaker
+│   ├── ws_rpc.zig        # WebSocket client: eth_subscribe(logs), ping/pong, reconnect
 │   ├── db.zig            # Database client: SQLite (isolated read pool) + RocksDB + PostgreSQL
 │   ├── rocksdb.zig       # RocksDB C bindings
 │   ├── pg.zig            # PostgreSQL C bindings (libpq)
-│   ├── indexer.zig       # Per-contract sync loop, reorg handling, generic event hooks
+│   ├── indexer.zig       # Per-contract sync loop, WSS live mode, reorg handling, event hooks
 │   ├── factory.zig       # Factory contract manager: child discovery + lifecycle
 │   ├── http_server.zig   # REST API: routing, CORS, SSE stream (/stream), metrics
 │   ├── graphql.zig       # GraphQL API: zgraphql schema, resolvers, rate limiting
@@ -107,13 +109,24 @@ zponder add-script dex_swap
 zponder add-script transfer_rule --json
 ```
 
-### 3. Verify Configuration & Environment
+### 3. Configure RPC (HTTP + optional WSS)
+
+```toml
+[rpc]
+url = "https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY"
+# Optional: after catch-up, switch tip sync to eth_subscribe(logs)
+ws_url = "wss://eth-mainnet.g.alchemy.com/v2/YOUR_KEY"
+```
+
+See [docs/WSS.md](docs/WSS.md) for hybrid indexing, failover (`ws_urls`), and ops tips.
+
+### 4. Verify Configuration & Environment
 
 ```bash
 zponder check -c config.toml
 ```
 
-### 4. Start Indexing
+### 5. Start Indexing
 
 ```bash
 zponder -c config.toml
@@ -166,9 +179,21 @@ ponder.on("PancakePair:Swap", async ({ event, context }) => {
 
 ---
 
+## Documentation
+
+| Doc | Content |
+| :--- | :--- |
+| [docs/WSS.md](docs/WSS.md) | Optional WSS `eth_subscribe` live indexing (config, reconnect, ops) |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Layered architecture (EN / 中文) |
+| [docs/API.md](docs/API.md) | REST + GraphQL + SSE API reference |
+| [docs/dev.md](docs/dev.md) | Design notes & config walkthrough |
+| [examples/](examples/) | Local Anvil demo & handler examples |
+
+---
+
 ## Testing
 
-Run full test suite (70+ unit tests):
+Run full test suite (70+ unit tests, including WS frame / Accept-key helpers):
 
 ```bash
 zig build test

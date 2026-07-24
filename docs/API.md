@@ -2,6 +2,8 @@
 
 [English](#english-api-reference) | [中文](#中文-api-参考)
 
+**Related docs:** [ARCHITECTURE.md](ARCHITECTURE.md) · [WSS.md](WSS.md) (optional WebSocket live indexing) · [dev.md](dev.md)
+
 ---
 
 <a name="english-api-reference"></a>
@@ -10,6 +12,8 @@
 Base URL: `http://localhost:8080` (configurable via `config.toml`)
 
 All responses include CORS headers (`Access-Control-Allow-Origin: *`).
+
+> Indexing transport (HTTP poll vs WSS `eth_subscribe`) is configured in `config.toml` `[rpc]` and does not change these HTTP/GraphQL query APIs. See [WSS.md](WSS.md).
 
 ---
 
@@ -524,6 +528,8 @@ HTTP status: `429 Too Many Requests`.
 基础 URL: `http://localhost:8080`（可通过 `config.toml` 配置）
 
 所有响应均包含 CORS 头（`Access-Control-Allow-Origin: *`）。
+
+> 索引传输方式（HTTP 轮询 vs WSS `eth_subscribe`）由 `config.toml` 的 `[rpc]` 段配置，不改变本文 REST/GraphQL 查询接口。详见 [WSS.md](WSS.md)。
 
 ---
 

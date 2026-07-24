@@ -10,6 +10,8 @@ track_blocks = true
 
 [rpc]
 url = "http://localhost:8545"
+# Anvil 同端口提供 WebSocket；取消下一行注释可启用 tip 阶段 eth_subscribe
+# ws_url = "ws://localhost:8545"
 timeout = 10000
 retry_count = 3
 

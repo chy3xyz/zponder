@@ -26,7 +26,9 @@ bash examples/local-demo/run.sh
 - `run.sh` — automated demo script
 - `DemoToken.sol` — minimal ERC20 contract
 - `DemoToken.abi` — compiled ABI
-- `config.toml` — zponder configuration
+- `config.toml` — zponder configuration (optional `ws_url = "ws://localhost:8545"` for WSS tip sync)
+
+**Related docs:** [docs/WSS.md](../docs/WSS.md) — hybrid HTTP catch-up + WSS `eth_subscribe`
 
 ---
 

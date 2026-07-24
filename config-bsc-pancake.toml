@@ -15,6 +15,8 @@ etherscan_api_key = ""  # 填你的 BscScan API Key（可选，留空则手动�
 
 [rpc]
 url = "https://bsc-dataseed.binance.org"
+# Optional WSS tip subscribe (professional RPC recommended): see docs/WSS.md
+# ws_url = "wss://your-bsc-endpoint/ws"
 timeout = 10000
 retry_count = 3
 

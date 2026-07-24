@@ -35,7 +35,7 @@ Zig 静态编译无依赖，Docker 简化部署、环境一致性，支持集群
 二、需求分析
 2.1 功能需求
 2.1.1 核心功能（对标 Ponder）
-- 区块监听：从指定区块高度开始，自动同步链上区块，支持批量拉取、实时追块
+- 区块监听：从指定区块高度开始，自动同步链上区块，支持批量拉取、实时追块；可选 WSS `eth_subscribe` 降低 tip 轮询成本
 - 事件解析：支持 ABI 自动解析，监听指定合约的目标事件（如 ERC20 Transfer、ERC721 Transfer）
 - 数据持久化：将解析后的事件数据、账户状态（如余额）存储到数据库，支持事务、幂等性
 - 查询服务：提供 HTTP API 接口，支持查询账户余额、事件历史、区块同步状态等
@@ -256,9 +256,10 @@ zig-eth-indexer/
 │   ├── main.zig          # 入口文件，启动索引器、协调各模块
 │   ├── config.zig        # 配置管理模块
 │   ├── log.zig           # 日志模块
-│   ├── eth_rpc.zig       # 以太坊 RPC 模块（基于 eth.zig）
+│   ├── eth_rpc.zig       # 以太坊 HTTP JSON-RPC 模块
+│   ├── ws_rpc.zig        # WSS eth_subscribe 直播索引（可选）
 │   ├── db.zig            # 数据库模块（PostgreSQL/SQLite）
-│   ├── indexer.zig       # 核心索引模块
+│   ├── indexer.zig       # 核心索引模块（含 WSS tip 模式）
 │   ├── http_server.zig   # HTTP 服务模块
 │   ├── abi.zig           # ABI 解析辅助模块
 │   └── utils.zig         # 工具函数（地址转换、大数字处理等）
@@ -275,6 +276,9 @@ snapshot_interval = 3600    # 快照周期（秒），0 表示不开启
 # RPC 配置
 [rpc]
 url = "https://eth-mainnet.g.alchemy.com/v2/your-api-key"
+# 可选：追上 tip 后切换到 eth_subscribe(logs)，降低轮询成本
+# ws_url = "wss://eth-mainnet.g.alchemy.com/v2/your-api-key"
+# ws_urls = ["wss://primary/ws", "wss://backup/ws"]
 timeout = 10000             # 超时时间（毫秒）
 retry_count = 3             # 重试次数
 
@@ -306,6 +310,14 @@ address = "0xBC4CA0EdA7647A8aB7C2061c2E118A18a936f13D"  # BAYC 合约地址
 abi_path = "./abis/erc721.abi"
 from_block = 12965000
 events = ["Transfer"]
+
+4.2.1 WSS 订阅索引（降低 tip 轮询成本）
+
+历史回填仍走 HTTP `eth_getLogs`；配置 `ws_url` 后，追上 tip 自动切换到
+`eth_subscribe("logs")`。未配置则保持 `eth_blockNumber` 轮询。
+
+完整说明、故障转移、Anvil 手测与运维建议见：**docs/WSS.md**。
+
 4.3 核心模块代码
 4.3.1 入口文件（main.zig）
 const std = @import("std");

@@ -9,6 +9,7 @@ pub const log = @import("log.zig");
 pub const utils = @import("utils.zig");
 pub const abi = @import("abi.zig");
 pub const eth_rpc = @import("eth_rpc.zig");
+pub const ws_rpc = @import("ws_rpc.zig");
 pub const db = @import("db.zig");
 pub const indexer = @import("indexer.zig");
 pub const http_server = @import("http_server.zig");
@@ -29,6 +30,7 @@ test {
     _ = utils;
     _ = abi;
     _ = eth_rpc;
+    _ = ws_rpc;
     _ = db;
     _ = indexer;
     _ = http_server;

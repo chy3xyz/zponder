@@ -208,3 +208,4 @@
 24. ~~**L11** — version 硬编码~~ ✅
 25. **L7** — 增加集成测试（启动服务器 + HTTP 请求）
 26. **M10** — 完善 ABI 解码，支持动态类型
+27. ~~**WSS tip 订阅** — HTTP 追历史 + tip `eth_subscribe(logs)` 降轮询成本~~ ✅（见 [WSS.md](WSS.md)）

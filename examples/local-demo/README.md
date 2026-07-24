@@ -39,6 +39,19 @@ The script:
 6. Indexes all Transfer events (blocks 0–4)
 7. Prints REST API + GraphQL API query results
 
+## Optional: WSS live subscribe
+
+Anvil exposes WebSocket on the same port as HTTP. To exercise tip-phase
+`eth_subscribe("logs")` instead of polling, uncomment in `config.toml`:
+
+```toml
+[rpc]
+url = "http://localhost:8545"
+ws_url = "ws://localhost:8545"
+```
+
+See [docs/WSS.md](../../docs/WSS.md) for behavior, reconnect, and cost notes.
+
 ## Files
 
 | File | Purpose |
