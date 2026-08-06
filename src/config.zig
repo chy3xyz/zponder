@@ -389,6 +389,8 @@ pub fn load(alloc: std.mem.Allocator, io: std.Io, config_path: []const u8) !Conf
     const content = try std.Io.Dir.cwd().readFileAlloc(io, config_path, alloc, .limited(1024 * 1024));
     defer alloc.free(content);
     var cfg = try loadFromString(alloc, content);
+    // validate 失败时释放已解析的 cfg（此前 InvalidConfig 路径泄漏所有字段）
+    errdefer cfg.deinit(alloc);
     try validate(&cfg);
     return cfg;
 }
@@ -1343,4 +1345,36 @@ test "config validate rejects non-select query" {
     var cfg = try loadFromString(alloc, toml);
     defer cfg.deinit(alloc);
     try std.testing.expectError(error.InvalidConfig, validate(&cfg));
+}
+
+test "config: 无效配置 load 失败路径无泄漏" {
+    // 回归测试：此前 load() 在 validate 失败时泄漏已解析的全部 cfg 字段
+    // （SafeAllocator 在 `zponder start -c bad` 时报告泄漏）。
+    const alloc = std.testing.allocator;
+    const IoBackend = if (@import("builtin").os.tag == .linux) std.Io.Uring else std.Io.Threaded;
+    var backend = IoBackend.init(alloc, .{});
+    defer backend.deinit();
+    const io = backend.io();
+
+    const path = "/tmp/zp_invalid_config.toml";
+    const bad =
+        \\[global]
+        \\log_level = "info"
+        \\
+        \\[rpc]
+        \\url = "http://127.0.0.1:1"
+        \\
+        \\[database]
+        \\type = "sqlite"
+        \\db_name = "/tmp/zp_x.db"
+        \\
+        \\[http]
+        \\port = 18080
+        \\host = "127.0.0.1"
+    ;
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bad });
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    // 无合约 → validate 失败；若 errdefer 缺失，testing allocator 在此报泄漏
+    try std.testing.expectError(error.InvalidConfig, load(alloc, io, path));
 }
