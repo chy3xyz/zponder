@@ -39,7 +39,7 @@ A production-grade EVM event indexer written in Zig 0.17.0, inspired by [Ponder]
 | Script Engine      | Native Embedded QuickJS (C Runtime)                 |
 | Storage            | SQLite / RocksDB / PostgreSQL                       |
 | HTTP / SSE Server  | `std.http.Server` + `std.Io`                        |
-| GraphQL Engine     | [zgraphql](https://github.com/chy3xyz/zgraphql) v0.3.1 |
+| GraphQL Engine     | [zgraphql](https://github.com/chy3xyz/zgraphql) v0.4.0 |
 | RPC Client         | HTTP JSON-RPC failover + optional WSS `eth_subscribe` |
 | Build              | `build.zig` + `build.zig.zon`                        |
 

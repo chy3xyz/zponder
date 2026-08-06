@@ -453,3 +453,96 @@ fn extractReturnType(method: []const u8) []const u8 {
     // Default to "uint256" for numeric methods, "bytes32" otherwise.
     return "uint256";
 }
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "graphql: 纯函数校验逻辑" {
+    // isValidTableName — 仅允许字母数字与下划线
+    try std.testing.expect(isValidTableName("usdc_transfer"));
+    try std.testing.expect(isValidTableName("a"));
+    try std.testing.expect(!isValidTableName(""));
+    try std.testing.expect(!isValidTableName("usdc;drop"));
+    try std.testing.expect(!isValidTableName("usdc-table"));
+    try std.testing.expect(!isValidTableName("usdc transfer"));
+
+    // isValidMethodSignature — 仅允许字母数字、下划线、括号与逗号
+    try std.testing.expect(isValidMethodSignature("balanceOf(address)"));
+    try std.testing.expect(isValidMethodSignature("transfer(address,uint256)"));
+    try std.testing.expect(!isValidMethodSignature(""));
+    try std.testing.expect(!isValidMethodSignature("balanceOf(address); DROP TABLE x"));
+    try std.testing.expect(!isValidMethodSignature("balanceOf(address) OR 1=1"));
+
+    // extractReturnType — 目前简化为固定返回 uint256
+    try std.testing.expect(std.mem.eql(u8, extractReturnType("balanceOf(address)"), "uint256"));
+}
+
+test "graphql: schema 构建与 resolver 挂载" {
+    const alloc = std.testing.allocator;
+    var schema_def = try Builder.init(alloc);
+    defer schema_def.deinit();
+
+    attachResolvers(&schema_def);
+
+    const query_fields = schema_def.query_type.kind.object.fields;
+    const query_names = [_][]const u8{ "health", "version", "contracts", "contract", "syncStates", "latestEvents", "contractCall" };
+    for (query_names) |name| {
+        const field = query_fields.get(name) orelse return error.GraphQLQueryFieldMissing;
+        // 每个 Query 字段都必须挂载 resolver，否则运行时返回 "Cannot return null"
+        try std.testing.expect(field.resolve != null);
+    }
+}
+
+test "graphql: 端到端执行（zgraphql v0.4.0）" {
+    const alloc = std.testing.allocator;
+
+    var schema_def = try Builder.init(alloc);
+    defer schema_def.deinit();
+    attachResolvers(&schema_def);
+
+    const IoBackend = if (@import("builtin").os.tag == .linux) std.Io.Uring else std.Io.Threaded;
+    var backend = IoBackend.init(alloc, .{});
+    defer backend.deinit();
+    const io = backend.io();
+
+    // 1) 正常查询：health + version resolver 真实执行（解析→验证→执行→JSON）
+    {
+        var parser = try zg.Parser.init(alloc, "{ health version }");
+        defer parser.deinit();
+        var doc = try parser.parseDocument();
+        defer doc.deinit();
+
+        var validator = zg.Validator.init(alloc, &schema_def);
+        defer validator.deinit();
+        // 注意：ValidationResult 为浅拷贝，借用 validator 内部状态，
+        // 必须在 validator.deinit() 之前消费（此处仅立即读取 isValid）。
+        const vresult = try validator.validate(&doc);
+        try std.testing.expect(vresult.isValid());
+
+        var executor = zg.Executor.init(alloc, &schema_def, io);
+        defer executor.deinit();
+        var result = try executor.execute(&doc);
+        defer result.deinit();
+
+        const json_str = try result.toJson();
+        defer alloc.free(json_str);
+        try std.testing.expect(std.mem.indexOf(u8, json_str, "\"health\":\"ok\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, json_str, "\"version\"") != null);
+    }
+
+    // 2) 验证错误：未知字段被 validator 拒绝（0.4.0 验证路径）
+    {
+        var parser = try zg.Parser.init(alloc, "{ unknownField }");
+        defer parser.deinit();
+        var doc = try parser.parseDocument();
+        defer doc.deinit();
+
+        var validator = zg.Validator.init(alloc, &schema_def);
+        defer validator.deinit();
+        // 注意：ValidationResult 为浅拷贝，借用 validator 内部状态，
+        // 必须在 validator.deinit() 之前消费（此处仅立即读取 isValid）。
+        const vresult = try validator.validate(&doc);
+        try std.testing.expect(!vresult.isValid());
+    }
+}

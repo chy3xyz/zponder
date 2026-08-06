@@ -34,6 +34,14 @@ test {
     _ = db;
     _ = indexer;
     _ = http_server;
+    _ = cache;
+    _ = rocksdb;
+    _ = pg;
+    _ = etherscan;
+    _ = template;
+    _ = dashboard;
+    _ = graphql;
+    _ = factory;
     _ = webhook;
     _ = script_engine;
     _ = js_engine;

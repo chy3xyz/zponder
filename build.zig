@@ -81,6 +81,7 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .imports = &.{
+            .{ .name = "build_options", .module = options.createModule() },
             .{ .name = "zgraphql", .module = zgraphql_mod },
             .{ .name = "c", .module = c_mod },
         },

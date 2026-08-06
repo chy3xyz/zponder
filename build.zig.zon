@@ -1,11 +1,12 @@
 .{
     .name = .zponder,
-    .version = "0.6.0",
+    .version = "0.6.1",
     .fingerprint = 0xf792d1784b9db5e6,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .zgraphql = .{
-            .path = "../zgraphql",
+            .url = "https://github.com/chy3xyz/zgraphql/archive/refs/tags/v0.4.0.tar.gz",
+            .hash = "zgraphql-0.4.0-bxNFFtHBCABLOGCQGpR1etZN4QrUtMlcq2mN8KAk-t6G",
         },
     },
     .paths = .{
@@ -14,5 +15,6 @@
         "src",
         "config.toml",
         "README.md",
+        "CHANGELOG.md",
     },
 }
