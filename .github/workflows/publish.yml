@@ -5,6 +5,11 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+env:
+  # 与 src/ 使用的 Zig 版本保持一致；官方稳定版尚无 0.17.0，
+  # 从 ziglang.org/builds 下载 master/dev 构建（命名 zig-<triplet>-<version>）。
+  ZIG_VERSION: "0.17.0-dev.1567+f0354179a"
+
 jobs:
   build:
     name: build-${{ matrix.platform }}
@@ -23,10 +28,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # mlugg/setup-zig 曾因 mirror 404/503 导致 "Unable to locate executable file: zig"
+      # （v0.6.0 / v0.4.0 发布失败根因），改为从 ziglang.org/builds 直接下载。
       - name: Setup Zig
-        uses: mlugg/setup-zig@v1
-        with:
-          version: 0.17.0
+        run: |
+          case "${{ matrix.platform }}" in
+            darwin-arm64) TRIPLET="zig-aarch64-macos" ;;
+            darwin-x64)   TRIPLET="zig-x86_64-macos" ;;
+            linux-x64)    TRIPLET="zig-x86_64-linux" ;;
+          esac
+          URL="https://ziglang.org/builds/${TRIPLET}-${ZIG_VERSION}.tar.xz"
+          curl -fsSL "$URL" -o zig.tar.xz
+          tar -xJf zig.tar.xz
+          echo "$GITHUB_WORKSPACE/${TRIPLET}-${ZIG_VERSION}" >> "$GITHUB_PATH"
+          zig version
 
       - name: Install deps (macOS)
         if: runner.os == 'macOS'
