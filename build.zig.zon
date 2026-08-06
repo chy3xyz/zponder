@@ -16,5 +16,6 @@
         "config.toml",
         "README.md",
         "CHANGELOG.md",
+        "LICENSE",
     },
 }
