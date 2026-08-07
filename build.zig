@@ -48,6 +48,8 @@ pub fn build(b: *std.Build) void {
         "/usr/local/opt/rocksdb/include",
     } else &.{
         "/usr/include",
+        // Debian/Ubuntu 的 libpq 头文件位于 /usr/include/postgresql/
+        "/usr/include/postgresql",
     };
     // Use only the detected homebrew prefix for lib paths (Zig 0.17 rejects missing dirs).
     const lib_paths: []const []const u8 = if (is_macos and is_arm64) &.{
