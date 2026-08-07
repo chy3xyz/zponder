@@ -30,6 +30,7 @@ jobs:
 
       # mlugg/setup-zig 曾因 mirror 404/503 导致 "Unable to locate executable file: zig"
       # （v0.6.0 / v0.4.0 发布失败根因），改为从 ziglang.org/builds 直接下载。
+      # 注意：$GITHUB_PATH 只对后续步骤生效，当前步骤内须用绝对路径验证。
       - name: Setup Zig
         run: |
           case "${{ matrix.platform }}" in
@@ -40,8 +41,9 @@ jobs:
           URL="https://ziglang.org/builds/${TRIPLET}-${ZIG_VERSION}.tar.xz"
           curl -fsSL "$URL" -o zig.tar.xz
           tar -xJf zig.tar.xz
-          echo "$GITHUB_WORKSPACE/${TRIPLET}-${ZIG_VERSION}" >> "$GITHUB_PATH"
-          zig version
+          ZIG_DIR="$GITHUB_WORKSPACE/${TRIPLET}-${ZIG_VERSION}"
+          echo "$ZIG_DIR" >> "$GITHUB_PATH"
+          "$ZIG_DIR/zig" version
 
       - name: Install deps (macOS)
         if: runner.os == 'macOS'
