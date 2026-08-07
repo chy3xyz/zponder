@@ -1351,8 +1351,7 @@ test "config: 无效配置 load 失败路径无泄漏" {
     // 回归测试：此前 load() 在 validate 失败时泄漏已解析的全部 cfg 字段
     // （SafeAllocator 在 `zponder start -c bad` 时报告泄漏）。
     const alloc = std.testing.allocator;
-    const IoBackend = if (@import("builtin").os.tag == .linux) std.Io.Uring else std.Io.Threaded;
-    var backend = IoBackend.init(alloc, .{});
+    var backend = std.Io.Threaded.init(alloc, .{});
     defer backend.deinit();
     const io = backend.io();
 

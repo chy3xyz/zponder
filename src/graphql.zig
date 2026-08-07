@@ -133,8 +133,8 @@ pub fn start(alloc: std.mem.Allocator, cfg: *const config.GraphQLConfig, ctx: Co
                 self.allocator.destroy(self);
             }
 
-            const IoBackend = if (@import("builtin").os.tag == .linux) std.Io.Uring else std.Io.Threaded;
-            var backend = IoBackend.init(self.allocator, .{});
+            // 统一使用 Threaded backend（跨平台）；std.Io.Uring 在 0.17-dev 无静态构造器
+            var backend = std.Io.Threaded.init(self.allocator, .{});
             defer backend.deinit();
             const backend_io = backend.io();
 
@@ -501,8 +501,7 @@ test "graphql: 端到端执行（zgraphql v0.4.0）" {
     defer schema_def.deinit();
     attachResolvers(&schema_def);
 
-    const IoBackend = if (@import("builtin").os.tag == .linux) std.Io.Uring else std.Io.Threaded;
-    var backend = IoBackend.init(alloc, .{});
+    var backend = std.Io.Threaded.init(alloc, .{});
     defer backend.deinit();
     const io = backend.io();
 
