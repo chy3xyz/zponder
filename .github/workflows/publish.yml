@@ -51,7 +51,11 @@ jobs:
 
       - name: Install deps (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq libsqlite3-dev librocksdb-dev libpq-dev
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libsqlite3-dev librocksdb-dev libpq-dev
+          # 确保 PostgreSQL 头文件存在（此前 apt 曾跳过 libpq-dev 导致构建失败）
+          test -f /usr/include/libpq-fe.h && echo "libpq-fe.h OK" || sudo apt-get install -y libpq-dev
 
       - name: Build
         run: zig build -Doptimize=ReleaseFast
