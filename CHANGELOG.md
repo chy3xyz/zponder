@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.2] - 2026-08-08
+
+### Fixed
+- **WSS 多合约并发崩溃（segfault / abort）**：`std.http.Client` 非线程安全，
+  多个索引器线程并发调用 `eth_rpc.Client.rpcCall` 造成数据竞争（TLS 初始化
+  失败、崩溃）。RPC 请求现通过 `std.Io.Mutex` 串行化。
+- **`zponder check` 退出 Bus error**：`config.toml` 的 `cors = true` 把字符串
+  字面量 `"*"` 存入 `cors_origins`，`deinit` 时释放静态内存。现改为 dup 内容；
+  并修复 `cmdCheck` 未释放 RPC 客户端（TLS 连接泄漏）。
+- **SQLite 并发写偶发 ExecFailed**：初始化未设置 `PRAGMA busy_timeout`
+  （默认 0，锁竞争时立即失败）。现从配置设置（默认 5000ms）。
+
+### Changed
+- `zponder check` 成功路径现在可干净退出（此前 Bus error，退出码非 0）。
+
 ## [0.6.1] - 2026-08-07
 
 ### Changed
