@@ -75,6 +75,13 @@ pub const Client = struct {
         try checkPragma(db, "PRAGMA foreign_keys = ON;");
         try checkPragma(db, "PRAGMA journal_mode = WAL;");
         try checkPragma(db, "PRAGMA synchronous = NORMAL;");
+        // 多索引器线程并发写时的锁等待（默认 0 会立刻失败丢写入）
+        const busy_ms = config.busy_timeout_ms;
+        var busy_pragma_buf: [64]u8 = undefined;
+        const written = try std.fmt.bufPrint(&busy_pragma_buf, "PRAGMA busy_timeout = {d};", .{busy_ms});
+        // sqlite3_exec 需要 C 字符串（null 结尾），bufPrint 不保证
+        busy_pragma_buf[written.len] = 0;
+        try checkPragma(db, busy_pragma_buf[0..written.len]);
 
         var read_db: ?*c.sqlite3 = null;
         if (!std.mem.eql(u8, path, ":memory:")) {

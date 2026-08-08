@@ -39,6 +39,10 @@ pub const Client = struct {
     io: std.Io,
     config: *const RpcConfig,
     http_client: std.http.Client,
+    // std.http.Client 非线程安全：多个索引器线程并发 fetch 同一实例会
+    // 数据竞争（TlsInitializationFailed / segfault / abort，4 合约 + WSS 复现）。
+    // 用互斥锁串行化 RPC 请求（RPC 本身是网络瓶颈，串行对吞吐影响有限）。
+    http_mutex: std.Io.Mutex = .init,
     next_id: std.atomic.Value(u64),
     url_index: std.atomic.Value(usize),
     // 并发限制
@@ -284,6 +288,10 @@ pub const Client = struct {
     fn rpcCall(self: *Client, method: []const u8, params: []const u8) ![]u8 {
         self.acquireSlot();
         defer self.releaseSlot();
+
+        // 串行化 http_client 访问（非线程安全，见 http_mutex 注释）
+        self.http_mutex.lockUncancelable(self.io);
+        defer self.http_mutex.unlock(self.io);
 
         const id = self.next_id.fetchAdd(1, .monotonic);
 

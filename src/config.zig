@@ -830,7 +830,10 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
                             for (http.cors_origins) |o| alloc.free(o);
                             alloc.free(http.cors_origins);
                         }
-                        http.cors_origins = try alloc.dupe([]const u8, &[_][]const u8{"*"});
+                        // 必须 dupe 内容：deinit 会对每个元素 alloc.free，
+                        // 若直接放字面量 "*" 会 free 静态内存 → Bus error
+                        const star = try alloc.dupe(u8, "*");
+                        http.cors_origins = try alloc.dupe([]const u8, &[_][]const u8{star});
                     }
                 } else if (std.mem.eql(u8, key, "cors_origins")) {
                     if (http.cors_origins.len > 0) {
@@ -1376,4 +1379,20 @@ test "config: 无效配置 load 失败路径无泄漏" {
 
     // 无合约 → validate 失败；若 errdefer 缺失，testing allocator 在此报泄漏
     try std.testing.expectError(error.InvalidConfig, load(alloc, io, path));
+}
+
+test "config: cors=true 的 cfg deinit 不崩溃（回归：释放静态字面量）" {
+    // 修复前：cors=true 把字面量 "*" 放入 cors_origins，
+    // deinit 时 alloc.free("*") 释放静态内存 → Bus error（check/start 退出时崩溃）
+    const alloc = std.testing.allocator;
+    const toml =
+        \\[http]
+        \\cors = true
+        \\
+        \\[rpc]
+        \\url = "https://example.com"
+    ;
+    var cfg = try loadFromString(alloc, toml);
+    defer cfg.deinit(alloc);
+    try std.testing.expectEqualStrings("*", cfg.http.cors_origins[0]);
 }

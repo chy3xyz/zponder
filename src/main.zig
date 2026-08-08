@@ -313,6 +313,7 @@ fn cmdCheck(alloc: std.mem.Allocator, io: std.Io, config_path: []const u8) !void
     log.info("✓ [1/4] 配置文件格式校验通过: {s}", .{config_path});
 
     var rpc = eth_rpc.Client.init(alloc, io, &cfg.rpc);
+    defer rpc.deinit();
     const block_num = rpc.getBlockNumber() catch |err| {
         log.err("✗ [2/4] RPC 节点连接失败 ({s}): {any}", .{ cfg.rpc.url, err });
         return;
