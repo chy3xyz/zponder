@@ -10,16 +10,29 @@ pub const Event = struct {
 
     pub fn clone(alloc: std.mem.Allocator, contract_name: []const u8, event_name: []const u8, fields: []const db.DecodedField, block_number: u64) !Event {
         const fields_copy = try alloc.alloc(db.DecodedField, fields.len);
-        errdefer alloc.free(fields_copy);
+        var filled: usize = 0;
+        errdefer {
+            // OOM 时释放已 dupe 的前序字段（否则泄漏）
+            for (fields_copy[0..filled]) |f| {
+                alloc.free(f.name);
+                alloc.free(f.value);
+            }
+            alloc.free(fields_copy);
+        }
         for (fields, 0..) |f, i| {
             fields_copy[i] = .{
                 .name = try alloc.dupe(u8, f.name),
                 .value = try alloc.dupe(u8, f.value),
             };
+            filled = i + 1;
         }
+        const cn = try alloc.dupe(u8, contract_name);
+        errdefer alloc.free(cn);
+        const en = try alloc.dupe(u8, event_name);
+        errdefer alloc.free(en);
         return .{
-            .contract_name = try alloc.dupe(u8, contract_name),
-            .event_name = try alloc.dupe(u8, event_name),
+            .contract_name = cn,
+            .event_name = en,
             .block_number = block_number,
             .fields = fields_copy,
         };

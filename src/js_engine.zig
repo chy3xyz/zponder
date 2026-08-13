@@ -3,9 +3,12 @@ const c = @import("c");
 const log = @import("log.zig");
 const db = @import("db.zig");
 
-/// JS undefined 值（c.JS_UNDEFINED 宏在 Zig 0.17 的 zeroInit 有兼容问题，改用 JS_NewInt32）
+/// JS undefined 值（立即数，无堆分配）。
+/// 注意：c.JS_UNDEFINED 宏在 Zig 0.17 的 zeroInit 有兼容问题，手动构造；
+/// 不能用 JS_NewInt32(0)，那会返回 int 0 而非 undefined，破坏 === undefined 判断。
 fn jsUndefined(ctx: ?*c.JSContext) c.JSValue {
-    return c.JS_NewInt32(ctx, 0);
+    _ = ctx;
+    return .{ .u = .{ .int32 = 0 }, .tag = @as(i64, c.JS_TAG_UNDEFINED) };
 }
 
 /// ponder.http 路由（Hono-like 最小实现）
