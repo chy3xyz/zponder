@@ -238,6 +238,7 @@ pub fn main(init: std.process.Init) !void {
 
     const CombinedHook = struct {
         script_eng: *script_engine.ScriptEngine,
+        js_eng: *js_engine.JsEngine,
         bus: *eb.EventBus,
 
         fn callback(
@@ -250,12 +251,14 @@ pub fn main(init: std.process.Init) !void {
             if (ctx_ptr) |ptr| {
                 const self_ptr: *@This() = @ptrCast(@alignCast(ptr));
                 self_ptr.script_eng.processEvent(contract_name, event_name, fields, block_number);
+                self_ptr.js_eng.handleEvent(contract_name, event_name, fields, block_number);
                 self_ptr.bus.publish(contract_name, event_name, fields, block_number);
             }
         }
     };
     var combined_hook: CombinedHook = .{
         .script_eng = &script_eng,
+        .js_eng = js_eng,
         .bus = &event_bus,
     };
     for (indexers.items) |*idx| {
