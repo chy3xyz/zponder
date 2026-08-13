@@ -13,6 +13,7 @@ const etherscan = @import("etherscan.zig");
 const abi = @import("abi.zig");
 const script_engine = @import("script_engine.zig");
 const js_engine = @import("js_engine.zig");
+const eb = @import("event_bus.zig");
 
 var g_running = std.atomic.Value(bool).init(true);
 
@@ -226,6 +227,10 @@ pub fn main(init: std.process.Init) !void {
     var js_eng = try js_engine.JsEngine.init(alloc, init.io);
     defer js_eng.deinit();
 
+    // 实时事件总线：indexer 解码事件 → SSE 订阅者
+    var event_bus = eb.EventBus.init(alloc);
+    defer event_bus.deinit();
+
     script_eng.loadDirectory("./handlers") catch {};
     script_eng.loadDirectory("./examples/handlers") catch {};
     js_eng.loadDirectory("./handlers") catch {};
@@ -233,6 +238,7 @@ pub fn main(init: std.process.Init) !void {
 
     const CombinedHook = struct {
         script_eng: *script_engine.ScriptEngine,
+        bus: *eb.EventBus,
 
         fn callback(
             ctx_ptr: ?*anyopaque,
@@ -244,11 +250,13 @@ pub fn main(init: std.process.Init) !void {
             if (ctx_ptr) |ptr| {
                 const self_ptr: *@This() = @ptrCast(@alignCast(ptr));
                 self_ptr.script_eng.processEvent(contract_name, event_name, fields, block_number);
+                self_ptr.bus.publish(contract_name, event_name, fields, block_number);
             }
         }
     };
     var combined_hook: CombinedHook = .{
         .script_eng = &script_eng,
+        .bus = &event_bus,
     };
     for (indexers.items) |*idx| {
         idx.setEventCallback(&combined_hook, CombinedHook.callback);
@@ -257,7 +265,7 @@ pub fn main(init: std.process.Init) !void {
     // 8. 启动
     for (indexers.items) |*idx| try idx.start();
 
-    var server = http_server.Server.init(alloc, init.io, &cfg.http, &database, &query_cache, indexer_ptrs.items, cfg.queries, cfg.dashboards);
+    var server = http_server.Server.init(alloc, init.io, &cfg.http, &database, &query_cache, indexer_ptrs.items, cfg.queries, cfg.dashboards, &event_bus);
     defer server.deinit();
     try server.start();
 

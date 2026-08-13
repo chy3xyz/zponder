@@ -7,6 +7,7 @@ const log = @import("log.zig");
 const utils = @import("utils.zig");
 const template = @import("template.zig");
 const dashboard = @import("dashboard.zig");
+const eb = @import("event_bus.zig");
 
 const build_options = @import("build_options");
 
@@ -73,6 +74,7 @@ pub const Server = struct {
     indexers: []*indexer.Indexer,
     queries: []const config.QueryConfig,
     dashboards: []const config.DashboardConfig,
+    event_bus: *eb.EventBus,
     listen_socket: ?std.Io.net.Server,
     thread: ?std.Thread,
     running: std.atomic.Value(bool),
@@ -88,6 +90,7 @@ pub const Server = struct {
         indexers: []*indexer.Indexer,
         queries: []const config.QueryConfig,
         dashboards: []const config.DashboardConfig,
+        bus: *eb.EventBus,
     ) Server {
         const rps = @as(f64, @floatFromInt(cfg.rate_limit_rps orelse 0));
         const burst = @as(f64, @floatFromInt(cfg.rate_limit_burst orelse 0));
@@ -100,6 +103,7 @@ pub const Server = struct {
             .indexers = indexers,
             .queries = queries,
             .dashboards = dashboards,
+            .event_bus = bus,
             .listen_socket = null,
             .thread = null,
             .running = std.atomic.Value(bool).init(false),
@@ -856,18 +860,49 @@ pub const Server = struct {
 
     fn handleStream(self: *Server, request: *std.http.Server.Request) !void {
         const origin = self.corsOrigin(request);
-        try request.respond(
-            "retry: 3000\n\nevent: connected\ndata: {\"status\":\"connected\",\"service\":\"zponder SSE real-time stream\"}\n\n",
-            .{
+
+        var stream_buf: [4096]u8 = undefined;
+        var bw = try request.respondStreaming(&stream_buf, .{
+            .respond_options = .{
                 .status = .ok,
                 .extra_headers = &.{
                     .{ .name = "Content-Type", .value = "text/event-stream" },
                     .{ .name = "Cache-Control", .value = "no-cache" },
-                    .{ .name = "Connection", .value = "keep-alive" },
                     .{ .name = "Access-Control-Allow-Origin", .value = origin },
                 },
             },
-        );
+        });
+
+        // connected 握手消息
+        bw.writer.writeAll("retry: 3000\n\nevent: connected\ndata: {\"status\":\"connected\",\"service\":\"zponder SSE real-time stream\"}\n\n") catch {};
+        bw.writer.flush() catch {};
+        bw.flush() catch {};
+
+        // 订阅事件总线
+        const sub = try self.event_bus.subscribe();
+        defer {
+            self.event_bus.unsubscribe(sub);
+            sub.deinit();
+        }
+
+        // 循环推送事件；客户端断开时 writeAll/flush 报错退出
+        while (true) {
+            var ev = sub.next(self.io) orelse break;
+            defer ev.deinit(self.alloc);
+
+            var out: std.Io.Writer.Allocating = .init(self.alloc);
+            defer out.deinit();
+            out.writer.print("event: {s}\ndata: {{\"contract\":\"{s}\",\"block_number\":{d},\"fields\":{{", .{ ev.event_name, ev.contract_name, ev.block_number }) catch continue;
+            for (ev.fields, 0..) |f, i| {
+                if (i > 0) out.writer.writeByte(',') catch break;
+                out.writer.print("\"{s}\":\"{s}\"", .{ f.name, f.value }) catch break;
+            }
+            out.writer.writeAll("}}}\n\n") catch continue;
+
+            bw.writer.writeAll(out.written()) catch break;
+            bw.writer.flush() catch break;
+            bw.flush() catch break;
+        }
     }
 
     // ========================================================================
