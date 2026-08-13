@@ -289,8 +289,20 @@ pub const Client = struct {
         self.acquireSlot();
         defer self.releaseSlot();
 
-        // 串行化 http_client 访问（非线程安全，见 http_mutex 注释）
-        self.http_mutex.lockUncancelable(self.io);
+        // 串行化 http_client 访问（非线程安全，见 http_mutex 注释）。
+        // 用有界等待：std.Io.Mutex.lockUncancelable 在高争用下 futex 唤醒可能
+        // 丢失导致线程永久卡住（4 合约并发复现）；tryLock + 让出 + 超时返回
+        // RpcBusy，由上层 rpcCallWithRetry 重试，避免索引器静默卡死。
+        var acquired = false;
+        var attempts: u32 = 0;
+        while (attempts < 1000) : (attempts += 1) {
+            if (self.http_mutex.tryLock()) {
+                acquired = true;
+                break;
+            }
+            std.Io.sleep(self.io, std.Io.Duration.fromMilliseconds(5), .real) catch {};
+        }
+        if (!acquired) return error.RpcBusy;
         defer self.http_mutex.unlock(self.io);
 
         const id = self.next_id.fetchAdd(1, .monotonic);
@@ -315,6 +327,10 @@ pub const Client = struct {
             .location = .{ .url = target_url },
             .method = .POST,
             .payload = req_buf.items,
+            // Zig 0.17-dev 的 std.http.Client 无读超时；复用池内陈旧连接
+            // 会导致读永久挂起（4 合约并发时偶发 c3 卡死）。禁用 keep_alive
+            // 每次新建连接，避免陈旧连接。完整超时需 std 层支持。
+            .keep_alive = false,
             .extra_headers = &.{
                 .{ .name = "Content-Type", .value = "application/json" },
             },

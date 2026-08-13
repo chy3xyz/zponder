@@ -40,10 +40,15 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(alloc);
     defer alloc.free(args);
     var config_path: []const u8 = "./config.toml";
+    var dev_mode = false;
 
     var arg_idx: usize = 1;
     while (arg_idx < args.len) : (arg_idx += 1) {
         const arg = args[arg_idx];
+        if (std.mem.eql(u8, arg, "dev")) {
+            dev_mode = true;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "version") or std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--version")) {
             const ver_msg = try std.fmt.allocPrint(alloc,
                 \\zponder v{s} (commit: {s})
@@ -119,8 +124,8 @@ pub fn main(init: std.process.Init) !void {
     var cfg = try config.load(alloc, init.io, config_path);
     defer cfg.deinit(alloc);
 
-    // 2. 初始化日志
-    try log.init(alloc, init.io, cfg.global.log_level, if (cfg.global.log_file.len > 0) cfg.global.log_file else null);
+    // 2. 初始化日志（dev 模式强制 debug 级别）
+    try log.init(alloc, init.io, if (dev_mode) "debug" else cfg.global.log_level, if (cfg.global.log_file.len > 0) cfg.global.log_file else null);
     defer log.deinit(alloc, init.io);
 
     log.info("🚀 启动 zponder v{s} ({s})", .{ build_options.version, build_options.git_commit });

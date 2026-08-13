@@ -37,3 +37,4 @@ npm/zponder/bin/linux-arm64/zponder
 .env
 .gstack/
 zponder
+.reasonix/
