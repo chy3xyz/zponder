@@ -89,16 +89,32 @@ pub const Manager = struct {
             std.atomic.spinLoopHint();
         }
         defer self.mutex.unlock();
-        if (self.queue.items.len < 1000) {
-            self.queue.append(self.alloc, .{
-                .contract_name = self.alloc.dupe(u8, contract_name) catch return,
-                .event_name = self.alloc.dupe(u8, event_name) catch return,
-                .block_number = block_number,
-                .payload_json = payload,
-            }) catch return;
-        } else {
+
+        if (self.queue.items.len >= 1000) {
             self.alloc.free(payload);
+            return;
         }
+
+        // 进入锁后，任何失败路径都要释放已分配的 payload/dup（避免 OOM 泄漏）
+        const contract_dup = self.alloc.dupe(u8, contract_name) catch {
+            self.alloc.free(payload);
+            return;
+        };
+        errdefer self.alloc.free(contract_dup);
+        const event_dup = self.alloc.dupe(u8, event_name) catch {
+            self.alloc.free(payload);
+            return;
+        };
+        errdefer self.alloc.free(event_dup);
+        self.queue.append(self.alloc, .{
+            .contract_name = contract_dup,
+            .event_name = event_dup,
+            .block_number = block_number,
+            .payload_json = payload,
+        }) catch {
+            self.alloc.free(payload);
+            return;
+        };
     }
 
     fn workerLoop(self: *Manager) void {

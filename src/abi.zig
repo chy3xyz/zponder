@@ -294,7 +294,10 @@ fn decodeDynamicValue(alloc: std.mem.Allocator, data: []const u8, offset_hex: us
     if (offset_hex > std.math.maxInt(usize) - 64 or offset_hex + 64 > hex_data.len)
         return try alloc.dupe(u8, "0x");
     const len_word = hex_data[offset_hex .. offset_hex + 64];
-    const len = @as(usize, @intCast(hexWordToU256(len_word)));
+    const len_u256 = hexWordToU256(len_word);
+    // 恶意链上数据可能给出超大 u256 长度，@intCast 到 usize 会溢出 panic
+    if (len_u256 > std.math.maxInt(usize)) return try alloc.dupe(u8, "0x");
+    const len: usize = @intCast(len_u256);
 
     // 防溢出：len * 2
     if (len > std.math.maxInt(usize) / 2) return try alloc.dupe(u8, "0x");
@@ -402,13 +405,19 @@ pub fn decodeLog(alloc: std.mem.Allocator, event: *const AbiEvent, topics: []con
                 // 动态类型：当前 word 是偏移量（以字节为单位）
                 if (word_start <= std.math.maxInt(usize) - 64 and word_start + 64 <= hex_data.len) {
                     const offset_word = hex_data[word_start .. word_start + 64];
-                    const offset_bytes = @as(usize, @intCast(hexWordToU256(offset_word)));
-                    if (offset_bytes > std.math.maxInt(usize) / 2) {
+                    const offset_u256 = hexWordToU256(offset_word);
+                    // 恶意链上数据可能给出超大 u256 偏移，@intCast 到 usize 会溢出 panic
+                    if (offset_u256 > std.math.maxInt(usize)) {
                         try fields.append(alloc, .{ .name = input.name, .value = try alloc.dupe(u8, "0x") });
                     } else {
-                        const offset_hex = offset_bytes * 2; // 转为 hex 字符数
-                        const decoded = try decodeDynamicValue(alloc, data, offset_hex);
-                        try fields.append(alloc, .{ .name = input.name, .value = decoded });
+                        const offset_bytes: usize = @intCast(offset_u256);
+                        if (offset_bytes > std.math.maxInt(usize) / 2) {
+                            try fields.append(alloc, .{ .name = input.name, .value = try alloc.dupe(u8, "0x") });
+                        } else {
+                            const offset_hex = offset_bytes * 2; // 转为 hex 字符数
+                            const decoded = try decodeDynamicValue(alloc, data, offset_hex);
+                            try fields.append(alloc, .{ .name = input.name, .value = decoded });
+                        }
                     }
                 } else {
                     try fields.append(alloc, .{ .name = input.name, .value = try alloc.dupe(u8, "0x") });

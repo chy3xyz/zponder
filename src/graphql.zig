@@ -344,7 +344,8 @@ fn attachResolvers(schema_def: *zg.schema.Schema) void {
                 }
 
                 const limit: u32 = if (args.get("limit")) |lv| @intCast(@max(1, @min(lv.data.int, 1000))) else 10;
-                const offset: u32 = if (args.get("offset")) |ov| @intCast(@max(0, ov.data.int)) else 0;
+                // offset 加上限防 @intCast(i64→u32) 溢出 panic（limit 已有 @min 保护）
+                const offset: u32 = if (args.get("offset")) |ov| @intCast(@max(0, @min(ov.data.int, 1_000_000_000))) else 0;
                 const block_from: ?u64 = if (args.get("blockFrom")) |bf| @intCast(@max(0, bf.data.int)) else null;
                 const block_to: ?u64 = if (args.get("blockTo")) |bt| @intCast(@max(0, bt.data.int)) else null;
 

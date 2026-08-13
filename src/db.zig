@@ -70,7 +70,10 @@ pub const Client = struct {
     fn initSqlite(alloc: std.mem.Allocator, config: *const DatabaseConfig) !Client {
         var db: ?*c.sqlite3 = null;
         const path = if (config.db_name.len > 0) config.db_name else ":memory:";
-        const rc = c.sqlite3_open(path.ptr, &db);
+        // 写连接用 FULLMUTEX：多个索引器线程并发写同一连接，sqlite3 连接
+        // 本身非线程安全（默认无内部锁），FULLMUTEX 使其线程安全。
+        const w_flags: c_int = c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE | c.SQLITE_OPEN_FULLMUTEX;
+        const rc = c.sqlite3_open_v2(path.ptr, &db, w_flags, null);
         if (rc != c.SQLITE_OK) return error.DatabaseOpenFailed;
         try checkPragma(db, "PRAGMA foreign_keys = ON;");
         try checkPragma(db, "PRAGMA journal_mode = WAL;");
