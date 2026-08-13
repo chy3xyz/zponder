@@ -9,12 +9,6 @@ const build_options = @import("build_options");
 
 const log = std.log.scoped(.graphql);
 
-/// zgraphql 0.4.0 的 WS subscription 路径未把 server user_data 传给 executor
-/// （HTTP 查询路径有 setUserData，WS 路径漏了），导致 subscription resolver
-/// 收到的 ctx 为 null。这里维护一个全局 Context 指针作为 fallback；
-/// 未来 zgraphql 修复后可移除，改用 user_data。
-var global_context: ?*const Context = null;
-
 /// Context passed to all GraphQL resolvers via user_data.
 pub const Context = struct {
     database: *db.Client,
@@ -106,7 +100,6 @@ pub fn start(alloc: std.mem.Allocator, cfg: *const config.GraphQLConfig, ctx: Co
     const ctx_ptr = try alloc.create(Context);
     errdefer alloc.destroy(ctx_ptr);
     ctx_ptr.* = ctx;
-    global_context = ctx_ptr;
 
     // Setup rate limiter if configured.
     var rate_limiter: ?zg.RateLimiter = null;
@@ -139,7 +132,6 @@ pub fn start(alloc: std.mem.Allocator, cfg: *const config.GraphQLConfig, ctx: Co
                 self.ctx_ptr.shutdown_flag.store(true, .release);
                 self.schema_def.deinit();
                 if (self.rate_limiter) |*rl| rl.deinit();
-                global_context = null;
                 self.allocator.destroy(self.ctx_ptr);
                 self.allocator.destroy(self);
             }
@@ -186,13 +178,6 @@ fn getCtx(user_data: ?*anyopaque) *const Context {
     return @ptrCast(@alignCast(user_data.?));
 }
 
-/// subscription 场景：zgraphql 0.4.0 WS 路径的 user_data 为 null，
-/// fallback 到全局 Context（见 global_context 注释）。
-fn getCtxSafe(user_data: ?*anyopaque) *const Context {
-    if (user_data) |u| return @ptrCast(@alignCast(u));
-    return global_context.?;
-}
-
 fn isValidTableName(name: []const u8) bool {
     if (name.len == 0) return false;
     for (name) |c| {
@@ -235,7 +220,7 @@ fn attachResolvers(schema_def: *zg.schema.Schema) void {
                 };
 
                 fn subscribe(ctx: ?*anyopaque, alloc: std.mem.Allocator, _: zg.Value, _: std.StringHashMap(zg.Value)) anyerror!zg.schema.SubscriptionStream {
-                    const c = getCtxSafe(ctx);
+                    const c = getCtx(ctx);
                     const s = try alloc.create(StreamCtx);
                     s.* = .{ .ctx = c, .last_block = 0 };
                     return zg.schema.SubscriptionStream{
@@ -274,7 +259,7 @@ fn attachResolvers(schema_def: *zg.schema.Schema) void {
             fn resolve(ctx: ?*anyopaque, alloc: std.mem.Allocator, _: zg.Value, _: std.StringHashMap(zg.Value)) anyerror!zg.Value {
                 const c = getCtx(ctx);
                 var list = zg.Value.initList(alloc);
-                errdefer list.deinit();
+                errdefer list.deinit(alloc);
 
                 for (c.indexers) |idx| {
                     var obj = zg.Value.initObject(alloc);
@@ -326,7 +311,7 @@ fn attachResolvers(schema_def: *zg.schema.Schema) void {
             fn resolve(ctx: ?*anyopaque, alloc: std.mem.Allocator, _: zg.Value, _: std.StringHashMap(zg.Value)) anyerror!zg.Value {
                 const c = getCtx(ctx);
                 var list = zg.Value.initList(alloc);
-                errdefer list.deinit();
+                errdefer list.deinit(alloc);
 
                 for (c.indexers) |idx| {
                     var obj = zg.Value.initObject(alloc);
@@ -370,7 +355,7 @@ fn attachResolvers(schema_def: *zg.schema.Schema) void {
                 defer parsed.deinit();
 
                 var list = zg.Value.initList(alloc);
-                errdefer list.deinit();
+                errdefer list.deinit(alloc);
 
                 if (parsed.value == .array) {
                     for (parsed.value.array.items) |row| {
@@ -593,9 +578,9 @@ test "graphql: 端到端执行（zgraphql v0.4.0）" {
         var executor = zg.Executor.init(alloc, &schema_def, io);
         defer executor.deinit();
         var result = try executor.execute(&doc);
-        defer result.deinit();
+        defer result.deinit(alloc);
 
-        const json_str = try result.toJson();
+        const json_str = try result.toJson(alloc);
         defer alloc.free(json_str);
         try std.testing.expect(std.mem.indexOf(u8, json_str, "\"health\":\"ok\"") != null);
         try std.testing.expect(std.mem.indexOf(u8, json_str, "\"version\"") != null);

@@ -14,7 +14,7 @@
 
 | Item                    | Status       |
 |-------------------------|--------------|
-| `build.zig` + `build.zig.zon` | Complete (embeds QuickJS + zgraphql v0.4.0) |
+| `build.zig` + `build.zig.zon` | Complete (embeds QuickJS + zgraphql v0.7.0) |
 | `src/` source files     | 22+ Zig files |
 | `config.toml`           | Complete (`ws_url` / `ws_urls` optional) |
 | Unit tests              | 70+ passing  |
@@ -37,7 +37,7 @@
 | Script Engine      | Native Embedded QuickJS C Runtime             |
 | Storage            | SQLite (with `read_db` pool) / RocksDB / PostgreSQL |
 | HTTP Server        | `std.http.Server` + `std.Io`                 |
-| GraphQL Engine     | [zgraphql](https://github.com/chy3xyz/zgraphql) v0.4.0 |
+| GraphQL Engine     | [zgraphql](https://github.com/chy3xyz/zgraphql) v0.7.0 |
 | RPC Client         | HTTP JSON-RPC failover + optional WSS `eth_subscribe` |
 | Build              | `build.zig` + `build.zig.zon`                 |
 
