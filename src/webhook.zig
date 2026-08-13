@@ -140,12 +140,63 @@ pub const Manager = struct {
     }
 };
 
-test "webhook queue enqueue and deinit" {
+test "webhook enqueue 生成正确 payload 与字段" {
     const alloc = std.testing.allocator;
-    var threaded: std.Io.Threaded = undefined;
-    const io = threaded.io();
-    var mgr = try Manager.init(alloc, io, "");
-    defer mgr.deinit();
+    // 手动构造 Manager（不 spawn worker，避免网络与并发干扰）
+    var mgr = Manager{
+        .alloc = alloc,
+        .io = undefined,
+        .target_url = try alloc.dupe(u8, "http://127.0.0.1:1"),
+        .queue = .empty,
+        .mutex = .unlocked,
+        .running = std.atomic.Value(bool).init(true),
+        .thread = null,
+    };
+    defer {
+        for (mgr.queue.items) |*m| m.deinit(alloc);
+        mgr.queue.deinit(alloc);
+        alloc.free(mgr.target_url);
+    }
 
-    mgr.enqueueEvent("pancake", "Swap", &.{}, 100);
+    const fields = [_]db.DecodedField{
+        .{ .name = "from", .value = "0x1111" },
+        .{ .name = "value", .value = "100" },
+    };
+    mgr.enqueueEvent("pancake", "Swap", &fields, 123);
+
+    try std.testing.expectEqual(@as(usize, 1), mgr.queue.items.len);
+    const msg = &mgr.queue.items[0];
+    try std.testing.expectEqualStrings("pancake", msg.contract_name);
+    try std.testing.expectEqualStrings("Swap", msg.event_name);
+    try std.testing.expectEqual(@as(u64, 123), msg.block_number);
+    // payload JSON 包含事件字段键值
+    try std.testing.expect(std.mem.indexOf(u8, msg.payload_json, "\"contract\":\"pancake\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg.payload_json, "\"value\":\"100\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg.payload_json, "\"block_number\":123") != null);
+}
+
+test "webhook 队列满 1000 时丢弃新消息" {
+    const alloc = std.testing.allocator;
+    var mgr = Manager{
+        .alloc = alloc,
+        .io = undefined,
+        .target_url = try alloc.dupe(u8, "http://127.0.0.1:1"),
+        .queue = .empty,
+        .mutex = .unlocked,
+        .running = std.atomic.Value(bool).init(true),
+        .thread = null,
+    };
+    defer {
+        for (mgr.queue.items) |*m| m.deinit(alloc);
+        mgr.queue.deinit(alloc);
+        alloc.free(mgr.target_url);
+    }
+
+    const fields = [_]db.DecodedField{};
+    var i: usize = 0;
+    while (i < 1001) : (i += 1) {
+        mgr.enqueueEvent("c", "E", &fields, i);
+    }
+    // 队列容量 1000，第 1001 条被丢弃
+    try std.testing.expectEqual(@as(usize, 1000), mgr.queue.items.len);
 }

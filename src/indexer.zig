@@ -41,6 +41,7 @@ pub const Indexer = struct {
     snapshot_interval: u64,
     state: std.atomic.Value(IndexerState),
     current_block: std.atomic.Value(u64),
+    last_tip: std.atomic.Value(u64),
     last_snapshot_time: std.atomic.Value(i64),
     batch_size: u64,
     poll_interval_ms: u32,
@@ -110,6 +111,7 @@ pub const Indexer = struct {
             .snapshot_interval = snapshot_interval,
             .state = std.atomic.Value(IndexerState).init(.stopped),
             .current_block = std.atomic.Value(u64).init(start_block),
+            .last_tip = std.atomic.Value(u64).init(start_block),
             .last_snapshot_time = std.atomic.Value(i64).init(0),
             .batch_size = batch_size,
             .poll_interval_ms = poll_interval_ms,
@@ -203,6 +205,7 @@ pub const Indexer = struct {
                 std.Io.sleep(self.rpc.io, std.Io.Duration.fromMilliseconds(self.poll_interval_ms), .real) catch {};
                 continue;
             };
+            self.last_tip.store(latest_block, .monotonic);
 
             const current = self.current_block.load(.monotonic);
             if (current >= latest_block) {
@@ -967,6 +970,7 @@ test "shouldRecordEvent filtering" {
         .snapshot_interval = 0,
         .state = std.atomic.Value(IndexerState).init(.stopped),
         .current_block = std.atomic.Value(u64).init(0),
+        .last_tip = std.atomic.Value(u64).init(0),
         .last_snapshot_time = std.atomic.Value(i64).init(0),
         .batch_size = 100,
         .poll_interval_ms = 1000,
@@ -1042,6 +1046,7 @@ test "indexer getStatus and getCurrentBlock" {
         .snapshot_interval = 0,
         .state = std.atomic.Value(IndexerState).init(.stopped),
         .current_block = std.atomic.Value(u64).init(100),
+        .last_tip = std.atomic.Value(u64).init(100),
         .last_snapshot_time = std.atomic.Value(i64).init(0),
         .batch_size = 100,
         .poll_interval_ms = 1000,

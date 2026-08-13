@@ -578,6 +578,12 @@ pub const Server = struct {
         try self.sendJson(request, buf.items, .ok);
     }
 
+    fn lag(idx: *indexer.Indexer) u64 {
+        const tip = idx.last_tip.load(.monotonic);
+        const cur = idx.getCurrentBlock();
+        return if (tip > cur) tip - cur else 0;
+    }
+
     fn handleMetrics(self: *Server, request: *std.http.Server.Request) !void {
         var buf: std.Io.Writer.Allocating = .init(self.alloc);
         defer buf.deinit();
@@ -624,8 +630,11 @@ pub const Server = struct {
                 "zponder_indexer_current_block{{contract=\"{s}\"}} {d}\n" ++
                 "# HELP zponder_indexer_status 索引器状态码\n" ++
                 "# TYPE zponder_indexer_status gauge\n" ++
-                "zponder_indexer_status{{contract=\"{s}\"}} {d}\n",
-                .{ idx.contract.name, idx.getCurrentBlock(), idx.contract.name, status_str },
+                "zponder_indexer_status{{contract=\"{s}\"}} {d}\n" ++
+                "# HELP zponder_indexer_lag 同步滞后块数（tip - 当前）\n" ++
+                "# TYPE zponder_indexer_lag gauge\n" ++
+                "zponder_indexer_lag{{contract=\"{s}\"}} {d}\n",
+                .{ idx.contract.name, idx.getCurrentBlock(), idx.contract.name, status_str, idx.contract.name, lag(idx) },
             );
         }
 
