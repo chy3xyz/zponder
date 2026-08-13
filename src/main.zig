@@ -268,7 +268,7 @@ pub fn main(init: std.process.Init) !void {
     // 8. 启动
     for (indexers.items) |*idx| try idx.start();
 
-    var server = http_server.Server.init(alloc, init.io, &cfg.http, &database, &query_cache, indexer_ptrs.items, cfg.queries, cfg.dashboards, &event_bus);
+    var server = http_server.Server.init(alloc, init.io, &cfg.http, &database, &query_cache, indexer_ptrs.items, cfg.queries, cfg.dashboards, &event_bus, js_eng);
     defer server.deinit();
     try server.start();
 

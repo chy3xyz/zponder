@@ -8,6 +8,7 @@ const utils = @import("utils.zig");
 const template = @import("template.zig");
 const dashboard = @import("dashboard.zig");
 const eb = @import("event_bus.zig");
+const js_engine = @import("js_engine.zig");
 
 const build_options = @import("build_options");
 
@@ -75,6 +76,7 @@ pub const Server = struct {
     queries: []const config.QueryConfig,
     dashboards: []const config.DashboardConfig,
     event_bus: *eb.EventBus,
+    js: ?*js_engine.JsEngine,
     listen_socket: ?std.Io.net.Server,
     thread: ?std.Thread,
     running: std.atomic.Value(bool),
@@ -91,6 +93,7 @@ pub const Server = struct {
         queries: []const config.QueryConfig,
         dashboards: []const config.DashboardConfig,
         bus: *eb.EventBus,
+        js: ?*js_engine.JsEngine,
     ) Server {
         const rps = @as(f64, @floatFromInt(cfg.rate_limit_rps orelse 0));
         const burst = @as(f64, @floatFromInt(cfg.rate_limit_burst orelse 0));
@@ -104,6 +107,7 @@ pub const Server = struct {
             .queries = queries,
             .dashboards = dashboards,
             .event_bus = bus,
+            .js = js,
             .listen_socket = null,
             .thread = null,
             .running = std.atomic.Value(bool).init(false),
@@ -212,6 +216,31 @@ pub const Server = struct {
         }
     }
 
+    /// 尝试匹配 ponder.http 注册的 JS 动态路由；命中则响应并返回 true。
+    fn tryDynamicRoute(self: *Server, request: *std.http.Server.Request, target: []const u8, method: std.http.Method) !bool {
+        const js = self.js orelse return false;
+        const jm: js_engine.HttpMethod = switch (method) {
+            .GET => .get,
+            .POST => .post,
+            else => return false,
+        };
+        const qs_idx = std.mem.indexOfScalar(u8, target, '?') orelse target.len;
+        const path = target[0..qs_idx];
+        const qs = if (qs_idx < target.len) target[qs_idx + 1 ..] else "";
+
+        const body = js.handleHttpRequest(jm, path, qs) orelse return false;
+        defer self.alloc.free(body);
+
+        try request.respond(body, .{
+            .status = .ok,
+            .extra_headers = &.{
+                .{ .name = "Content-Type", .value = "application/json; charset=utf-8" },
+                .{ .name = "Access-Control-Allow-Origin", .value = self.corsOrigin(request) },
+            },
+        });
+        return true;
+    }
+
     fn handleRequest(self: *Server, request: *std.http.Server.Request) !void {
         const target = request.head.target;
         const method = request.head.method;
@@ -237,6 +266,11 @@ pub const Server = struct {
         // CORS 预检请求
         if (method == .OPTIONS) {
             try self.sendCorsResponse(request, .no_content);
+            return;
+        }
+
+        // ponder.http 动态路由（JS 注册的 handler）优先
+        if (try self.tryDynamicRoute(request, target, method)) {
             return;
         }
 

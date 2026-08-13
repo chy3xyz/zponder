@@ -8,6 +8,21 @@ fn jsUndefined(ctx: ?*c.JSContext) c.JSValue {
     return c.JS_NewInt32(ctx, 0);
 }
 
+/// ponder.http 路由（Hono-like 最小实现）
+pub const HttpRoute = struct {
+    method: HttpMethod,
+    path: []const u8,
+    handler: c.JSValue,
+};
+
+pub const HttpMethod = enum { get, post };
+
+/// HTTP 请求上下文（供 c.req.param/query 回调读取）
+const HttpRequestCtx = struct {
+    params: std.StringHashMap([]const u8),
+    query: std.StringHashMap([]const u8),
+};
+
 pub const JsEngine = struct {
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -15,6 +30,10 @@ pub const JsEngine = struct {
     ctx: ?*c.JSContext,
     // event_name -> handler 函数（JS_DupValue 保持引用，避免被 GC）
     handlers: std.StringHashMap(c.JSValue),
+    // ponder.http 路由表
+    http_routes: std.ArrayList(HttpRoute),
+    // 当前 HTTP 请求上下文（handleHttpRequest 期间有效，供 C 回调读取）
+    current_req: ?*const HttpRequestCtx = null,
     // QuickJS runtime 非线程安全；多索引器线程并发触发需串行化
     mutex: std.atomic.Mutex = .unlocked,
 
@@ -32,6 +51,7 @@ pub const JsEngine = struct {
             .rt = rt,
             .ctx = ctx,
             .handlers = std.StringHashMap(c.JSValue).init(alloc),
+            .http_routes = .empty,
         };
         // 存 engine 指针供 C 回调取回
         c.JS_SetRuntimeOpaque(rt, engine);
@@ -47,6 +67,12 @@ pub const JsEngine = struct {
             if (self.ctx) |ctx| c.JS_FreeValue(ctx, entry.value_ptr.*);
         }
         self.handlers.deinit();
+        // 释放 http 路由
+        for (self.http_routes.items) |*r| {
+            self.alloc.free(r.path);
+            if (self.ctx) |ctx| c.JS_FreeValue(ctx, r.handler);
+        }
+        self.http_routes.deinit(self.alloc);
         if (self.ctx) |ctx| c.JS_FreeContext(ctx);
         if (self.rt) |rt| c.JS_FreeRuntime(rt);
         self.alloc.destroy(self);
@@ -61,8 +87,17 @@ pub const JsEngine = struct {
         const ponder = c.JS_NewObject(ctx);
         const on_fn = c.JS_NewCFunction2(ctx, ponderOnCallback, "on", 2, 0, 0);
         _ = c.JS_SetPropertyStr(ctx, ponder, "on", on_fn);
+
+        // ponder.http（Hono-like 最小实现）：.get/.post(path, handler)
+        const http_obj = c.JS_NewObject(ctx);
+        const get_fn = c.JS_NewCFunction2(ctx, httpGetCallback, "get", 2, 0, 0);
+        const post_fn = c.JS_NewCFunction2(ctx, httpPostCallback, "post", 2, 0, 0);
+        _ = c.JS_SetPropertyStr(ctx, http_obj, "get", get_fn);
+        _ = c.JS_SetPropertyStr(ctx, http_obj, "post", post_fn);
+        _ = c.JS_SetPropertyStr(ctx, ponder, "http", http_obj);
+
         _ = c.JS_SetPropertyStr(ctx, global, "ponder", ponder);
-        // 注意：JS_SetPropertyStr 接管 val 所有权，on_fn/ponder 无需（也不能）再 FreeValue
+        // 注意：JS_SetPropertyStr 接管 val 所有权，on_fn/ponder 等无需（也不能）再 FreeValue
     }
 
     /// ponder.on(event, handler) 的 C 回调：注册 handler
@@ -81,6 +116,99 @@ pub const JsEngine = struct {
 
         engine.registerHandler(evt_name, handler_val);
         return jsUndefined(ctx);
+    }
+
+    /// ponder.http.get(path, handler) 回调
+    fn httpGetCallback(ctx: ?*c.JSContext, _: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+        return httpRouteCallback(ctx, argc, argv, .get);
+    }
+
+    /// ponder.http.post(path, handler) 回调
+    fn httpPostCallback(ctx: ?*c.JSContext, _: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+        return httpRouteCallback(ctx, argc, argv, .post);
+    }
+
+    fn httpRouteCallback(ctx: ?*c.JSContext, argc: c_int, argv: [*c]c.JSValue, method: HttpMethod) c.JSValue {
+        if (argc < 2) return jsUndefined(ctx);
+        const rt = c.JS_GetRuntime(ctx);
+        const engine = @as(*JsEngine, @ptrCast(@alignCast(c.JS_GetRuntimeOpaque(rt) orelse return jsUndefined(ctx))));
+
+        const path_val = argv[0];
+        const handler_val = argv[1];
+        if (!c.JS_IsString(path_val) or !c.JS_IsFunction(ctx, handler_val)) return jsUndefined(ctx);
+
+        const path_cstr = c.JS_ToCString(ctx, path_val) orelse return jsUndefined(ctx);
+        defer c.JS_FreeCString(ctx, path_cstr);
+        const path = std.mem.span(path_cstr);
+
+        engine.registerHttpRoute(method, path, handler_val);
+        return jsUndefined(ctx);
+    }
+
+    fn registerHttpRoute(self: *JsEngine, method: HttpMethod, path: []const u8, handler_val: c.JSValue) void {
+        const ctx = self.ctx orelse return;
+        const path_copy = self.alloc.dupe(u8, path) catch return;
+        self.http_routes.append(self.alloc, .{
+            .method = method,
+            .path = path_copy,
+            .handler = c.JS_DupValue(ctx, handler_val),
+        }) catch {
+            self.alloc.free(path_copy);
+        };
+    }
+
+    /// c.req.param(name) 回调
+    fn reqParamCallback(ctx: ?*c.JSContext, _: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+        if (argc < 1) return jsUndefined(ctx);
+        const rt = c.JS_GetRuntime(ctx);
+        const engine = @as(*JsEngine, @ptrCast(@alignCast(c.JS_GetRuntimeOpaque(rt) orelse return jsUndefined(ctx))));
+        const name_cstr = c.JS_ToCString(ctx, argv[0]) orelse return jsUndefined(ctx);
+        defer c.JS_FreeCString(ctx, name_cstr);
+        const name = std.mem.span(name_cstr);
+
+        if (engine.current_req) |req| {
+            if (req.params.get(name)) |v| {
+                return c.JS_NewStringLen(ctx, v.ptr, v.len);
+            }
+        }
+        return jsUndefined(ctx);
+    }
+
+    /// c.req.query(name) 回调
+    fn reqQueryCallback(ctx: ?*c.JSContext, _: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+        if (argc < 1) return jsUndefined(ctx);
+        const rt = c.JS_GetRuntime(ctx);
+        const engine = @as(*JsEngine, @ptrCast(@alignCast(c.JS_GetRuntimeOpaque(rt) orelse return jsUndefined(ctx))));
+        const name_cstr = c.JS_ToCString(ctx, argv[0]) orelse return jsUndefined(ctx);
+        defer c.JS_FreeCString(ctx, name_cstr);
+        const name = std.mem.span(name_cstr);
+
+        if (engine.current_req) |req| {
+            if (req.query.get(name)) |v| {
+                return c.JS_NewStringLen(ctx, v.ptr, v.len);
+            }
+        }
+        return jsUndefined(ctx);
+    }
+
+    /// c.json(obj)：把 obj JSON 序列化后作为响应体返回
+    fn cJsonCallback(ctx: ?*c.JSContext, _: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+        const global = c.JS_GetGlobalObject(ctx);
+        defer c.JS_FreeValue(ctx, global);
+        const json_obj = c.JS_GetPropertyStr(ctx, global, "JSON");
+        defer c.JS_FreeValue(ctx, json_obj);
+        const stringify = c.JS_GetPropertyStr(ctx, json_obj, "stringify");
+        defer c.JS_FreeValue(ctx, stringify);
+
+        var target = if (argc >= 1) argv[0] else jsUndefined(ctx);
+        // JSON.stringify(target)
+        return c.JS_Call(ctx, stringify, jsUndefined(ctx), 1, &target);
+    }
+
+    /// c.text(str)：直接返回字符串作为响应体
+    fn cTextCallback(ctx: ?*c.JSContext, _: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+        if (argc < 1) return jsUndefined(ctx);
+        return c.JS_DupValue(ctx, argv[0]);
     }
 
     fn registerHandler(self: *JsEngine, event_name: []const u8, handler_val: c.JSValue) void {
@@ -143,6 +271,123 @@ pub const JsEngine = struct {
             const ret = c.JS_ExecutePendingJob(self.rt, &job_ctx);
             if (ret < 0) break;
             if (ret == 0) break;
+        }
+    }
+
+    /// HTTP 动态路由入口：匹配 ponder.http 注册的路由并执行 handler。
+    /// 返回 alloc 的响应体（调用者 free）；null 表示无匹配路由。
+    pub fn handleHttpRequest(self: *JsEngine, method: HttpMethod, path: []const u8, query_string: []const u8) ?[]u8 {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+
+        const ctx = self.ctx orelse return null;
+
+        // 匹配路由并捕获路径参数
+        var params = std.StringHashMap([]const u8).init(self.alloc);
+        defer {
+            var it = params.iterator();
+            while (it.next()) |e| self.alloc.free(e.key_ptr.*);
+            params.deinit();
+        }
+        const route = matchRoute(self.alloc, self.http_routes.items, method, path, &params) orelse return null;
+
+        // 解析 query string 到 map
+        var query = std.StringHashMap([]const u8).init(self.alloc);
+        defer {
+            var it = query.iterator();
+            while (it.next()) |e| {
+                self.alloc.free(e.key_ptr.*);
+                self.alloc.free(e.value_ptr.*);
+            }
+            query.deinit();
+        }
+        parseQueryString(self.alloc, query_string, &query);
+
+        // 构造 c 对象：{ req: { param, query }, json, text }
+        var c_obj = c.JS_NewObject(ctx);
+        defer c.JS_FreeValue(ctx, c_obj);
+        const req_obj = c.JS_NewObject(ctx);
+        const param_fn = c.JS_NewCFunction2(ctx, reqParamCallback, "param", 1, 0, 0);
+        const query_fn = c.JS_NewCFunction2(ctx, reqQueryCallback, "query", 1, 0, 0);
+        _ = c.JS_SetPropertyStr(ctx, req_obj, "param", param_fn);
+        _ = c.JS_SetPropertyStr(ctx, req_obj, "query", query_fn);
+        _ = c.JS_SetPropertyStr(ctx, c_obj, "req", req_obj);
+        const json_fn = c.JS_NewCFunction2(ctx, cJsonCallback, "json", 1, 0, 0);
+        const text_fn = c.JS_NewCFunction2(ctx, cTextCallback, "text", 1, 0, 0);
+        _ = c.JS_SetPropertyStr(ctx, c_obj, "json", json_fn);
+        _ = c.JS_SetPropertyStr(ctx, c_obj, "text", text_fn);
+
+        // 设置当前请求上下文（供 c.req.param/query 回调读取）
+        var req_ctx = HttpRequestCtx{ .params = params, .query = query };
+        self.current_req = &req_ctx;
+        defer self.current_req = null;
+
+        // 调用 handler(c)
+        const result = c.JS_Call(ctx, route.handler, jsUndefined(ctx), 1, &c_obj);
+        defer c.JS_FreeValue(ctx, result);
+
+        // 驱动 async pending jobs
+        var job_ctx: ?*c.JSContext = null;
+        var i: usize = 0;
+        while (i < 100) : (i += 1) {
+            const ret = c.JS_ExecutePendingJob(self.rt, &job_ctx);
+            if (ret <= 0) break;
+        }
+
+        if (c.JS_IsException(result)) return null;
+        // 返回值是字符串（c.json/c.text 的结果）或 undefined
+        if (!c.JS_IsString(result)) return null;
+        const body_cstr = c.JS_ToCString(ctx, result) orelse return null;
+        defer c.JS_FreeCString(ctx, body_cstr);
+        return self.alloc.dupe(u8, std.mem.span(body_cstr)) catch null;
+    }
+
+    fn matchRoute(alloc: std.mem.Allocator, routes: []const HttpRoute, method: HttpMethod, path: []const u8, params: *std.StringHashMap([]const u8)) ?*const HttpRoute {
+        for (routes) |*r| {
+            if (r.method != method) continue;
+            if (matchPath(alloc, r.path, path, params)) return r;
+        }
+        return null;
+    }
+
+    fn matchPath(alloc: std.mem.Allocator, pattern: []const u8, path: []const u8, params: *std.StringHashMap([]const u8)) bool {
+        var p_it = std.mem.splitScalar(u8, pattern, '/');
+        var a_it = std.mem.splitScalar(u8, path, '/');
+        while (true) {
+            const p_seg = p_it.next();
+            const a_seg = a_it.next();
+            if (p_seg == null and a_seg == null) return true;
+            if (p_seg == null or a_seg == null) return false;
+            const p = p_seg.?;
+            const a = a_seg.?;
+            if (p.len > 0 and p[0] == ':') {
+                const key = p[1..];
+                if (params.get(key) == null) {
+                    params.put(alloc.dupe(u8, key) catch return false, a) catch return false;
+                }
+            } else if (!std.mem.eql(u8, p, a)) {
+                return false;
+            }
+        }
+    }
+
+    fn parseQueryString(alloc: std.mem.Allocator, qs: []const u8, map: *std.StringHashMap([]const u8)) void {
+        var it = std.mem.splitScalar(u8, qs, '&');
+        while (it.next()) |pair| {
+            if (pair.len == 0) continue;
+            const eq = std.mem.indexOfScalar(u8, pair, '=') orelse pair.len;
+            const key = pair[0..eq];
+            const val = if (eq < pair.len) pair[eq + 1 ..] else "";
+            if (map.get(key) != null) continue;
+            const k = alloc.dupe(u8, key) catch continue;
+            const v = alloc.dupe(u8, val) catch {
+                alloc.free(k);
+                continue;
+            };
+            map.put(k, v) catch {
+                alloc.free(k);
+                alloc.free(v);
+            };
         }
     }
 
@@ -233,4 +478,40 @@ test "js engine ponder.on Contract:Event 全名匹配" {
     engine.handleEvent("Dai", "Transfer", &fields, 1);
 
     try engine.evalScript("if (hit !== '0x64') throw new Error('not hit: ' + hit);", "check.js");
+}
+
+test "js engine ponder.http 动态路由" {
+    const alloc = std.testing.allocator;
+    var engine = try JsEngine.init(alloc, undefined);
+    defer engine.deinit();
+
+    try engine.evalScript(
+        \\ponder.http.get("/api/token/:address", function(c) {
+        \\  const address = c.req.param("address");
+        \\  const q = c.req.query("name");
+        \\  return c.json({ address: address, name: q });
+        \\});
+    , "routes.js");
+
+    const body = engine.handleHttpRequest(.get, "/api/token/0x123", "name=alice").?;
+    defer alloc.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "0x123") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "alice") != null);
+
+    // 无匹配路由返回 null
+    try std.testing.expect(engine.handleHttpRequest(.get, "/nope", "") == null);
+}
+
+test "js engine ponder.http c.text" {
+    const alloc = std.testing.allocator;
+    var engine = try JsEngine.init(alloc, undefined);
+    defer engine.deinit();
+
+    try engine.evalScript(
+        \\ponder.http.post("/ping", function(c) { return c.text("pong"); });
+    , "routes.js");
+
+    const body = engine.handleHttpRequest(.post, "/ping", "").?;
+    defer alloc.free(body);
+    try std.testing.expectEqualStrings("pong", body);
 }
