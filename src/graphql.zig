@@ -9,6 +9,12 @@ const build_options = @import("build_options");
 
 const log = std.log.scoped(.graphql);
 
+/// zgraphql 0.4.0 的 WS subscription 路径未把 server user_data 传给 executor
+/// （HTTP 查询路径有 setUserData，WS 路径漏了），导致 subscription resolver
+/// 收到的 ctx 为 null。这里维护一个全局 Context 指针作为 fallback；
+/// 未来 zgraphql 修复后可移除，改用 user_data。
+var global_context: ?*const Context = null;
+
 /// Context passed to all GraphQL resolvers via user_data.
 pub const Context = struct {
     database: *db.Client,
@@ -79,6 +85,9 @@ const Builder = zg.SchemaBuilder(.{
         .key = .{ .type = "String!" },
         .value = .{ .type = "String!" },
     },
+    .Subscription = .{
+        .newBlocks = .{ .type = "Int!" },
+    },
 });
 
 pub fn start(alloc: std.mem.Allocator, cfg: *const config.GraphQLConfig, ctx: Context) !std.Thread {
@@ -97,6 +106,7 @@ pub fn start(alloc: std.mem.Allocator, cfg: *const config.GraphQLConfig, ctx: Co
     const ctx_ptr = try alloc.create(Context);
     errdefer alloc.destroy(ctx_ptr);
     ctx_ptr.* = ctx;
+    global_context = ctx_ptr;
 
     // Setup rate limiter if configured.
     var rate_limiter: ?zg.RateLimiter = null;
@@ -129,6 +139,7 @@ pub fn start(alloc: std.mem.Allocator, cfg: *const config.GraphQLConfig, ctx: Co
                 self.ctx_ptr.shutdown_flag.store(true, .release);
                 self.schema_def.deinit();
                 if (self.rate_limiter) |*rl| rl.deinit();
+                global_context = null;
                 self.allocator.destroy(self.ctx_ptr);
                 self.allocator.destroy(self);
             }
@@ -175,6 +186,13 @@ fn getCtx(user_data: ?*anyopaque) *const Context {
     return @ptrCast(@alignCast(user_data.?));
 }
 
+/// subscription 场景：zgraphql 0.4.0 WS 路径的 user_data 为 null，
+/// fallback 到全局 Context（见 global_context 注释）。
+fn getCtxSafe(user_data: ?*anyopaque) *const Context {
+    if (user_data) |u| return @ptrCast(@alignCast(u));
+    return global_context.?;
+}
+
 fn isValidTableName(name: []const u8) bool {
     if (name.len == 0) return false;
     for (name) |c| {
@@ -184,6 +202,54 @@ fn isValidTableName(name: []const u8) bool {
 }
 
 fn attachResolvers(schema_def: *zg.schema.Schema) void {
+    // GraphQL Subscription：实时推送索引器同步到的最新区块号。
+    if (schema_def.subscription_type) |sub_type| {
+        if (sub_type.kind.object.fields.getPtr("newBlocks")) |field| {
+            field.subscribe = struct {
+                const StreamCtx = struct {
+                    ctx: *const Context,
+                    last_block: u64,
+
+                    fn next(ptr: *anyopaque, alloc: std.mem.Allocator) anyerror!?zg.Value {
+                        const s = @as(*StreamCtx, @ptrCast(@alignCast(ptr)));
+                        // 轮询各索引器当前区块，取最大值；有新块则推送，
+                        // 否则短暂让出后重查（阻塞语义，见 zgraphql consumeSubscription）。
+                        while (true) {
+                            var max_block: u64 = 0;
+                            for (s.ctx.indexers) |idx| {
+                                const b = idx.getCurrentBlock();
+                                if (b > max_block) max_block = b;
+                            }
+                            if (max_block > s.last_block) {
+                                s.last_block = max_block;
+                                return zg.Value.fromInt(alloc, @intCast(max_block));
+                            }
+                            std.Io.sleep(s.ctx.rpc.io, std.Io.Duration.fromMilliseconds(500), .real) catch {};
+                        }
+                    }
+
+                    fn deinit(ptr: *anyopaque, alloc: std.mem.Allocator) void {
+                        const s = @as(*StreamCtx, @ptrCast(@alignCast(ptr)));
+                        alloc.destroy(s);
+                    }
+                };
+
+                fn subscribe(ctx: ?*anyopaque, alloc: std.mem.Allocator, _: zg.Value, _: std.StringHashMap(zg.Value)) anyerror!zg.schema.SubscriptionStream {
+                    const c = getCtxSafe(ctx);
+                    const s = try alloc.create(StreamCtx);
+                    s.* = .{ .ctx = c, .last_block = 0 };
+                    return zg.schema.SubscriptionStream{
+                        .ptr = s,
+                        .vtable = &.{
+                            .next = StreamCtx.next,
+                            .deinit = StreamCtx.deinit,
+                        },
+                    };
+                }
+            }.subscribe;
+        }
+    }
+
     if (schema_def.query_type.kind.object.fields.getPtr("health")) |field| {
         field.resolve = struct {
             fn resolve(ctx: ?*anyopaque, alloc: std.mem.Allocator, _: zg.Value, _: std.StringHashMap(zg.Value)) anyerror!zg.Value {
@@ -492,6 +558,11 @@ test "graphql: schema 构建与 resolver 挂载" {
         // 每个 Query 字段都必须挂载 resolver，否则运行时返回 "Cannot return null"
         try std.testing.expect(field.resolve != null);
     }
+
+    // Subscription 根类型 + newBlocks subscribe 挂载
+    const sub_type = schema_def.subscription_type orelse return error.GraphQLSubscriptionTypeMissing;
+    const new_blocks = sub_type.kind.object.fields.get("newBlocks") orelse return error.GraphQLSubscriptionFieldMissing;
+    try std.testing.expect(new_blocks.subscribe != null);
 }
 
 test "graphql: 端到端执行（zgraphql v0.4.0）" {
