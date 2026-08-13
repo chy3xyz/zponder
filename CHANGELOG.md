@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] - 2026-08-13
+
+### Added
+- **GraphQL Subscription**：新增 `Subscription.newBlocks`（WebSocket `graphql-transport-ws`），
+  实时推送索引器同步到的最新区块号。
+- **SSE 实时事件流**：新增线程安全事件总线（`event_bus.zig`），`/stream` 现在持续推送
+  索引器解码的事件（此前只发 `connected` 就断开）。
+- **QuickJS `ponder.on` handler 引擎**：注入全局 `ponder` 对象，`ponder.on("Contract:Event", fn)`
+  注册的 JS handler 现在会在事件到达时真实执行（此前 `ponder is not defined`）。
+- **`contractCall` 真实返回类型**：从合约 ABI 解析函数返回类型（单返回/多返回 tuple），
+  替代硬编码 `uint256`。
+- **Metrics 增强**：`/metrics` 新增 `zponder_rpc_requests_total`、`zponder_rpc_errors_total`、
+  `zponder_indexer_lag{contract}`。
+- **`dev` 子命令**：强制 debug 日志级别运行。
+- **CI**：`publish.yml` 增加 `zig build test`。
+
+### Changed
+- **zgraphql 0.4.0 → 0.7.0**：适配 `Value` API（`deinit`/`toJson` 显式 allocator）；
+  移除 WS `user_data` workaround（0.4.1 已修复）。
+
+### Fixed
+- **SQLite 写连接线程安全**：写连接此前无 `FULLMUTEX`，多索引器线程并发写会数据竞争；
+  现以 `SQLITE_OPEN_FULLMUTEX` 打开。
+- **ABI 解码溢出**：恶意/畸形链上数据（超大 `u256` 偏移/长度）此前会导致 `@intCast` panic；
+  转换前加边界检查。
+- **GraphQL `latestEvents.offset` 溢出**：无上限的 `@intCast(i64→u32)` 在超大输入时 panic。
+- **webhook `enqueueEvent` OOM 泄漏**：dupe/append 失败路径未释放已分配的 payload。
+- **WSS 多合约并发崩溃**（0.6.2 续）：RPC 请求互斥锁改为有界等待（futex 唤醒丢失导致
+  单索引器永久卡死）。
+- **`check` 退出 Bus error**：`cors = true` 释放静态字面量（0.6.2 续）；`cmdCheck` RPC 客户端泄漏。
+
 ## [0.6.2] - 2026-08-08
 
 ### Fixed
