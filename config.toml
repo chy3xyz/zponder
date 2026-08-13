@@ -66,6 +66,12 @@ abi_path = "./abis/erc20.abi"
 from_block = 20000000
 events = ["Transfer", "Approval"]
 
+# 事件参数过滤（可选）：只索引满足条件的日志，降低存储与 RPC 成本
+# 语法: filters = ["事件名:参数名:比较符:阈值", ...]
+# 比较符: gt(>) gte(>=) lt(<) lte(<=) eq(==)，阈值支持十进制或 0x 十六进制
+# 例: 只索引 value > 1000 USDC 的 Transfer（value 为非 indexed 参数，按链上数值比较）
+# filters = ["Transfer:value:gt:1000000000"]
+
 # ============================================================
 # BNB Chain 示例 (chain = "bsc")
 #   PancakeSwap Router:  0x10ed43c718714eb63d5aa57b78b54704e256024e

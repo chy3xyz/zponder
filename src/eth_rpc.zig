@@ -45,6 +45,9 @@ pub const Client = struct {
     http_mutex: std.Io.Mutex = .init,
     next_id: std.atomic.Value(u64),
     url_index: std.atomic.Value(usize),
+    // 指标：请求/错误计数（metrics 端点暴露）
+    total_requests: std.atomic.Value(u64),
+    total_errors: std.atomic.Value(u64),
     // 并发限制
     concurrent_requests: std.atomic.Value(u32),
     // 熔断器状态
@@ -62,6 +65,8 @@ pub const Client = struct {
             .http_client = .{ .allocator = alloc, .io = io },
             .next_id = std.atomic.Value(u64).init(1),
             .url_index = std.atomic.Value(usize).init(0),
+            .total_requests = std.atomic.Value(u64).init(0),
+            .total_errors = std.atomic.Value(u64).init(0),
             .concurrent_requests = std.atomic.Value(u32).init(0),
             .circuit_state = std.atomic.Value(CircuitState).init(.closed),
             .circuit_failures = std.atomic.Value(u32).init(0),
@@ -323,7 +328,8 @@ pub const Client = struct {
         else
             self.config.url;
 
-        const result = try self.http_client.fetch(.{
+        _ = self.total_requests.fetchAdd(1, .monotonic);
+        const result = self.http_client.fetch(.{
             .location = .{ .url = target_url },
             .method = .POST,
             .payload = req_buf.items,
@@ -335,7 +341,10 @@ pub const Client = struct {
                 .{ .name = "Content-Type", .value = "application/json" },
             },
             .response_writer = &response_writer.writer,
-        });
+        }) catch |err| {
+            _ = self.total_errors.fetchAdd(1, .monotonic);
+            return err;
+        };
 
         const status_int = @intFromEnum(result.status);
         // 客户端错误：不可重试

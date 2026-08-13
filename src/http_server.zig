@@ -597,6 +597,20 @@ pub const Server = struct {
             .{ stats.count, stats.total_bytes, self.indexers.len },
         );
 
+        // RPC 请求/错误计数（所有索引器共享同一 RPC 客户端）
+        if (self.indexers.len > 0) {
+            const rpc = self.indexers[0].rpc;
+            try buf.writer.print(
+                "# HELP zponder_rpc_requests_total RPC 请求总数\n" ++
+                "# TYPE zponder_rpc_requests_total counter\n" ++
+                "zponder_rpc_requests_total {d}\n" ++
+                "# HELP zponder_rpc_errors_total RPC 错误总数\n" ++
+                "# TYPE zponder_rpc_errors_total counter\n" ++
+                "zponder_rpc_errors_total {d}\n",
+                .{ rpc.total_requests.load(.monotonic), rpc.total_errors.load(.monotonic) },
+            );
+        }
+
         for (self.indexers) |idx| {
             const status_str = switch (idx.getStatus()) {
                 .running => @as(u8, 1),
