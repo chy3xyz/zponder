@@ -24,15 +24,63 @@ pub const AbiEvent = struct {
     }
 };
 
+/// ABI 函数参数（inputs / outputs 通用）
+pub const AbiParam = struct {
+    name: []const u8,
+    type: []const u8,
+};
+
+/// ABI 函数定义（含返回类型）
+pub const AbiFunction = struct {
+    name: []const u8,
+    inputs: []AbiParam,
+    outputs: []AbiParam,
+
+    pub fn deinit(self: *AbiFunction, alloc: std.mem.Allocator) void {
+        alloc.free(self.name);
+        for (self.inputs) |*p| {
+            alloc.free(p.name);
+            alloc.free(p.type);
+        }
+        alloc.free(self.inputs);
+        for (self.outputs) |*p| {
+            alloc.free(p.name);
+            alloc.free(p.type);
+        }
+        alloc.free(self.outputs);
+        self.* = undefined;
+    }
+
+    /// 返回类型：单个 output 返回其类型，多个返回 "(type1,type2)"，无返回返回 null。
+    pub fn returnType(self: *const AbiFunction, alloc: std.mem.Allocator) ?[]const u8 {
+        if (self.outputs.len == 0) return null;
+        if (self.outputs.len == 1) return self.outputs[0].type;
+        // 多返回值 → 元组
+        var buf: std.ArrayList(u8) = .empty;
+        buf.append(alloc, '(') catch return null;
+        for (self.outputs, 0..) |o, i| {
+            if (i > 0) buf.append(alloc, ',') catch return null;
+            buf.appendSlice(alloc, o.type) catch return null;
+        }
+        buf.append(alloc, ')') catch return null;
+        return buf.toOwnedSlice(alloc) catch null;
+    }
+};
+
 /// ABI 合约定义
 pub const AbiContract = struct {
     events: []AbiEvent,
+    functions: []AbiFunction,
 
     pub fn deinit(self: *AbiContract, alloc: std.mem.Allocator) void {
         for (self.events) |*e| {
             e.deinit(alloc);
         }
         alloc.free(self.events);
+        for (self.functions) |*f| {
+            f.deinit(alloc);
+        }
+        alloc.free(self.functions);
         self.* = undefined;
     }
 
@@ -51,6 +99,16 @@ pub const AbiContract = struct {
         for (self.events) |*e| {
             if (std.mem.eql(u8, e.name, name)) {
                 return e;
+            }
+        }
+        return null;
+    }
+
+    /// 根据函数名（不含参数）查找函数定义（首个匹配，忽略重载）
+    pub fn findFunctionByName(self: *const AbiContract, name: []const u8) ?*const AbiFunction {
+        for (self.functions) |*f| {
+            if (std.mem.eql(u8, f.name, name)) {
+                return f;
             }
         }
         return null;
@@ -78,43 +136,84 @@ pub fn parseAbiJson(alloc: std.mem.Allocator, content: []const u8) !AbiContract 
         }
         events.deinit(alloc);
     }
+    var functions: std.ArrayList(AbiFunction) = .empty;
+    errdefer {
+        for (functions.items) |*f| {
+            f.deinit(alloc);
+        }
+        functions.deinit(alloc);
+    }
 
     const root = parsed.value.array;
     for (root.items) |item| {
         const obj = item.object;
         const type_val = obj.get("type") orelse continue;
-        if (!std.mem.eql(u8, type_val.string, "event")) continue;
+        const type_str = type_val.string;
 
-        const name = obj.get("name").?.string;
+        if (std.mem.eql(u8, type_str, "event")) {
+            const name = obj.get("name").?.string;
 
-        var inputs: std.ArrayList(AbiEventInput) = .empty;
-        errdefer inputs.deinit(alloc);
+            var inputs: std.ArrayList(AbiEventInput) = .empty;
+            errdefer inputs.deinit(alloc);
 
-        const inputs_arr = obj.get("inputs").?.array;
-        for (inputs_arr.items) |inp| {
-            const inp_obj = inp.object;
-            try inputs.append(alloc, .{
-                .name = try alloc.dupe(u8, inp_obj.get("name").?.string),
-                .type = try alloc.dupe(u8, inp_obj.get("type").?.string),
-                .indexed = if (inp_obj.get("indexed")) |v| v.bool else false,
+            const inputs_arr = obj.get("inputs").?.array;
+            for (inputs_arr.items) |inp| {
+                const inp_obj = inp.object;
+                try inputs.append(alloc, .{
+                    .name = try alloc.dupe(u8, inp_obj.get("name").?.string),
+                    .type = try alloc.dupe(u8, inp_obj.get("type").?.string),
+                    .indexed = if (inp_obj.get("indexed")) |v| v.bool else false,
+                });
+            }
+
+            // 计算事件签名：keccak256("EventName(type1,type2,...)")
+            var sig_buf: [256]u8 = undefined;
+            const sig_str = try formatEventSignature(&sig_buf, name, inputs.items);
+            var signature: [32]u8 = undefined;
+            std.crypto.hash.sha3.Keccak256.hash(sig_str, &signature, .{});
+
+            try events.append(alloc, .{
+                .name = try alloc.dupe(u8, name),
+                .inputs = try inputs.toOwnedSlice(alloc),
+                .signature = signature,
+            });
+        } else if (std.mem.eql(u8, type_str, "function")) {
+            // 函数（含返回类型）：contractCall 用它解析 eth_call 返回值
+            const name = obj.get("name").?.string;
+
+            var inputs: std.ArrayList(AbiParam) = .empty;
+            errdefer inputs.deinit(alloc);
+            const inputs_arr = if (obj.get("inputs")) |v| v.array.items else &.{};
+            for (inputs_arr) |inp| {
+                const inp_obj = inp.object;
+                try inputs.append(alloc, .{
+                    .name = if (inp_obj.get("name")) |n| try alloc.dupe(u8, n.string) else try alloc.dupe(u8, ""),
+                    .type = try alloc.dupe(u8, inp_obj.get("type").?.string),
+                });
+            }
+
+            var outputs: std.ArrayList(AbiParam) = .empty;
+            errdefer outputs.deinit(alloc);
+            const outputs_arr = if (obj.get("outputs")) |v| v.array.items else &.{};
+            for (outputs_arr) |out| {
+                const out_obj = out.object;
+                try outputs.append(alloc, .{
+                    .name = if (out_obj.get("name")) |n| try alloc.dupe(u8, n.string) else try alloc.dupe(u8, ""),
+                    .type = try alloc.dupe(u8, out_obj.get("type").?.string),
+                });
+            }
+
+            try functions.append(alloc, .{
+                .name = try alloc.dupe(u8, name),
+                .inputs = try inputs.toOwnedSlice(alloc),
+                .outputs = try outputs.toOwnedSlice(alloc),
             });
         }
-
-        // 计算事件签名：keccak256("EventName(type1,type2,...)")
-        var sig_buf: [256]u8 = undefined;
-        const sig_str = try formatEventSignature(&sig_buf, name, inputs.items);
-        var signature: [32]u8 = undefined;
-        std.crypto.hash.sha3.Keccak256.hash(sig_str, &signature, .{});
-
-        try events.append(alloc, .{
-            .name = try alloc.dupe(u8, name),
-            .inputs = try inputs.toOwnedSlice(alloc),
-            .signature = signature,
-        });
     }
 
     return AbiContract{
         .events = try events.toOwnedSlice(alloc),
+        .functions = try functions.toOwnedSlice(alloc),
     };
 }
 
@@ -514,7 +613,7 @@ test "AbiContract findEventByName and findEventByTopic0" {
         alloc.free(events);
     }
 
-    const contract = AbiContract{ .events = events };
+    const contract = AbiContract{ .events = events, .functions = &.{} };
 
     try std.testing.expect(contract.findEventByName("Transfer") != null);
     try std.testing.expect(contract.findEventByName("Approval") != null);
@@ -665,4 +764,30 @@ test "decodeCallResult bool" {
     const f = try decodeCallResult(alloc, "bool", "0x0000000000000000000000000000000000000000000000000000000000000000");
     defer alloc.free(f);
     try std.testing.expectEqualStrings("false", f);
+}
+
+test "parseAbiJson 解析 function 与 returnType" {
+    const alloc = std.testing.allocator;
+    const json =
+        \\[
+        \\  {"type":"function","name":"balanceOf","inputs":[{"name":"","type":"address"}],"outputs":[{"name":"","type":"uint256"}]},
+        \\  {"type":"function","name":"getPair","inputs":[],"outputs":[{"name":"a","type":"uint256"},{"name":"b","type":"address"}]},
+        \\  {"type":"event","name":"Transfer","inputs":[],"anonymous":false}
+        \\]
+    ;
+    var contract = try parseAbiJson(alloc, json);
+    defer contract.deinit(alloc);
+
+    // 单返回值：直接返回类型
+    const bal = contract.findFunctionByName("balanceOf").?;
+    try std.testing.expectEqualStrings("uint256", bal.returnType(alloc).?);
+
+    // 多返回值：tuple 类型（heap 分配）
+    const gp = contract.findFunctionByName("getPair").?;
+    const t = gp.returnType(alloc).?;
+    defer alloc.free(t);
+    try std.testing.expectEqualStrings("(uint256,address)", t);
+
+    // 事件仍正常解析
+    try std.testing.expect(contract.findEventByName("Transfer") != null);
 }

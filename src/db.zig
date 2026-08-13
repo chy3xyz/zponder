@@ -1958,7 +1958,7 @@ test "db event table insert and query" {
     var events = try alloc.alloc(abi.AbiEvent, 1);
     events[0] = test_evt;
     defer alloc.free(events);
-    const test_contract = abi.AbiContract{ .events = events };
+    const test_contract = abi.AbiContract{ .events = events, .functions = &.{} };
     try client.autoMigrateContract("test", &test_contract, &.{"Transfer"});
     const fields = &.{ DecodedField{ .name = "from", .value = "0x1111" }, DecodedField{ .name = "to", .value = "0x2222" }, DecodedField{ .name = "value", .value = "0x64" } };
     try client.insertEventLog("test", "Transfer", fields, 100, "0xtxhash", 0);
@@ -1994,7 +1994,7 @@ test "db rollbackFromBlock" {
     var events = try alloc.alloc(abi.AbiEvent, 1);
     events[0] = test_evt;
     defer alloc.free(events);
-    const test_contract = abi.AbiContract{ .events = events };
+    const test_contract = abi.AbiContract{ .events = events, .functions = &.{} };
     try client.autoMigrateContract("test", &test_contract, &.{"Transfer"});
     try client.createSnapshot(.{ .contract_address = "0xabc", .block_number = 100, .snapshot_data = "{}" });
     try client.createSnapshot(.{ .contract_address = "0xabc", .block_number = 200, .snapshot_data = "{}" });
@@ -2051,7 +2051,7 @@ test "db deleteEventLogsInRange" {
     var events = try alloc.alloc(abi.AbiEvent, 1);
     events[0] = test_evt;
     defer alloc.free(events);
-    const test_contract = abi.AbiContract{ .events = events };
+    const test_contract = abi.AbiContract{ .events = events, .functions = &.{} };
     try client.autoMigrateContract("test", &test_contract, &.{"Transfer"});
     const f = &.{ DecodedField{ .name = "from", .value = "0x1111" }, DecodedField{ .name = "to", .value = "0x2222" }, DecodedField{ .name = "value", .value = "0x64" } };
     try client.insertEventLog("test", "Transfer", f, 100, "0xtx1", 0);

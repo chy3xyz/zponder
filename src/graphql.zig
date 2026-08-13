@@ -419,10 +419,12 @@ fn attachResolvers(schema_def: *zg.schema.Schema) void {
                     return zg.Value.fromNull(alloc);
                 }
 
-                // Find the contract's address
+                // Find the contract's address + indexer (for ABI return-type lookup)
+                var contract_idx: ?*indexer.Indexer = null;
                 var contract_addr: ?[]const u8 = null;
                 for (c.indexers) |idx| {
                     if (std.mem.eql(u8, idx.contract.name, contract_name)) {
+                        contract_idx = idx;
                         contract_addr = idx.contract.address;
                         break;
                     }
@@ -473,8 +475,22 @@ fn attachResolvers(schema_def: *zg.schema.Schema) void {
                 };
                 defer alloc.free(result_hex);
 
-                // Decode result: extract return type from method signature
-                const return_type = extractReturnType(method);
+                // Decode result: look up the real return type from the contract ABI
+                // (fallback to "uint256" for unknown/constructor-style signatures).
+                const paren = std.mem.indexOfScalar(u8, method, '(') orelse method.len;
+                const method_name = method[0..paren];
+                const fn_def = if (contract_idx) |idx|
+                    if (idx.abi_contract) |*ac| ac.findFunctionByName(method_name) else null
+                else
+                    null;
+                const return_type: []const u8 = if (fn_def) |f|
+                    (f.returnType(alloc) orelse "uint256")
+                else
+                    "uint256";
+                // returnType 在多返回值时返回堆上 tuple，需释放（单返回值指向 ABI slice）
+                defer if (fn_def) |f| {
+                    if (f.outputs.len > 1) alloc.free(return_type);
+                };
                 const decoded = try abi.decodeCallResult(alloc, return_type, result_hex);
                 defer alloc.free(decoded);
 
@@ -498,13 +514,6 @@ fn isValidMethodSignature(sig: []const u8) bool {
     return true;
 }
 
-fn extractReturnType(method: []const u8) []const u8 {
-    _ = method;
-    // Simplified: return types are not part of the selector.
-    // Default to "uint256" for numeric methods, "bytes32" otherwise.
-    return "uint256";
-}
-
 // ============================================================================
 // Tests
 // ============================================================================
@@ -524,9 +533,6 @@ test "graphql: 纯函数校验逻辑" {
     try std.testing.expect(!isValidMethodSignature(""));
     try std.testing.expect(!isValidMethodSignature("balanceOf(address); DROP TABLE x"));
     try std.testing.expect(!isValidMethodSignature("balanceOf(address) OR 1=1"));
-
-    // extractReturnType — 目前简化为固定返回 uint256
-    try std.testing.expect(std.mem.eql(u8, extractReturnType("balanceOf(address)"), "uint256"));
 }
 
 test "graphql: schema 构建与 resolver 挂载" {
