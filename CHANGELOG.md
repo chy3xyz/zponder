@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-08-13
+
+### Added
+- **`ponder.http` 完整框架**（Hono 风格自定义 HTTP 端点，在 JS handler 内定义）：
+  - `get/post/put/delete` 路由，`use` 中间件洋葱模型（`next()` 前进）
+  - `c.req.param/query/body`、`c.json/c.text`、`c.status/c.header`
+  - handler 异常返回 500（含错误信息），Content-Type 区分 JSON/文本
+- **业务示例**：DEX Swap 价格、ERC20 鲸鱼、NFT 追踪、自定义 API + middleware 鉴权
+  （`examples/handlers/`），文档与实现 API 完全对齐。
+
+### Fixed
+- `jsUndefined` 返回 int 0 而非 undefined，破坏 `=== undefined` 判断。
+- `event_bus.Event.clone` OOM 时泄漏已 dupe 的前序字段/名称。
+
 ## [0.7.0] - 2026-08-13
 
 ### Added
