@@ -18,7 +18,7 @@ pub const HttpRoute = struct {
     handler: c.JSValue,
 };
 
-pub const HttpMethod = enum { get, post };
+pub const HttpMethod = enum { get, post, put, delete };
 
 pub const ContentType = enum { json, text };
 
@@ -26,6 +26,8 @@ pub const ContentType = enum { json, text };
 pub const HttpResponse = struct {
     body: []u8,
     content_type: ContentType,
+    status: u16 = 200,
+    headers: std.ArrayList([]const u8) = .empty,
 };
 
 /// HTTP 请求上下文（供 c.req.param/query/body 回调读取）
@@ -33,6 +35,15 @@ const HttpRequestCtx = struct {
     params: std.StringHashMap([]const u8),
     query: std.StringHashMap([]const u8),
     body: []const u8,
+};
+
+/// middleware 分发上下文（handleHttpRequest 期间有效）
+const DispatchCtx = struct {
+    c_obj: c.JSValue,
+    next_fn: c.JSValue,
+    middlewares: []const c.JSValue,
+    final_handler: c.JSValue,
+    index: usize,
 };
 
 pub const JsEngine = struct {
@@ -44,10 +55,18 @@ pub const JsEngine = struct {
     handlers: std.StringHashMap(c.JSValue),
     // ponder.http 路由表
     http_routes: std.ArrayList(HttpRoute),
+    // ponder.http middleware 链（use 注册）
+    http_middlewares: std.ArrayList(c.JSValue),
     // 当前 HTTP 请求上下文（handleHttpRequest 期间有效，供 C 回调读取）
     current_req: ?*const HttpRequestCtx = null,
-    // 当前响应的 content type（c.json/c.text 回调设置）
+    // 当前 middleware 分发上下文
+    dispatch_ctx: ?*DispatchCtx = null,
+    // 当前响应的 content type / status / headers（c.json/c.text/c.status/c.header 设置）
     current_content_type: ContentType = .json,
+    current_status: u16 = 200,
+    current_headers: std.ArrayList([]const u8) = .empty,
+    // handler 的返回值（middleware 链可能不 return，需独立记录）
+    final_response: ?c.JSValue = null,
     // QuickJS runtime 非线程安全；多索引器线程并发触发需串行化
     mutex: std.atomic.Mutex = .unlocked,
 
@@ -66,6 +85,7 @@ pub const JsEngine = struct {
             .ctx = ctx,
             .handlers = std.StringHashMap(c.JSValue).init(alloc),
             .http_routes = .empty,
+            .http_middlewares = .empty,
         };
         // 存 engine 指针供 C 回调取回
         c.JS_SetRuntimeOpaque(rt, engine);
@@ -87,6 +107,11 @@ pub const JsEngine = struct {
             if (self.ctx) |ctx| c.JS_FreeValue(ctx, r.handler);
         }
         self.http_routes.deinit(self.alloc);
+        // 释放 middleware
+        for (self.http_middlewares.items) |*m| {
+            if (self.ctx) |ctx| c.JS_FreeValue(ctx, m.*);
+        }
+        self.http_middlewares.deinit(self.alloc);
         if (self.ctx) |ctx| c.JS_FreeContext(ctx);
         if (self.rt) |rt| c.JS_FreeRuntime(rt);
         self.alloc.destroy(self);
@@ -102,12 +127,18 @@ pub const JsEngine = struct {
         const on_fn = c.JS_NewCFunction2(ctx, ponderOnCallback, "on", 2, 0, 0);
         _ = c.JS_SetPropertyStr(ctx, ponder, "on", on_fn);
 
-        // ponder.http（Hono-like 最小实现）：.get/.post(path, handler)
+        // ponder.http（Hono-like）：.use/.get/.post/.put/.delete(path, handler)
         const http_obj = c.JS_NewObject(ctx);
+        const use_fn = c.JS_NewCFunction2(ctx, httpUseCallback, "use", 1, 0, 0);
         const get_fn = c.JS_NewCFunction2(ctx, httpGetCallback, "get", 2, 0, 0);
         const post_fn = c.JS_NewCFunction2(ctx, httpPostCallback, "post", 2, 0, 0);
+        const put_fn = c.JS_NewCFunction2(ctx, httpPutCallback, "put", 2, 0, 0);
+        const del_fn = c.JS_NewCFunction2(ctx, httpDeleteCallback, "delete", 2, 0, 0);
+        _ = c.JS_SetPropertyStr(ctx, http_obj, "use", use_fn);
         _ = c.JS_SetPropertyStr(ctx, http_obj, "get", get_fn);
         _ = c.JS_SetPropertyStr(ctx, http_obj, "post", post_fn);
+        _ = c.JS_SetPropertyStr(ctx, http_obj, "put", put_fn);
+        _ = c.JS_SetPropertyStr(ctx, http_obj, "delete", del_fn);
         _ = c.JS_SetPropertyStr(ctx, ponder, "http", http_obj);
 
         _ = c.JS_SetPropertyStr(ctx, global, "ponder", ponder);
@@ -140,6 +171,74 @@ pub const JsEngine = struct {
     /// ponder.http.post(path, handler) 回调
     fn httpPostCallback(ctx: ?*c.JSContext, _: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
         return httpRouteCallback(ctx, argc, argv, .post);
+    }
+
+    /// ponder.http.put(path, handler) 回调
+    fn httpPutCallback(ctx: ?*c.JSContext, _: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+        return httpRouteCallback(ctx, argc, argv, .put);
+    }
+
+    /// ponder.http.delete(path, handler) 回调
+    fn httpDeleteCallback(ctx: ?*c.JSContext, _: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+        return httpRouteCallback(ctx, argc, argv, .delete);
+    }
+
+    /// ponder.http.use(middleware) 回调
+    fn httpUseCallback(ctx: ?*c.JSContext, _: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+        if (argc < 1) return jsUndefined(ctx);
+        const rt = c.JS_GetRuntime(ctx);
+        const engine = @as(*JsEngine, @ptrCast(@alignCast(c.JS_GetRuntimeOpaque(rt) orelse return jsUndefined(ctx))));
+        const mw = argv[0];
+        if (!c.JS_IsFunction(ctx, mw)) return jsUndefined(ctx);
+        engine.http_middlewares.append(engine.alloc, c.JS_DupValue(ctx, mw)) catch {};
+        return jsUndefined(ctx);
+    }
+
+    /// next()：middleware 洋葱模型，前进到下一个处理器
+    fn nextCallback(ctx: ?*c.JSContext, this_val: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+        _ = argc;
+        _ = argv;
+        const rt = c.JS_GetRuntime(ctx);
+        const engine = @as(*JsEngine, @ptrCast(@alignCast(c.JS_GetRuntimeOpaque(rt) orelse return jsUndefined(ctx))));
+        const d = engine.dispatch_ctx orelse return jsUndefined(ctx);
+        d.index += 1;
+        if (d.index < d.middlewares.len) {
+            var args = [_]c.JSValue{ d.c_obj, d.next_fn };
+            return c.JS_Call(ctx, d.middlewares[d.index], this_val, 2, &args);
+        }
+        // 最终 handler：记录返回值（middleware 可能不 return，需独立传递）
+        var harg = [_]c.JSValue{d.c_obj};
+        const r = c.JS_Call(ctx, d.final_handler, this_val, 1, &harg);
+        if (engine.final_response) |fr| c.JS_FreeValue(ctx, fr);
+        engine.final_response = c.JS_DupValue(ctx, r);
+        return r;
+    }
+
+    /// c.status(code)：设置响应状态码
+    fn cStatusCallback(ctx: ?*c.JSContext, _: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+        const rt = c.JS_GetRuntime(ctx);
+        const engine = @as(*JsEngine, @ptrCast(@alignCast(c.JS_GetRuntimeOpaque(rt) orelse return jsUndefined(ctx))));
+        if (argc >= 1) {
+            var code: i32 = 0;
+            if (c.JS_ToInt32(ctx, &code, argv[0]) == 0 and code > 0 and code < 600) {
+                engine.current_status = @intCast(code);
+            }
+        }
+        return jsUndefined(ctx);
+    }
+
+    /// c.header(name, value)：设置响应头
+    fn cHeaderCallback(ctx: ?*c.JSContext, _: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+        if (argc < 2) return jsUndefined(ctx);
+        const rt = c.JS_GetRuntime(ctx);
+        const engine = @as(*JsEngine, @ptrCast(@alignCast(c.JS_GetRuntimeOpaque(rt) orelse return jsUndefined(ctx))));
+        const name_cstr = c.JS_ToCString(ctx, argv[0]) orelse return jsUndefined(ctx);
+        defer c.JS_FreeCString(ctx, name_cstr);
+        const val_cstr = c.JS_ToCString(ctx, argv[1]) orelse return jsUndefined(ctx);
+        defer c.JS_FreeCString(ctx, val_cstr);
+        engine.current_headers.append(engine.alloc, engine.alloc.dupe(u8, std.mem.span(name_cstr)) catch return jsUndefined(ctx)) catch return jsUndefined(ctx);
+        engine.current_headers.append(engine.alloc, engine.alloc.dupe(u8, std.mem.span(val_cstr)) catch return jsUndefined(ctx)) catch return jsUndefined(ctx);
+        return jsUndefined(ctx);
     }
 
     fn httpRouteCallback(ctx: ?*c.JSContext, argc: c_int, argv: [*c]c.JSValue, method: HttpMethod) c.JSValue {
@@ -350,16 +449,49 @@ pub const JsEngine = struct {
         _ = c.JS_SetPropertyStr(ctx, c_obj, "req", req_obj);
         const json_fn = c.JS_NewCFunction2(ctx, cJsonCallback, "json", 1, 0, 0);
         const text_fn = c.JS_NewCFunction2(ctx, cTextCallback, "text", 1, 0, 0);
+        const status_fn = c.JS_NewCFunction2(ctx, cStatusCallback, "status", 1, 0, 0);
+        const header_fn = c.JS_NewCFunction2(ctx, cHeaderCallback, "header", 2, 0, 0);
         _ = c.JS_SetPropertyStr(ctx, c_obj, "json", json_fn);
         _ = c.JS_SetPropertyStr(ctx, c_obj, "text", text_fn);
+        _ = c.JS_SetPropertyStr(ctx, c_obj, "status", status_fn);
+        _ = c.JS_SetPropertyStr(ctx, c_obj, "header", header_fn);
 
         // 设置当前请求上下文（供 c.req.param/query/body 回调读取）
         var req_ctx = HttpRequestCtx{ .params = params, .query = query, .body = req_body };
         self.current_req = &req_ctx;
         defer self.current_req = null;
+        // 重置响应状态（每请求独立）
+        self.current_content_type = .json;
+        self.current_status = 200;
+        for (self.current_headers.items) |h| self.alloc.free(h);
+        self.current_headers.clearRetainingCapacity();
 
-        // 调用 handler(c)
-        const result = c.JS_Call(ctx, route.handler, jsUndefined(ctx), 1, &c_obj);
+        // middleware 洋葱链：use 注册的中间件依次执行，next() 前进
+        const next_fn = c.JS_NewCFunction2(ctx, nextCallback, "next", 0, 0, 0);
+        defer c.JS_FreeValue(ctx, next_fn);
+        var disp = DispatchCtx{
+            .c_obj = c_obj,
+            .next_fn = next_fn,
+            .middlewares = self.http_middlewares.items,
+            .final_handler = route.handler,
+            .index = 0,
+        };
+        self.dispatch_ctx = &disp;
+        defer self.dispatch_ctx = null;
+
+        // 重置最终响应（handler 的返回值独立于 middleware 链传递）
+        if (self.final_response) |fr| c.JS_FreeValue(ctx, fr);
+        self.final_response = null;
+
+        // 调用第一个 middleware（或无 middleware 时直接调 handler）
+        var mw_args = [_]c.JSValue{ c_obj, next_fn };
+        const result = if (disp.middlewares.len > 0)
+            c.JS_Call(ctx, disp.middlewares[0], jsUndefined(ctx), 2, &mw_args)
+        else blk: {
+            const r = c.JS_Call(ctx, disp.final_handler, jsUndefined(ctx), 1, &c_obj);
+            self.final_response = c.JS_DupValue(ctx, r);
+            break :blk r;
+        };
         defer c.JS_FreeValue(ctx, result);
 
         // 驱动 async pending jobs
@@ -370,13 +502,44 @@ pub const JsEngine = struct {
             if (ret <= 0) break;
         }
 
-        if (c.JS_IsException(result)) return null;
+        // 最终响应：handler 的返回值（middleware 可能不 return）
+        const resp_val = self.final_response orelse result;
+
+        if (c.JS_IsException(resp_val)) {
+            // handler 抛异常 → 500
+            const exc = c.JS_GetException(ctx);
+            const exc_cstr = c.JS_ToCString(ctx, exc) orelse null;
+            c.JS_FreeValue(ctx, exc);
+            defer if (exc_cstr) |s| c.JS_FreeCString(ctx, s);
+            const msg_body = if (exc_cstr) |s|
+                (self.alloc.dupe(u8, std.mem.span(s)) catch return null)
+            else
+                (self.alloc.dupe(u8, "Internal Server Error") catch return null);
+            return HttpResponse{
+                .body = msg_body,
+                .content_type = .text,
+                .status = 500,
+                .headers = self.takeCurrentHeaders(),
+            };
+        }
         // 返回值是字符串（c.json/c.text 的结果）或 undefined
-        if (!c.JS_IsString(result)) return null;
-        const body_cstr = c.JS_ToCString(ctx, result) orelse return null;
+        if (!c.JS_IsString(resp_val)) return null;
+        const body_cstr = c.JS_ToCString(ctx, resp_val) orelse return null;
         defer c.JS_FreeCString(ctx, body_cstr);
         const body_dup = self.alloc.dupe(u8, std.mem.span(body_cstr)) catch return null;
-        return HttpResponse{ .body = body_dup, .content_type = self.current_content_type };
+        return HttpResponse{
+            .body = body_dup,
+            .content_type = self.current_content_type,
+            .status = self.current_status,
+            .headers = self.takeCurrentHeaders(),
+        };
+    }
+
+    /// 转移当前响应头到返回值（move 语义，调用者负责 free）
+    fn takeCurrentHeaders(self: *JsEngine) std.ArrayList([]const u8) {
+        const h = self.current_headers;
+        self.current_headers = .empty;
+        return h;
     }
 
     fn matchRoute(alloc: std.mem.Allocator, routes: []const HttpRoute, method: HttpMethod, path: []const u8, params: *std.StringHashMap([]const u8)) ?*const HttpRoute {
@@ -553,4 +716,71 @@ test "js engine ponder.http c.text 与 body" {
     defer alloc.free(resp.body);
     try std.testing.expectEqual(ContentType.text, resp.content_type);
     try std.testing.expectEqualStrings("hello-body", resp.body);
+}
+
+test "js engine ponder.http middleware 洋葱模型" {
+    const alloc = std.testing.allocator;
+    var engine = try JsEngine.init(alloc, undefined);
+    defer engine.deinit();
+
+    try engine.evalScript(
+        \\var order = [];
+        \\ponder.http.use(function(c, next) { order.push("a1"); next(); order.push("a2"); });
+        \\ponder.http.use(function(c, next) { order.push("b1"); next(); order.push("b2"); });
+        \\ponder.http.get("/x", function(c) { order.push("h"); return c.text("ok"); });
+    , "mw.js");
+
+    const resp = engine.handleHttpRequest(.get, "/x", "", "").?;
+    defer alloc.free(resp.body);
+    try std.testing.expectEqualStrings("ok", resp.body);
+
+    // 验证洋葱顺序：a1 -> b1 -> h -> b2 -> a2
+    try engine.evalScript(
+        "if (order.join(',') !== 'a1,b1,h,b2,a2') throw new Error('order=' + order.join(','));",
+        "check.js",
+    );
+}
+
+test "js engine ponder.http status 与 header" {
+    const alloc = std.testing.allocator;
+    var engine = try JsEngine.init(alloc, undefined);
+    defer engine.deinit();
+
+    try engine.evalScript(
+        \\ponder.http.get("/notfound", function(c) {
+        \\  c.status(404);
+        \\  c.header("X-Custom", "yes");
+        \\  return c.json({ error: "nope" });
+        \\});
+    , "routes.js");
+
+    var resp = engine.handleHttpRequest(.get, "/notfound", "", "").?;
+    defer {
+        alloc.free(resp.body);
+        for (resp.headers.items) |h| alloc.free(h);
+        resp.headers.deinit(alloc);
+    }
+    try std.testing.expectEqual(@as(u16, 404), resp.status);
+    try std.testing.expectEqual(@as(usize, 2), resp.headers.items.len);
+    try std.testing.expectEqualStrings("X-Custom", resp.headers.items[0]);
+    try std.testing.expectEqualStrings("yes", resp.headers.items[1]);
+}
+
+test "js engine ponder.http handler 异常返回 500" {
+    const alloc = std.testing.allocator;
+    var engine = try JsEngine.init(alloc, undefined);
+    defer engine.deinit();
+
+    try engine.evalScript(
+        \\ponder.http.get("/boom", function(c) { throw new Error("kaboom"); });
+    , "routes.js");
+
+    var resp = engine.handleHttpRequest(.get, "/boom", "", "").?;
+    defer {
+        alloc.free(resp.body);
+        for (resp.headers.items) |h| alloc.free(h);
+        resp.headers.deinit(alloc);
+    }
+    try std.testing.expectEqual(@as(u16, 500), resp.status);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "kaboom") != null);
 }

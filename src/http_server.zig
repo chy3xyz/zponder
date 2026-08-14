@@ -222,18 +222,20 @@ pub const Server = struct {
         const jm: js_engine.HttpMethod = switch (method) {
             .GET => .get,
             .POST => .post,
+            .PUT => .put,
+            .DELETE => .delete,
             else => return false,
         };
         const qs_idx = std.mem.indexOfScalar(u8, target, '?') orelse target.len;
         const path = target[0..qs_idx];
         const qs = if (qs_idx < target.len) target[qs_idx + 1 ..] else "";
 
-        // 读取请求体（POST 场景传给 JS handler 的 c.req.body()）
+        // 读取请求体（POST/PUT 场景传给 JS handler 的 c.req.body()）
         var body_buf: [4096]u8 = undefined;
         var body_storage: std.ArrayList(u8) = .empty;
         defer body_storage.deinit(self.alloc);
         var req_body: []const u8 = "";
-        if (method == .POST and (request.head.content_length orelse 0) > 0) {
+        if ((method == .POST or method == .PUT) and (request.head.content_length orelse 0) > 0) {
             const body_reader = request.server.reader.bodyReader(&body_buf, request.head.transfer_encoding, request.head.content_length);
             var writer = std.Io.Writer.Allocating.init(self.alloc);
             defer writer.deinit();
@@ -242,19 +244,31 @@ pub const Server = struct {
             req_body = body_storage.items;
         }
 
-        const resp = js.handleHttpRequest(jm, path, qs, req_body) orelse return false;
+        var resp = js.handleHttpRequest(jm, path, qs, req_body) orelse return false;
         defer self.alloc.free(resp.body);
+        defer {
+            for (resp.headers.items) |h| self.alloc.free(h);
+            resp.headers.deinit(self.alloc);
+        }
 
         const content_type = switch (resp.content_type) {
             .json => "application/json; charset=utf-8",
             .text => "text/plain; charset=utf-8",
         };
+
+        // 组装响应头：Content-Type + CORS + 自定义 headers
+        var extra: std.ArrayList(std.http.Header) = .empty;
+        defer extra.deinit(self.alloc);
+        try extra.append(self.alloc, .{ .name = "Content-Type", .value = content_type });
+        try extra.append(self.alloc, .{ .name = "Access-Control-Allow-Origin", .value = self.corsOrigin(request) });
+        var i: usize = 0;
+        while (i + 1 < resp.headers.items.len) : (i += 2) {
+            try extra.append(self.alloc, .{ .name = resp.headers.items[i], .value = resp.headers.items[i + 1] });
+        }
+
         try request.respond(resp.body, .{
-            .status = .ok,
-            .extra_headers = &.{
-                .{ .name = "Content-Type", .value = content_type },
-                .{ .name = "Access-Control-Allow-Origin", .value = self.corsOrigin(request) },
-            },
+            .status = @enumFromInt(resp.status),
+            .extra_headers = extra.items,
         });
         return true;
     }
