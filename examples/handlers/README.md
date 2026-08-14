@@ -1,118 +1,99 @@
-# zponder 动态 Handler 脚本与规则引擎示例
+# zponder Handler 脚本与规则示例
 
-本目录提供了 **zponder 动态 Handler 脚本引擎** 的常见应用示例。
+本目录提供贴近真实业务的 zponder handler 示例，放入 `./handlers/`（或本目录）即自动扫描加载，无需重新编译。
 
-动态 Handler 脚本允许开发者通过 **JSON/JS 规则声明**，在无需重新编译 Zig 代码的前提下，实时过滤、监听链上合约事件，并触发日志告警或异步 HTTP Webhook 推送。
+## 快速落地三步
 
-## JavaScript Handler 脚本示例 (Ponder 风格 API)
+1. 在 `config.toml` 配置合约（name / address / abi_path / events）
+2. 把本目录的示例复制到 `./handlers/`，改合约名与字段
+3. `zponder start -c config.toml`
 
-### 1. DEX 交易价格计算与巨鲸 Webhook 告警 (`swap_handler.js`)
+---
+
+## 一、JavaScript 事件处理器（`ponder.on`）
+
+**当前 API 签名**：
+
 ```javascript
-ponder.on("PancakePair:Swap", async ({ event, context }) => {
-  const { sender, amount0In, amount1Out } = event.args;
-  const in0 = BigInt(amount0In || "0");
-  const out1 = BigInt(amount1Out || "0");
+ponder.on("合约名:事件名", (event) => {
+  const { field1, field2 } = event.args;   // 事件的非 indexed 与 indexed 参数
+  const blockNumber = event.block.number;  // 区块号
+});
+```
 
-  if (in0 > 0n && out1 > 0n) {
-    const price = Number(out1) / Number(in0);
-    console.log(`[DEX Swap] Price: ${price.toFixed(6)}`);
+要点：
+- `event.args` 里 **uint/int 值是 hex 字符串**（如 `"0xde0b6b3a7640000"`），用 `BigInt(...)` 解析
+- `address` 是 `"0x..."` 字符串；`bool` 是 `"true"/"false"`
+- `event.block.number` 是数字
+- 支持 `"Contract:Event"` 全名与 `"Event"` 简写两种匹配
 
-    if (in0 >= 100000000000000000000n) {
-      await context.webhook.post("https://api.telegram.org/botYOUR_KEY/sendMessage", {
-        text: `🚨 巨鲸 Swap 告警: ${sender} 交易了 ${in0 / (10n ** 18n)} Tokens!`
-      });
+### 示例清单
+
+| 文件 | 业务场景 |
+|---|---|
+| `dex_swap_monitor.js` | DEX Swap 价格计算与方向判断（USDC/ETH 交易对） |
+| `erc20_whale_alert.js` | ERC20 大额转账监控、鲸鱼告警、铸币/销毁识别 |
+| `nft_tracker.js` | ERC721 NFT 铸造/交易/销毁追踪 |
+
+---
+
+## 二、Webhook 告警（JSON 规则）
+
+JS handler 侧重「事件处理 + 日志」；**推送到 Telegram/Slack 的 webhook 告警用 JSON 规则**（声明式，无需写代码）：
+
+```json
+[
+  {
+    "contract": "USDC",
+    "event": "Transfer",
+    "field": "value",
+    "op": "gte",
+    "val": "1000000000000",
+    "action": {
+      "type": "webhook",
+      "url": "https://api.telegram.org/botYOUR_TOKEN/sendMessage"
     }
   }
-});
+]
 ```
 
-### 2. ERC-20 代币转账与黑洞销毁追踪 (`erc20_transfer.js`)
+- `op` 支持 `gt` / `gte` / `lt` / `lte` / `eq`
+- `action.type` 支持 `log`（日志）与 `webhook`（HTTP 推送）
+- 参考 `whale_alert.json`、`multi_contract_rules.json`
+
+---
+
+## 三、自定义 HTTP API（`ponder.http`，Hono 风格）
+
 ```javascript
-ponder.on("ERC20:Transfer", async ({ event, context }) => {
-  const { from, to, value } = event.args;
-  const val = BigInt(value || "0");
-
-  if (to === "0x0000000000000000000000000000000000000000") {
-    console.log(`🔥 [Token Burn] ${val / (10n ** 18n)} Tokens 被销毁!`);
-    return;
+// 中间件：鉴权
+ponder.http.use((c, next) => {
+  if (c.req.query("api_key") !== "secret123") {
+    c.status(401);
+    return c.json({ error: "invalid api_key" });
   }
+  next();
+});
 
-  if (val >= 50000n * (10n ** 18n)) {
-    await context.webhook.post("http://127.0.0.1:3000/api/alerts", { from, to, amount: val.toString() });
-  }
+// 路由 + 路径参数 + 响应
+ponder.http.get("/api/wei/:amount", (c) => {
+  const wei = c.req.param("amount");
+  return c.json({ eth: Number(wei) / 1e18 });
+});
+
+ponder.http.post("/api/echo", (c) => {
+  return c.json({ received: c.req.body() });
 });
 ```
 
-### 3. Uniswap V3 流动性池 Swap & SSE 实时推流 (`uniswap_v3.js`)
-```javascript
-ponder.on("UniswapV3Pool:Swap", async ({ event, context }) => {
-  const { tick, liquidity } = event.args;
+完整 API：`get/post/put/delete`、`c.req.param/query/body`、`c.json/c.text`、`c.status/c.header`、`use` 中间件。
+参考 `custom_api.js`。
 
-  context.sse.broadcast({
-    type: "UNISWAP_V3_SWAP",
-    pool: event.log.address,
-    tick: Number(tick),
-    liquidity: liquidity.toString()
-  });
-});
-```
+端点挂在 HTTP 服务（默认 `http://localhost:8080`）上，与内置 REST/GraphQL 共存。
 
 ---
 
-## JSON 规则配置结构说明
+## 说明
 
-单条规则包含以下字段：
-
-| 字段 | 类型 | 说明 | 示例 |
-| :--- | :--- | :--- | :--- |
-| `contract` | `string` | 监听的合约名称，支持通配符 `"*"` 表示所有合约 | `"PancakePair"` / `"*"` |
-| `event` | `string` | 监听的事件名称，支持通配符 `"*"` 表示所有事件 | `"Swap"` / `"Transfer"` |
-| `field` | `string` | 匹配的事件字段名称 | `"amount0In"` / `"value"` |
-| `op` | `string` | 匹配操作符：`"eq"`, `"gt"`, `"gte"`, `"lt"`, `"lte"`, `"always"` | `"gte"` |
-| `val` | `string` | 匹配的目标比较值 | `"1000000000000000000000"` |
-| `action` | `object` | 触发的业务动作，包含 `type` (`"log"` / `"webhook"`) | `{"type": "log", "msg": "..."}` |
-
----
-
-## 示例清单
-
-### 1. DEX 巨鲸交易告警 (`whale_alert.json`)
-监听 PancakeSwap 上的 `Swap` 事件，当单笔交易数值超过阈值时，打印系统高优先告警，并异步发送 Webhook 至 Telegram/Discord Bot。
-
-### 2. 代币转账与销毁监控 (`erc20_transfer_rule.json`)
-监听 BUSD / ERC-20 的 `Transfer` 事件，监控 50,000+ 大额转账，以及发送至 `0x0000...0000` 黑洞地址的销毁 (Burn) 行为。
-
-### 3. 多合约全量规则监控 (`multi_contract_rules.json`)
-展示如何使用 `"*"` 通配符匹配全量链上事件，并向内部 Webhook 接收服务推送结构化 JSON 消息。
-
----
-
-## 在 Zig 中加载运行 Handler 脚本
-
-在主程序启动时，通过 `ScriptEngine` 加载脚本文件：
-
-```zig
-const std = @import("std");
-const zponder = @import("zponder");
-
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const alloc = gpa.allocator();
-    const io = std.Io.getGlobal();
-
-    // 1. 初始化脚本引擎
-    var engine = zponder.script_engine.ScriptEngine.init(alloc, io);
-    defer engine.deinit();
-
-    // 2. 动态加载 handler 脚本
-    try engine.loadScriptFile("examples/handlers/whale_alert.json");
-
-    // 3. 挂载至 Indexer
-    // indexer.setEventCallback(&engine, struct {
-    //     fn cb(ctx: ?*anyopaque, contract: []const u8, event: []const u8, fields: []const zponder.db.DecodedField, block: u64) void {
-    //         const eng: *zponder.script_engine.ScriptEngine = @ptrCast(@alignCast(ctx.?));
-    //         eng.processEvent(contract, event, fields, block);
-    //     }
-    // }.cb);
-}
-```
+- 索引数据查询用内置 **REST**（`/events/:contract/:event`）或 **GraphQL**（`/graphql`）；`ponder.http` 适合自定义轻量接口
+- 实时事件流用 **SSE**（`/stream`）或 **GraphQL Subscription**（`newBlocks`）
