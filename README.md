@@ -38,8 +38,9 @@ and query everything through REST, GraphQL, and SSE — all in one process.
 ### 🚀 Indexing & Scripting
 - **Embedded QuickJS Engine** — native JS runtime for event handlers:
   ```js
-  ponder.on("PancakePair:Swap", async ({ event }) => { /* ... */ });
+  ponder.on("PancakePair:Swap", (event) => { /* event.args, event.block */ });
   ```
+- **Custom HTTP routes** — `ponder.http.get/post/use(...)` define your own API (Hono-style) right in handlers.
 - **Auto Handler Scanning** — drop `.js` / `.json` files into `./handlers/`, they just work.
 - **Multi-Contract Parallel Sync** — threaded per-contract loops with **reorg rollback** safety.
 - **WSS Live Subscribe** — after HTTP catch-up, switch to `eth_subscribe("logs")` and cut RPC cost ([docs/WSS.md](docs/WSS.md)).
@@ -96,20 +97,19 @@ curl -X POST localhost:8081/graphql \
 Drop this in `./handlers/whale_alert.js` — `zponder` picks it up automatically:
 
 ```javascript
-ponder.on("ERC20:Transfer", async ({ event, context }) => {
+ponder.on("ERC20:Transfer", (event) => {
   const { from, to, value } = event.args;
-  const usd = Number(value) / 1e18 * 1800; // ~$1800/ETH
+  // uint 参数是 hex 字符串，用 BigInt 解析；按 18 位小数、$1800/ETH 估算
+  const usd = Number(BigInt(value || "0x0")) / 1e18 * 1800;
 
   if (usd >= 1_000_000) {
-    await context.webhook.post("https://api.telegram.org/botTOKEN/sendMessage", {
-      text: `🐋 Whale: ${from} → ${to} | $${usd.toLocaleString()} @ block ${event.block.number}`
-    });
-    console.log(`Whale alert fired @ #${event.block.number}`);
+    console.log(`🐋 Whale: ${from} → ${to} | $${usd.toLocaleString()} @ block ${event.block.number}`);
   }
 });
 ```
 
-Prefer declarative rules? Use a `.json` rule instead — no code required.
+Prefer declarative rules? Use a `.json` rule instead — no code required (webhook alerts to
+Telegram/Slack are declarative JSON rules). See [`examples/handlers/`](examples/handlers/).
 
 ---
 
