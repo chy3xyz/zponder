@@ -228,13 +228,31 @@ pub const Server = struct {
         const path = target[0..qs_idx];
         const qs = if (qs_idx < target.len) target[qs_idx + 1 ..] else "";
 
-        const body = js.handleHttpRequest(jm, path, qs) orelse return false;
-        defer self.alloc.free(body);
+        // 读取请求体（POST 场景传给 JS handler 的 c.req.body()）
+        var body_buf: [4096]u8 = undefined;
+        var body_storage: std.ArrayList(u8) = .empty;
+        defer body_storage.deinit(self.alloc);
+        var req_body: []const u8 = "";
+        if (method == .POST and (request.head.content_length orelse 0) > 0) {
+            const body_reader = request.server.reader.bodyReader(&body_buf, request.head.transfer_encoding, request.head.content_length);
+            var writer = std.Io.Writer.Allocating.init(self.alloc);
+            defer writer.deinit();
+            _ = body_reader.stream(&writer.writer, std.Io.Limit.limited(10 * 1024 * 1024)) catch 0;
+            body_storage = writer.toArrayList();
+            req_body = body_storage.items;
+        }
 
-        try request.respond(body, .{
+        const resp = js.handleHttpRequest(jm, path, qs, req_body) orelse return false;
+        defer self.alloc.free(resp.body);
+
+        const content_type = switch (resp.content_type) {
+            .json => "application/json; charset=utf-8",
+            .text => "text/plain; charset=utf-8",
+        };
+        try request.respond(resp.body, .{
             .status = .ok,
             .extra_headers = &.{
-                .{ .name = "Content-Type", .value = "application/json; charset=utf-8" },
+                .{ .name = "Content-Type", .value = content_type },
                 .{ .name = "Access-Control-Allow-Origin", .value = self.corsOrigin(request) },
             },
         });

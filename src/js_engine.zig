@@ -20,10 +20,19 @@ pub const HttpRoute = struct {
 
 pub const HttpMethod = enum { get, post };
 
-/// HTTP 请求上下文（供 c.req.param/query 回调读取）
+pub const ContentType = enum { json, text };
+
+/// handleHttpRequest 的响应（body 由调用者 free）
+pub const HttpResponse = struct {
+    body: []u8,
+    content_type: ContentType,
+};
+
+/// HTTP 请求上下文（供 c.req.param/query/body 回调读取）
 const HttpRequestCtx = struct {
     params: std.StringHashMap([]const u8),
     query: std.StringHashMap([]const u8),
+    body: []const u8,
 };
 
 pub const JsEngine = struct {
@@ -37,6 +46,8 @@ pub const JsEngine = struct {
     http_routes: std.ArrayList(HttpRoute),
     // 当前 HTTP 请求上下文（handleHttpRequest 期间有效，供 C 回调读取）
     current_req: ?*const HttpRequestCtx = null,
+    // 当前响应的 content type（c.json/c.text 回调设置）
+    current_content_type: ContentType = .json,
     // QuickJS runtime 非线程安全；多索引器线程并发触发需串行化
     mutex: std.atomic.Mutex = .unlocked,
 
@@ -196,6 +207,10 @@ pub const JsEngine = struct {
 
     /// c.json(obj)：把 obj JSON 序列化后作为响应体返回
     fn cJsonCallback(ctx: ?*c.JSContext, _: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+        const rt = c.JS_GetRuntime(ctx);
+        const engine = @as(*JsEngine, @ptrCast(@alignCast(c.JS_GetRuntimeOpaque(rt) orelse return jsUndefined(ctx))));
+        engine.current_content_type = .json;
+
         const global = c.JS_GetGlobalObject(ctx);
         defer c.JS_FreeValue(ctx, global);
         const json_obj = c.JS_GetPropertyStr(ctx, global, "JSON");
@@ -210,8 +225,24 @@ pub const JsEngine = struct {
 
     /// c.text(str)：直接返回字符串作为响应体
     fn cTextCallback(ctx: ?*c.JSContext, _: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+        const rt = c.JS_GetRuntime(ctx);
+        const engine = @as(*JsEngine, @ptrCast(@alignCast(c.JS_GetRuntimeOpaque(rt) orelse return jsUndefined(ctx))));
+        engine.current_content_type = .text;
+
         if (argc < 1) return jsUndefined(ctx);
         return c.JS_DupValue(ctx, argv[0]);
+    }
+
+    /// c.req.body()：返回请求体字符串
+    fn reqBodyCallback(ctx: ?*c.JSContext, _: c.JSValue, _: c_int, _: [*c]c.JSValue) callconv(.c) c.JSValue {
+        const rt = c.JS_GetRuntime(ctx);
+        const engine = @as(*JsEngine, @ptrCast(@alignCast(c.JS_GetRuntimeOpaque(rt) orelse return jsUndefined(ctx))));
+        if (engine.current_req) |req| {
+            if (req.body.len > 0) {
+                return c.JS_NewStringLen(ctx, req.body.ptr, req.body.len);
+            }
+        }
+        return jsUndefined(ctx);
     }
 
     fn registerHandler(self: *JsEngine, event_name: []const u8, handler_val: c.JSValue) void {
@@ -279,7 +310,7 @@ pub const JsEngine = struct {
 
     /// HTTP 动态路由入口：匹配 ponder.http 注册的路由并执行 handler。
     /// 返回 alloc 的响应体（调用者 free）；null 表示无匹配路由。
-    pub fn handleHttpRequest(self: *JsEngine, method: HttpMethod, path: []const u8, query_string: []const u8) ?[]u8 {
+    pub fn handleHttpRequest(self: *JsEngine, method: HttpMethod, path: []const u8, query_string: []const u8, req_body: []const u8) ?HttpResponse {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
 
@@ -306,22 +337,24 @@ pub const JsEngine = struct {
         }
         parseQueryString(self.alloc, query_string, &query);
 
-        // 构造 c 对象：{ req: { param, query }, json, text }
+        // 构造 c 对象：{ req: { param, query, body }, json, text }
         var c_obj = c.JS_NewObject(ctx);
         defer c.JS_FreeValue(ctx, c_obj);
         const req_obj = c.JS_NewObject(ctx);
         const param_fn = c.JS_NewCFunction2(ctx, reqParamCallback, "param", 1, 0, 0);
         const query_fn = c.JS_NewCFunction2(ctx, reqQueryCallback, "query", 1, 0, 0);
+        const body_fn = c.JS_NewCFunction2(ctx, reqBodyCallback, "body", 0, 0, 0);
         _ = c.JS_SetPropertyStr(ctx, req_obj, "param", param_fn);
         _ = c.JS_SetPropertyStr(ctx, req_obj, "query", query_fn);
+        _ = c.JS_SetPropertyStr(ctx, req_obj, "body", body_fn);
         _ = c.JS_SetPropertyStr(ctx, c_obj, "req", req_obj);
         const json_fn = c.JS_NewCFunction2(ctx, cJsonCallback, "json", 1, 0, 0);
         const text_fn = c.JS_NewCFunction2(ctx, cTextCallback, "text", 1, 0, 0);
         _ = c.JS_SetPropertyStr(ctx, c_obj, "json", json_fn);
         _ = c.JS_SetPropertyStr(ctx, c_obj, "text", text_fn);
 
-        // 设置当前请求上下文（供 c.req.param/query 回调读取）
-        var req_ctx = HttpRequestCtx{ .params = params, .query = query };
+        // 设置当前请求上下文（供 c.req.param/query/body 回调读取）
+        var req_ctx = HttpRequestCtx{ .params = params, .query = query, .body = req_body };
         self.current_req = &req_ctx;
         defer self.current_req = null;
 
@@ -342,7 +375,8 @@ pub const JsEngine = struct {
         if (!c.JS_IsString(result)) return null;
         const body_cstr = c.JS_ToCString(ctx, result) orelse return null;
         defer c.JS_FreeCString(ctx, body_cstr);
-        return self.alloc.dupe(u8, std.mem.span(body_cstr)) catch null;
+        const body_dup = self.alloc.dupe(u8, std.mem.span(body_cstr)) catch return null;
+        return HttpResponse{ .body = body_dup, .content_type = self.current_content_type };
     }
 
     fn matchRoute(alloc: std.mem.Allocator, routes: []const HttpRoute, method: HttpMethod, path: []const u8, params: *std.StringHashMap([]const u8)) ?*const HttpRoute {
@@ -496,25 +530,27 @@ test "js engine ponder.http 动态路由" {
         \\});
     , "routes.js");
 
-    const body = engine.handleHttpRequest(.get, "/api/token/0x123", "name=alice").?;
-    defer alloc.free(body);
-    try std.testing.expect(std.mem.indexOf(u8, body, "0x123") != null);
-    try std.testing.expect(std.mem.indexOf(u8, body, "alice") != null);
+    const resp = engine.handleHttpRequest(.get, "/api/token/0x123", "name=alice", "").?;
+    defer alloc.free(resp.body);
+    try std.testing.expectEqual(ContentType.json, resp.content_type);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "0x123") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "alice") != null);
 
     // 无匹配路由返回 null
-    try std.testing.expect(engine.handleHttpRequest(.get, "/nope", "") == null);
+    try std.testing.expect(engine.handleHttpRequest(.get, "/nope", "", "") == null);
 }
 
-test "js engine ponder.http c.text" {
+test "js engine ponder.http c.text 与 body" {
     const alloc = std.testing.allocator;
     var engine = try JsEngine.init(alloc, undefined);
     defer engine.deinit();
 
     try engine.evalScript(
-        \\ponder.http.post("/ping", function(c) { return c.text("pong"); });
+        \\ponder.http.post("/echo", function(c) { return c.text(c.req.body()); });
     , "routes.js");
 
-    const body = engine.handleHttpRequest(.post, "/ping", "").?;
-    defer alloc.free(body);
-    try std.testing.expectEqualStrings("pong", body);
+    const resp = engine.handleHttpRequest(.post, "/echo", "", "hello-body").?;
+    defer alloc.free(resp.body);
+    try std.testing.expectEqual(ContentType.text, resp.content_type);
+    try std.testing.expectEqualStrings("hello-body", resp.body);
 }
