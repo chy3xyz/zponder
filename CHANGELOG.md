@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `vendor/zgraphql-0.8.0/` 本地路径，规避 GitHub tarball 哈希不稳定导致的重复下载失败。
 - **QuickJS-ng 0.15.1 → 0.17.0**：vendored C 源码整体替换（register-based regexp 引擎、
   多个 UAF/越界修复）；移除残留的 `-DCONFIG_VERSION="0.8.0"` 编译定义（0.17.0 已不使用）。
+- **发布 CI 修复**：改用 Zig 0.17.0 稳定版（旧 dev 构建已从 ziglang.org/builds
+  下架导致 404）；本地依赖在 build.zig.zon 中使用 `.path` 字段（0.17.0 稳定版
+  不接受相对路径 `.url`）。
 
 ## [0.8.0] - 2026-08-13
 
