@@ -53,7 +53,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, arg, "version") or std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--version")) {
             const ver_msg = try std.fmt.allocPrint(alloc,
                 \\zponder v{s} (commit: {s})
-                \\Built with Zig 0.17.0-dev
+                \\Built with Zig 0.17.0
                 \\Features: QuickJS, SQLite, RocksDB, PostgreSQL, GraphQL, Webhook Queue, SSE Streaming, WSS Subscribe
                 \\
             , .{ build_options.version, build_options.git_commit });
