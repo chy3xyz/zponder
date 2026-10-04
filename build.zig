@@ -77,7 +77,7 @@ pub fn build(b: *std.Build) void {
     }
     const c_mod = c_translate.createModule();
 
-    const qjs_flags = &.{ "-D_GNU_SOURCE", "-DCONFIG_VERSION=\"0.8.0\"" };
+    const qjs_flags = &.{"-D_GNU_SOURCE"};
 
     const mod = b.addModule("zponder", .{
         .root_source_file = b.path("src/root.zig"),

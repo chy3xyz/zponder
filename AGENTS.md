@@ -14,7 +14,7 @@
 
 | Item                    | Status       |
 |-------------------------|--------------|
-| `build.zig` + `build.zig.zon` | Complete (embeds QuickJS + zgraphql v0.7.0) |
+| `build.zig` + `build.zig.zon` | Complete (embeds QuickJS-ng v0.17.0 + zgraphql v0.8.0, vendored) |
 | `src/` source files     | 22+ Zig files |
 | `config.toml`           | Complete (`ws_url` / `ws_urls` optional) |
 | Unit tests              | 70+ passing  |
@@ -33,11 +33,11 @@
 
 | Layer              | Technology                                    |
 |--------------------|-----------------------------------------------|
-| Language           | Zig 0.17.0-dev                                |
-| Script Engine      | Native Embedded QuickJS C Runtime             |
+| Language           | Zig 0.17.0                                    |
+| Script Engine      | Native Embedded QuickJS-ng C Runtime (v0.17.0) |
 | Storage            | SQLite (with `read_db` pool) / RocksDB / PostgreSQL |
 | HTTP Server        | `std.http.Server` + `std.Io`                 |
-| GraphQL Engine     | [zgraphql](https://github.com/chy3xyz/zgraphql) v0.7.0 |
+| GraphQL Engine     | [zgraphql](https://github.com/chy3xyz/zgraphql) v0.8.0 (vendored) |
 | RPC Client         | HTTP JSON-RPC failover + optional WSS `eth_subscribe` |
 | Build              | `build.zig` + `build.zig.zon`                 |
 
@@ -63,8 +63,9 @@ zponder/
 │   ├── graphql.zig       # GraphQL API: zgraphql schema, resolvers, rate limiting
 │   ├── abi.zig           # ABI parsing, log decoding, eth_call encode/decode
 │   ├── cache.zig         # Thread-safe LRU cache
+│   ├── quickjs/          # Native C QuickJS-ng engine sources (v0.17.0) embedded
 │   └── root.zig          # Public API re-exports
-├── quickjs/              # Native C QuickJS engine sources embedded
+├── vendor/               # Vendored deps (zgraphql v0.8.0)
 ├── handlers/             # User business handler scripts (.js & .json)
 ├── examples/             # Practical handler examples & documentation
 ├── install.sh            # One-command ReleaseFast binary installer

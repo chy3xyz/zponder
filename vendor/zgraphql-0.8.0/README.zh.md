@@ -1,0 +1,573 @@
+# zgraphql
+
+一个可用于**生产环境**的 **Zig 0.17.0** GraphQL 库，**零外部依赖**。
+
+---
+
+## 目录
+
+- [特性](#特性)
+- [环境要求](#环境要求)
+- [快速开始](#快速开始)
+- [示例](#示例)
+- [核心概念](#核心概念)
+  - [Schema Builder](#schema-builder)
+  - [查询流水线](#查询流水线)
+  - [DataLoader (N+1)](#dataloader-n1)
+  - [异步设计](#异步设计)
+  - [安全](#安全)
+  - [可观测性](#可观测性)
+  - [分布式缓存](#分布式缓存)
+- [租户隔离](#租户隔离)
+- [订阅](#订阅)
+- [架构](#架构)
+- [模块概览](#模块概览)
+- [测试](#测试)
+- [生产就绪度](#生产就绪度)
+- [许可](#许可)
+
+---
+
+## 特性
+
+| 特性 | 说明 |
+|------|------|
+| **零依赖** | 纯 Zig 标准库 |
+| **编译期 Schema** | `comptime` 类型安全的 `SchemaBuilder` DSL |
+| **SDL 解析器** | 运行时解析 `.graphql` schema 文件 |
+| **查询校验** | 字段存在性、类型兼容性、片段循环、变量校验 |
+| **并发执行** | 通过 `std.Io` 纤程实现并行字段解析 |
+| **N+1 防护** | 内置 `DataLoader`，请求级缓存 |
+| **生产服务器** | HTTP + WebSocket (`graphql-ws`)，支持优雅关闭 |
+| **安全** | 深度/复杂度限制、速率限制、CORS、持久化查询 |
+| **可观测性** | 无锁指标、分布式追踪（W3C）、审计日志 |
+| **响应缓存** | 基于 TTL 的内存缓存 |
+| **分布式缓存** | 内置两级缓存（L1 本地 + L2 远程），支持可插拔后端（HTTP、自定义） |
+| **租户隔离** | 支持每个租户独立的 schema 覆盖、速率限制、复杂度限制和查询白名单 |
+| **字段授权** | 基于角色的访问控制 |
+| **Playground** | 内置 GraphQL IDE，地址 `/graphql/playground`（零依赖离线模式 + GraphiQL CDN 模式） |
+
+[英文 README](README.md)
+
+---
+
+## 环境要求
+
+- **Zig 0.17.0**（使用 `std.Io` API）
+
+---
+
+## 快速开始
+
+```zig
+const std = @import("std");
+const zg = @import("zgraphql");
+
+pub fn main() !void {
+    var gpa: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    // 1. 使用编译期 SchemaBuilder 定义 schema
+    const Builder = comptime zg.SchemaBuilder(.{
+        .Query = .{
+            .hello = .{ .type = "String!" },
+        },
+    });
+
+    var schema_def = try Builder.init(allocator);
+    defer schema_def.deinit();
+
+    // 2. 附加 resolver
+    if (schema_def.query_type.kind.object.fields.getPtr("hello")) |field| {
+        field.resolve = struct {
+            fn resolve(_: ?*anyopaque, alloc: std.mem.Allocator, _: zg.Value, _: std.StringHashMap(zg.Value)) anyerror!zg.Value {
+                return zg.Value.fromString(alloc, try alloc.dupe(u8, "world"));
+            }
+        }.resolve;
+    }
+
+    // 3. 解析查询
+    var parser = try zg.Parser.init(allocator, "{ hello }");
+    defer parser.deinit();
+    var doc = try parser.parseDocument();
+    defer doc.deinit();
+
+    // 4. 校验
+    var validator = zg.Validator.init(allocator, &schema_def);
+    defer validator.deinit();
+    const vr = try validator.validate(&doc);
+    if (!vr.isValid()) return error.ValidationFailed;
+
+    // 5. 执行
+    std.debug.print("Query is valid! Ready to execute.\n", .{});
+}
+```
+
+### 类型安全 Schema DSL
+
+如果需要用普通 Zig 类型编写 resolver（而不是上面手动拼接 `Value` 的方式），可以使用 `TypeSafeSchemaBuilder`。它在编译期把 resolver 绑定到 schema，零运行时开销：
+
+```zig
+const AppContext = struct {
+    greeting: []const u8,
+    scale: i64,
+};
+
+const Builder = zg.TypeSafeSchemaBuilder(AppContext, .{
+    .Query = .{
+        .hello = .{
+            .type = "String!",
+            .resolve = struct {
+                fn resolve(ctx: *AppContext, alloc: std.mem.Allocator) anyerror![]const u8 {
+                    return try alloc.dupe(u8, ctx.greeting);
+                }
+            }.resolve,
+        },
+        .double = .{
+            .type = "Int!",
+            .args = .{ .value = .{ .type = "Int!" } },
+            .resolve = struct {
+                const Args = struct { value: i64 };
+                fn resolve(ctx: *AppContext, _: std.mem.Allocator, args: Args) anyerror!i64 {
+                    return args.value * ctx.scale;
+                }
+            }.resolve,
+        },
+    },
+});
+
+var schema_def = try Builder.init(allocator); // 解析 SDL 并绑定所有 resolver
+defer schema_def.deinit();
+```
+
+Resolver 签名：
+- 无参数：`fn(ctx: *Context, allocator) anyerror!ReturnType`
+- 带参数：`fn(ctx: *Context, allocator, args: ArgsStruct) anyerror!ReturnType`
+- 无需上下文时，将上下文类型设为 `void`。
+
+支持的返回类型：字符串、整数、浮点数、布尔值、可选类型、数组和结构体。不支持的类型会在编译期通过 `@compileError` 拒绝。完整的可运行示例见 [`examples/typesafe.zig`](examples/typesafe.zig)。
+
+### 运行 HTTP 服务器
+
+```zig
+var server = zg.GraphQLServer.init(allocator, &schema_def, .{
+    .bind_address = std.Io.net.IpAddress.parseIp4("127.0.0.1", 8080) catch unreachable,
+    .max_query_depth = 20,
+});
+
+const IoBackend = if (@import("builtin").os.tag == .linux) std.Io.Uring else std.Io.Threaded;
+var backend = IoBackend.init(allocator, .{});
+defer backend.deinit();
+
+try server.listen(backend.io());
+```
+
+测试查询：
+```bash
+curl -X POST http://localhost:8080/graphql \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"{ hello }"}'
+```
+
+---
+
+## 示例
+
+```bash
+# 核心流程：构建 Schema -> 解析 -> 校验 -> 内省
+zig build run-basic
+
+# 生产级 HTTP 服务器，包含授权、指标、速率限制和缓存
+zig build run-server
+
+# WebSocket 订阅服务器（graphql-ws 协议）
+zig build run-subscription
+
+# DataLoader N+1 优化演示
+zig build run-dataloader
+```
+
+---
+
+## 核心概念
+
+### Schema Builder
+
+在编译期使用类型安全的方式定义 schema：
+
+```zig
+const Builder = comptime zg.SchemaBuilder(.{
+    .Query = .{
+        .hello = .{ .type = "String!" },
+        .user = .{ .type = "User", .args = .{ .id = .{ .type = "ID!" } } },
+    },
+    .User = .{
+        .name = .{ .type = "String!" },
+        .email = .{ .type = "String" },
+    },
+});
+
+const sdl = Builder.sdl;          // 编译期已知的 SDL 字符串
+var schema_def = try Builder.init(allocator);
+defer schema_def.deinit();
+```
+
+---
+
+### 查询流水线
+
+标准查询生命周期遵循编译器模式：
+
+```
+GraphQL 查询字符串 / SDL
+       |
+       v
+   [词法分析器]  --> 令牌流
+       |
+       v
+   [解析器] --> AST (文档)
+       |
+       v
+ [复杂度分析] --> 深度/复杂度检查
+       |
+       v
+ [校验器] --> 校验结果
+       |
+       v
+ [执行器] --> Value (含钩子与部分错误)
+       |
+       v
+   [JSON] --> 响应
+```
+
+---
+
+### DataLoader (N+1)
+
+通过批量加载防止 N+1 数据库查询：
+
+```zig
+var dl = zg.DataLoader.init(allocator, io);
+defer dl.deinit();
+
+dl.setBatchLoader(struct {
+    fn batch(ctx: ?*anyopaque, alloc: std.mem.Allocator, keys: []const []const u8) ![]zg.Value {
+        // 例如：SELECT * FROM users WHERE id IN (...)
+        var results = try alloc.alloc(zg.Value, keys.len);
+        // ... 填充结果
+        return results;
+    }
+}.batch, null);
+
+const values = try dl.loadMany(&.{"1", "2", "3"});
+// 后续对 dl.load("1") 的调用直接命中缓存，零次数据库往返
+```
+
+---
+
+### 异步设计
+
+zgraphql 为 Zig 0.17.0 的 `std.Io` 抽象而设计：
+
+- **Resolver** 是普通函数，返回 `Value`，在 `std.Io` 管理的纤程中运行。
+- **并行字段解析** 使用 `Io.Group` 实现结构化并发。
+- **I/O 操作**（数据库、HTTP、文件）通过 `std.Io` 自动让出 — 无需显式 `async/await`。
+- **跨平台**：Linux 用 io_uring，macOS/Windows/BSD 用线程池。
+
+异步 resolver 示例：
+```zig
+fn userResolver(ctx: ?*anyopaque, allocator: std.mem.Allocator, _: zg.Value, args: std.StringHashMap(zg.Value)) !zg.Value {
+    const context: *MyContext = @ptrCast(@alignCast(ctx));
+    const id = args.get("id").?.data.int;
+    // 此数据库调用在 io_uring 上运行，自动让出纤程
+    const user = try context.db.query("SELECT * FROM users WHERE id = ?", .{id}, context.io);
+    return user.toGraphQLValue(allocator);
+}
+```
+
+---
+
+### 安全
+
+#### 查询深度限制
+```zig
+var server = zg.GraphQLServer.init(allocator, &schema_def, .{
+    .max_query_depth = 15,
+});
+```
+
+#### 复杂度分析
+```zig
+const result = zg.ComplexityAnalyzer.analyzeDocument(&doc);
+std.debug.print("depth={d}, complexity={d}\n", .{result.depth, result.complexity});
+```
+
+#### 持久化查询与白名单
+```zig
+var cache = zg.QueryCache.init(allocator);
+defer cache.deinit();
+try cache.store("{ hello }");
+
+var server = zg.GraphQLServer.init(allocator, &schema_def, .{
+    .query_cache = &cache,
+    .enforce_query_whitelist = true,
+});
+```
+
+#### 速率限制
+```zig
+var rate_limiter = zg.RateLimiter.init(allocator, 100, 10);
+var server = zg.GraphQLServer.init(allocator, &schema_def, .{
+    .rate_limiter = &rate_limiter,
+});
+```
+
+#### 请求体大小限制
+```zig
+var server = zg.GraphQLServer.init(allocator, &schema_def, .{
+    .max_body_size = 1024 * 1024, // 1MB
+});
+```
+
+#### 字段级授权
+```zig
+field.required_role = "admin";
+// 执行器在调用 resolver 前检查 `hooks.hasRole()`
+```
+
+---
+
+### 可观测性
+
+#### 指标
+```zig
+var metrics = zg.MetricsCollector.init(allocator);
+defer metrics.deinit();
+
+var server = zg.GraphQLServer.init(allocator, &schema_def, .{
+    .metrics = &metrics,
+});
+
+const snapshot = metrics.snapshot();
+std.debug.print("queries={d}, avg_ms={d:.2}\n", .{ snapshot.queries_total, snapshot.avg_duration_ms });
+// 通过 /graphql/metrics 端点访问
+```
+
+#### 分布式追踪
+```zig
+var tracer = zg.Tracer.init(allocator, io);
+defer tracer.deinit();
+
+var server = zg.GraphQLServer.init(allocator, &schema_def, .{
+    .tracer = &tracer,
+});
+// 支持 W3C traceparent 传播
+```
+
+#### 审计日志
+```zig
+var audit = try zg.AuditLog.init(allocator, io, "/var/log/graphql.jsonl");
+var server = zg.GraphQLServer.init(allocator, &schema_def, .{
+    .audit_log = &audit,
+});
+// 每个请求以 JSON Lines 格式记录
+```
+
+---
+
+### 分布式缓存
+
+zgraphql 包含内置的 `DistributedCache`，用于跨进程/节点缓存：
+
+```zig
+var backend = zg.SimpleMemoryBackend.init(allocator);
+defer backend.deinit();
+
+var dc = zg.DistributedCache.init(
+    allocator,
+    backend.cacheBackend(),
+    "service:graphql:",  // key 前缀
+    &response_cache,     // 可选的 L1 本地缓存
+);
+defer dc.deinit();
+
+var server = zg.GraphQLServer.init(allocator, &schema_def, .{
+    .response_cache = &response_cache,
+    .distributed_cache = &dc,
+});
+```
+
+使用基于 HTTP 的后端（例如 Varnish、自定义缓存代理）：
+
+```zig
+var http_backend = try zg.HttpCacheBackend.init(allocator, "http://cache:8080");
+defer http_backend.deinit();
+
+var dc = zg.DistributedCache.init(
+    allocator,
+    http_backend.cacheBackend(),
+    "service:graphql:",
+    &response_cache,
+);
+```
+
+**自定义后端**：使用你自己的 Redis/Memcached 客户端实现 `CacheBackend` 接口：
+
+```zig
+const my_backend = zg.CacheBackend{
+    .get = myGetFn,
+    .set = mySetFn,
+    .delete = myDeleteFn,
+    .ctx = &my_state,
+};
+```
+
+---
+
+### 租户隔离
+
+多租户部署通过 `TenantManager` 实现：
+
+```zig
+var tm = zg.TenantManager.init(allocator);
+defer tm.deinit();
+
+try tm.register(.{
+    .id = "tenant-a",
+    .max_query_depth = 10,
+    .max_query_complexity = 500,
+    .max_body_size = 512 * 1024,
+    .enforce_query_whitelist = true,
+});
+
+try tm.register(.{
+    .id = "tenant-b",
+    .max_query_depth = 20,
+    .rate_limiter = &tenant_b_limiter,
+});
+
+var server = zg.GraphQLServer.init(allocator, &schema_def, .{
+    .tenant_manager = &tm,
+});
+```
+
+租户从请求头中解析（默认：`X-Tenant-ID`）。如需自定义请求头，请在启动服务器前调用 `tm.setHeaderName("X-Custom-Tenant")`。每个租户可以拥有独立的配置：
+- Schema 覆盖
+- 查询深度 / 复杂度限制
+- 请求体大小限制
+- 速率限制器
+- 查询白名单
+- 角色
+
+---
+
+### 订阅
+
+服务器支持 `graphql-ws` 协议进行实时订阅：
+
+1. 客户端发送 `connection_init`
+2. 服务器回复 `connection_ack`
+3. 客户端发送 `subscribe` 携带 payload
+4. 服务器发送 `next`（结果）然后 `complete`
+
+```javascript
+const ws = new WebSocket('ws://localhost:8080/graphql');
+ws.onopen = () => {
+  ws.send(JSON.stringify({ type: 'connection_init' }));
+  ws.send(JSON.stringify({
+    type: 'subscribe',
+    id: '1',
+    payload: { query: 'subscription { counter }' }
+  }));
+};
+```
+
+查看 `examples/subscription.zig` 获取完整可运行的服务器示例。
+
+---
+
+## 架构
+
+详细架构说明见 [`docs/ARCHITECTURE.zh.md`](docs/ARCHITECTURE.zh.md)。
+
+---
+
+## 模块概览
+
+| 模块 | 说明 |
+|------|------|
+| `value.zig` | GraphQL `Value` 类型及 JSON 序列化 |
+| `lexer.zig` | GraphQL 词法分析器 |
+| `ast.zig` | AST 节点定义 |
+| `parser.zig` | 递归下降解析器 |
+| `schema.zig` | Schema 类型系统 |
+| `schema_builder.zig` | 编译期 `SchemaBuilder` DSL |
+| `schema_parser.zig` | `.graphql` 文件 SDL 解析器 |
+| `validator.zig` | 查询校验器 |
+| `executor.zig` | 查询执行引擎 |
+| `introspection.zig` | `__Schema` 内省 |
+| `complexity.zig` | 查询深度/复杂度分析 |
+| `server.zig` | HTTP/WebSocket 服务器 |
+| `query_cache.zig` | 持久化查询缓存（SHA-256） |
+| `metrics.zig` | 无锁指标收集器 |
+| `dataloader.zig` | 请求级批量加载 |
+| `doc_generator.zig` | 从内省自动生成 Markdown 文档 |
+
+---
+
+## 测试
+
+```bash
+# 运行所有测试（单元 + 集成）
+zig build test
+
+# 仅运行集成测试
+zig build integration-test
+
+# 运行模糊测试
+zig build run-parser-fuzz
+zig build run-json-fuzz
+
+# 运行压力测试（30 秒持续负载）
+zig build run-stress-test
+```
+
+**当前测试状态**：
+| 测试套件 | 状态 |
+|---------|------|
+| 单元测试 | 115/115 通过 |
+| 集成测试 | 4/4 通过 |
+| 解析器模糊测试 | 10,000 轮，零泄漏 |
+| JSON 模糊测试 | 5,000 轮，零泄漏 |
+| 压力测试 | 持续负载下稳定 |
+
+---
+
+## 生产就绪度
+
+**评分：8.5 / 10**
+
+| 维度 | 评分 | 说明 |
+|------|------|------|
+| 测试 | 8/10 | 单元、集成、模糊、压力测试全部通过；OOM 路径与 HTTP 层覆盖仍在完善 |
+| 安全 | 8/10 | 线程安全的查询缓存、泄漏检测分配器、优雅关闭 |
+| 文档 | 8/10 | 双语文档、架构指南、API 参考 |
+| 性能 | 7/10 | 异步 std.Io 执行、L1+L2 缓存、无锁指标 |
+| 功能 | 9/10 | 完整 GraphQL 规范 + 分布式缓存 + 租户隔离 + Playground |
+| 成熟度 | 8/10 | 内置分布式缓存和租户隔离 |
+
+**剩余差距**：
+1. **无内置 Redis 协议** — 提供了 HTTP 缓存后端；原生 Redis RESP 需要自定义 `CacheBackend` 实现。
+2. **OOM 注入测试** — `errdefer` 清理路径尚未在模拟分配失败下验证。
+3. **HTTP 层测试** — 服务器请求处理、WebSocket 升级和 CORS 路径缺少直接单元测试。
+
+部署指南见 [`docs/DEPLOYMENT.zh.md`](docs/DEPLOYMENT.zh.md)。
+
+API 速查见 [`docs/API.zh.md`](docs/API.zh.md)。
+
+---
+
+## 许可
+
+MIT License
