@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.1] - 2026-10-04
+
+### Changed
+- **zgraphql 0.7.0 → 0.8.0**：并发 sibling-field 执行（无 API 变更）；改为 vendor 到
+  `vendor/zgraphql-0.8.0/` 本地路径，规避 GitHub tarball 哈希不稳定导致的重复下载失败。
+- **QuickJS-ng 0.15.1 → 0.17.0**：vendored C 源码整体替换（register-based regexp 引擎、
+  多个 UAF/越界修复）；移除残留的 `-DCONFIG_VERSION="0.8.0"` 编译定义（0.17.0 已不使用）。
+
 ## [0.8.0] - 2026-08-13
 
 ### Added
