@@ -5,12 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.2] - 2026-10-05
 
 ### Changed
 - zgraphql 依赖引用改为 **`git+https` URL 直连**（build.zig.zon 内
   `#fa62443…` commit 锁定 + 内容哈希校验），取代拷贝式 vendor 目录与
-  git submodule；`zig fetch` 原生支持，clone 无需 `--recursive`。
+  git submodule；`zig fetch` 原生支持，clone 无需 `--recursive`，
+  发布 CI 无需 `submodules: true`。
 
 ## [0.8.1] - 2026-10-04
 
