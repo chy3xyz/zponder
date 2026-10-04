@@ -8,9 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
-- zgraphql 依赖引用改为 **git submodule**（`vendor/zgraphql`，pinned v0.8.0），
-  取代拷贝式 vendor 目录；clone 须 `git clone --recursive`，发布 CI 已开启
-  `submodules: true`。
+- zgraphql 依赖引用改为 **`git+https` URL 直连**（build.zig.zon 内
+  `#fa62443…` commit 锁定 + 内容哈希校验），取代拷贝式 vendor 目录与
+  git submodule；`zig fetch` 原生支持，clone 无需 `--recursive`。
 
 ## [0.8.1] - 2026-10-04
 

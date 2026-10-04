@@ -5,7 +5,8 @@
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .zgraphql = .{
-            .path = "vendor/zgraphql",
+            .url = "git+https://github.com/chy3xyz/zgraphql#fa6244327b4e4d051f78dc78f4684b0487d6fbf4",
+            .hash = "zgraphql-0.8.0-bxNFFjPQCQCJc9-ZnSuObVDwCgYb2sjqSlgu4jsk7LKF",
         },
     },
     .paths = .{
