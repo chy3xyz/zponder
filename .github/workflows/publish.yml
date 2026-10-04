@@ -28,6 +28,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
 
       # mlugg/setup-zig 曾因 mirror 404/503 导致 "Unable to locate executable file: zig"
       # （v0.6.0 / v0.4.0 发布失败根因），改为从 ziglang.org 官方源直接下载。

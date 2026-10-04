@@ -1,0 +1,3 @@
+[submodule "vendor/zgraphql"]
+	path = vendor/zgraphql
+	url = https://github.com/chy3xyz/zgraphql.git

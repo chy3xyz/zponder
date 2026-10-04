@@ -65,7 +65,7 @@ zponder/
 │   ├── cache.zig         # Thread-safe LRU cache
 │   ├── quickjs/          # Native C QuickJS-ng engine sources (v0.17.0) embedded
 │   └── root.zig          # Public API re-exports
-├── vendor/               # Vendored deps (zgraphql v0.8.0)
+├── vendor/zgraphql/      # zgraphql 依赖（git submodule，pinned v0.8.0）
 ├── handlers/             # User business handler scripts (.js & .json)
 ├── examples/             # Practical handler examples & documentation
 ├── install.sh            # One-command ReleaseFast binary installer
