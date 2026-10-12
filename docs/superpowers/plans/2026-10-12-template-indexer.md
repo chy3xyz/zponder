@@ -619,8 +619,16 @@ git commit -m "feat: 新增 [[templates]] 配置段"
 ## Task 7: Indexer 模板模式（地址集合 + 补扫）
 
 **Files:**
-- Modify: `src/indexer.zig`（结构体字段 + `setTemplateMode`/`addTemplateAddress` + `syncRange`/`processLog` 分支）
+- Modify: `src/indexer.zig`（结构体字段 + `setTemplateMode`/`discoverAddress` + `syncRange`/`processLog` 分支）
+- Modify: `src/main.zig`（模板索引器装配在 Task 8，本任务允许只加必要的 setter）
 - Test: `src/indexer.zig`
+
+**来自前序任务评审的携转约束（必须满足，逐条有测试或断言）**：
+1. **地址集合为空时不得发起 RPC**：`LogFilter.addresses` 为空集合时序列化为 `"address":null`，语义等于"不过滤地址"——若模板模式在集合为空时照常请求，`eth_getLogs` 会返回该区块范围内**全部**合约的日志（放大面极大）。必须在构造层拦截（`if (template_set.all().len == 0 and 本次无补扫地址) return;`），并加一条单测/显式断言覆盖。
+2. **RocksDB 后端快速失败**：`template_addresses` 的四个方法在 RocksDB 一律 `error.UnsupportedOperation`；若启动时在 RocksDB 后端配了模板，必须在**启动期**报错退出（写入 Task 8 的启动校验），不得等到"发现第一个 clone 时才炸"。
+3. **地址大小写必须在单一位置归一化**：`template_addresses` 主键是精确 `TEXT` 比较（`0xAbC` 与 `0xabc` 会各占一行）。统一在 `discoverAddress` 入口按小写（或与 `config.ContractConfig.address` 一致的既有约定）归一化。
+4. **不得依赖同块发现顺序**：`ORDER BY from_block, address` 只保证输出稳定；同块发现的多个 clone 共享 `from_block`，排序退化为字典序且跨后端（SQLite BINARY vs PG locale collation）可能不一致。
+5. **`listTemplateAddresses` 无公开释放辅助**：调用方须逐个 `alloc.free(item.address)` 再 `alloc.free(list)`；测试用 `std.testing.allocator` 会因泄漏失败，别漏。
 
 **Interfaces:**
 - Consumes: Task 1/3/4/5（表结构、地址过滤、`template_addresses`、地址数组）
