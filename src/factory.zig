@@ -305,6 +305,7 @@ fn testFactoryConfig(template_name: []const u8) config.FactoryConfig {
         .child_poll_interval_ms = null,
         .child_batch_size = null,
         .template_name = template_name,
+        .from_template = "",
     };
 }
 

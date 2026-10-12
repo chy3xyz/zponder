@@ -140,6 +140,11 @@ pub const FactoryConfig = struct {
     child_poll_interval_ms: ?u32,
     child_batch_size: ?u32,
     template_name: []const u8,
+    /// 发现源是「模板」而不是合约地址时填模板名（与 `address` 恰有其一）：
+    /// 该模板地址集合里的事件会喂给 `template_name` 指向的模板。
+    /// 场景：clone 自己发出 `LiquidityMigrated(pair)` —— pair 地址来自被发现的
+    /// clone，而不是工厂，只有模板事件才能作为发现源。
+    from_template: []const u8,
 
     fn deinit(self: *const FactoryConfig, alloc: std.mem.Allocator) void {
         alloc.free(self.name);
@@ -151,6 +156,7 @@ pub const FactoryConfig = struct {
         for (self.child_events) |e| alloc.free(e);
         alloc.free(self.child_events);
         alloc.free(self.template_name);
+        alloc.free(self.from_template);
     }
 };
 
@@ -726,6 +732,7 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
                     .child_poll_interval_ms = null,
                     .child_batch_size = null,
                     .template_name = try alloc.dupe(u8, ""),
+                    .from_template = try alloc.dupe(u8, ""),
                 };
             } else if (std.mem.eql(u8, section_name, "templates")) {
                 section = .templates;
@@ -781,6 +788,9 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
             } else if (std.mem.eql(u8, key, "template_name")) {
                 if (cf.template_name.len > 0) alloc.free(cf.template_name);
                 cf.template_name = try unquote(alloc, value);
+            } else if (std.mem.eql(u8, key, "from_template")) {
+                if (cf.from_template.len > 0) alloc.free(cf.from_template);
+                cf.from_template = try unquote(alloc, value);
             }
             continue;
         }
@@ -1198,14 +1208,38 @@ pub fn validate(cfg: *const Config) !void {
             log.err("配置错误: 工厂合约名不能为空", .{});
             errors += 1;
         }
-        if (f.address.len == 0) {
-            log.err("配置错误: 工厂合约 {s} 的 address 不能为空", .{f.name});
+        if (f.address.len > 0 and f.from_template.len > 0) {
+            log.err("配置错误: 工厂合约 {s} 的 address 与 from_template 互斥（发现源只能选一种）", .{f.name});
             errors += 1;
-        } else if (hasDuplicateFactoryAddress(cfg, fi)) {
-            // 同一工厂声明两次：main 的关联循环按地址匹配且只留最后一个 factory_idx，
-            // 先配的那个工厂再也不会被喂事件（发现静默停止）
-            log.err("配置错误: 工厂 {s} 的 address {s} 与前面的工厂重复（同一工厂只能声明一次）", .{ f.name, f.address });
+        } else if (f.address.len == 0 and f.from_template.len == 0) {
+            log.err("配置错误: 工厂合约 {s} 必须配置 address 或 from_template 之一作为发现源", .{f.name});
             errors += 1;
+        } else if (f.address.len > 0) {
+            if (hasDuplicateFactoryAddress(cfg, fi)) {
+                // 同一工厂声明两次（同地址）：main 的关联循环会把两条规则都挂到同一个
+                // 索引器上，但两条规则的 creation_event 不同时只有一条会命中 —— 多规则
+                // 请改用 from_template（模板源），或以不同事件拆成不同条目。
+                log.err("配置错误: 工厂 {s} 的 address {s} 与前面的工厂重复（同一合约地址只能声明一次）", .{ f.name, f.address });
+                errors += 1;
+            }
+        } else if (!hasTemplateNamed(cfg, f.from_template)) {
+            log.err("配置错误: 工厂合约 {s} 的 from_template '{s}' 未在 [[templates]] 中定义", .{ f.name, f.from_template });
+            errors += 1;
+        }
+        if (f.from_template.len > 0) {
+            // 模板源只喂模板：否则同一批地址既进模板地址集合、又建逐 clone 子索引器，
+            // 又回到「N 个 clone → N 个索引器」的老问题。
+            if (f.child_abi_path.len > 0) {
+                log.err("配置错误: 工厂合约 {s} 用 from_template 作发现源时不能再配 child_abi_path（模板源只喂模板）", .{f.name});
+                errors += 1;
+            }
+            if (f.template_name.len == 0) {
+                log.err("配置错误: 工厂合约 {s} 的 from_template 必须与 template_name 一起使用（发现到的地址要喂给某个模板）", .{f.name});
+                errors += 1;
+            } else if (std.mem.eql(u8, f.from_template, f.template_name)) {
+                log.err("配置错误: 工厂合约 {s} 的 from_template 与 template_name 相同（自环发现）", .{f.name});
+                errors += 1;
+            }
         }
         if (f.creation_event.len == 0) {
             log.err("配置错误: 工厂合约 {s} 的 creation_event 不能为空", .{f.name});
@@ -1944,6 +1978,114 @@ test "config validate: 重复的工厂 address 被拒" {
     var ok = try loadTemplateFixture(alloc, other, "");
     defer ok.deinit(alloc);
     try validate(&ok);
+}
+
+test "config factories from_template 解析与校验" {
+    const alloc = std.testing.allocator;
+
+    // 第二模板 pair：下面各用例的发现目标（factory_name 指回 pair_disc）
+    const pair_tpl =
+        \\[[templates]]
+        \\name = "pair"
+        \\abi_path = "./abis/pair.abi"
+        \\events = ["Swap"]
+        \\factory_name = "pair_disc"
+        \\from_block = 0
+    ;
+
+    // 1) 合法：发现源是模板（curve 地址集合里的事件）→ 喂给 pair 模板
+    {
+        const disc =
+            \\[[factories]]
+            \\name = "pair_disc"
+            \\from_template = "curve"
+            \\creation_event = "Paired"
+            \\child_address_field = "pair"
+            \\template_name = "pair"
+        ;
+        var cfg = try loadTemplateFixture(alloc, disc, pair_tpl);
+        defer cfg.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 2), cfg.factories.len);
+        try std.testing.expectEqualStrings("curve", cfg.factories[1].from_template);
+        try std.testing.expectEqualStrings("", cfg.factories[1].address);
+        try validate(&cfg);
+    }
+
+    // 2) address 与 from_template 同时配 → 拒
+    {
+        const both =
+            \\[[factories]]
+            \\name = "pair_disc"
+            \\address = "0x2"
+            \\from_template = "curve"
+            \\creation_event = "Paired"
+            \\child_address_field = "pair"
+            \\template_name = "pair"
+        ;
+        var cfg = try loadTemplateFixture(alloc, both, pair_tpl);
+        defer cfg.deinit(alloc);
+        try std.testing.expectError(error.InvalidConfig, validate(&cfg));
+    }
+
+    // 3) 两个都不配 → 拒
+    {
+        const none =
+            \\[[factories]]
+            \\name = "pair_disc"
+            \\creation_event = "Paired"
+            \\child_address_field = "pair"
+            \\template_name = "pair"
+        ;
+        var cfg = try loadTemplateFixture(alloc, none, pair_tpl);
+        defer cfg.deinit(alloc);
+        try std.testing.expectError(error.InvalidConfig, validate(&cfg));
+    }
+
+    // 4) from_template 指向不存在的模板 → 拒
+    {
+        const ghost =
+            \\[[factories]]
+            \\name = "pair_disc"
+            \\from_template = "nope"
+            \\creation_event = "Paired"
+            \\child_address_field = "pair"
+            \\template_name = "pair"
+        ;
+        var cfg = try loadTemplateFixture(alloc, ghost, pair_tpl);
+        defer cfg.deinit(alloc);
+        try std.testing.expectError(error.InvalidConfig, validate(&cfg));
+    }
+
+    // 5) 模板源 + child_abi_path → 拒（模板源只喂模板，不建逐 clone 子索引器）
+    {
+        const with_child_abi =
+            \\[[factories]]
+            \\name = "pair_disc"
+            \\from_template = "curve"
+            \\creation_event = "Paired"
+            \\child_address_field = "pair"
+            \\child_abi_path = "./abis/curve.abi"
+            \\template_name = "pair"
+        ;
+        var cfg = try loadTemplateFixture(alloc, with_child_abi, pair_tpl);
+        defer cfg.deinit(alloc);
+        try std.testing.expectError(error.InvalidConfig, validate(&cfg));
+    }
+
+    // 6) from_template 与 template_name 相同（自环）→ 拒
+    {
+        const self_loop =
+            \\[[factories]]
+            \\name = "pair_disc"
+            \\from_template = "curve"
+            \\creation_event = "Paired"
+            \\child_address_field = "pair"
+            \\template_name = "curve"
+        ;
+        var cfg = try loadTemplateFixture(alloc, self_loop, "");
+        defer cfg.deinit(alloc);
+        try std.testing.expectError(error.InvalidConfig, validate(&cfg));
+    }
 }
 
 test "config templates 解析 max_addresses_per_request（缺省 null，运行期落默认值）" {
