@@ -970,9 +970,9 @@ git commit -m "test: launchpad 多 clone 端到端验收 + 模板模式文档"
 
 ---
 
-## Task 12: 修复本计划执行中发现的三个既有内存缺陷
+## Task 12: 修复本计划执行中发现的四个既有缺陷
 
-这三个缺陷都**不是**本计划引入的，但都由本计划的评审发现，且都在热路径上；合并前应修掉（每个都要有判别测试：修前红、修后绿）。
+这四个缺陷都**不是**本计划引入的，但都由本计划的评审发现，且都在热路径上；合并前应修掉（每个都要有判别测试：修前红、修后绿）。
 
 **Files:**
 - Modify: `src/db.zig`（前两项）
@@ -1000,14 +1000,19 @@ git commit -m "test: launchpad 多 clone 端到端验收 + 模板模式文档"
 修法：让 `child.idx` 的 `contract` 指向**堆上稳定存储**（初始化后把 `&child.contract_config` 回填给 `child.idx.contract`，并确认 `ChildIndexer.deinit` 的释放顺序不会让 `idx` 先于 `contract_config` 失效；注意 `child` 是 `alloc.create` 出来的，地址稳定）。Task 8 的模板路径用堆上 `template_contracts` 规避了同类问题，可作为参照。
 判别测试：一条 `max_children >= 1` 的工厂发现用例，断言子索引器的 `contract.name`/`events` 在 `onFactoryEventInner` 返回后仍可正确读取（例如断言 `child.idx.contract.name` 内容等于 `child_name`、且 `events.len` 正确；更强的做法是断言指针落在堆上而非栈上）。
 
-- [ ] **Step 4: 全量验证与提交**
+- [ ] **Step 4: RocksDB 后端在带地址过滤时不得静默返回全量**（`src/db.zig`，Task 3/9 评审发现）
+
+`queryEventLogsRocks` 忽略 `address`（`_ = address;`），而 Task 9 已把 `?address=` 与 GraphQL `address` 暴露给用户 → RocksDB 后端带地址过滤会**静默返回全部地址的行**（错答而非报错）。修法（二选一，取最小者）：在 `address != null` 时返回 `error.UnsupportedOperation`（与 `template_addresses` 的 RocksDB 行为一致、也与本计划"模板模式不支持 RocksDB"的定位一致），或改 key 布局真正支持（工作量大，非本轮目标）。**选前者**。
+判别测试：RocksDB 后端上 `queryEventLogs(..., address != null, ...)` 断言返回 `error.UnsupportedOperation`；`address == null` 时行为不变。
+
+- [ ] **Step 5: 全量验证与提交**
 
 Run: `zig build test --summary all` → EXIT=0，全部通过
 Run: `zig build -Doptimize=ReleaseSafe` → 通过
 
 ```bash
 git add src/db.zig src/factory.zig
-git commit -m "fix: 修复评审发现的三个既有内存缺陷（PG 悬垂切片/部分填充泄漏/工厂子索引器悬垂配置）"
+git commit -m "fix: 修复评审发现的四个既有缺陷（PG 悬垂切片/部分填充泄漏/工厂子索引器悬垂配置/RocksDB 静默忽略地址过滤）"
 ```
 
 ---
