@@ -31,6 +31,7 @@ pub const EventHookCallback = *const fn (
     fields: []const db.DecodedField,
     block_number: u64,
     block_timestamp: u64,
+    contract_address: []const u8,
 ) void;
 
 /// 模板模式下一个待补扫的 clone：发现区块起，补扫到"探测时的游标"为止。
@@ -1162,7 +1163,10 @@ pub const Indexer = struct {
                     }
                     if (self.event_callback) |cb| {
                         const block_ts = self.resolveBlockTimestamp(lg.block_number);
-                        cb(self.event_callback_ctx, self.contract.name, evt.name, db_fields.items, lg.block_number, block_ts);
+                        // 事件来源地址：模板模式下是该事件所属的 clone；单合约模式下
+                        // getLogs 只过滤 contract.address，故 lg.address 即 contract.address
+                        // （与上方 insertEventLog 的注释同一条不变量），两种模式写法一致。
+                        cb(self.event_callback_ctx, self.contract.name, evt.name, db_fields.items, lg.block_number, block_ts, lg.address);
                     }
                     return;
                 }
@@ -1922,4 +1926,81 @@ test "template 模板模式 API 接线（真实调用，杜绝惰性分析漏编
     idx.setTemplateMode(true);
     try std.testing.expectEqual(@as(u64, 123), idx.getCurrentBlock());
     try std.testing.expectEqual(@as(u64, 123), idx.last_tip.load(.monotonic));
+}
+
+// 事件回调必须携带"日志来源地址"（Task 10 的第一跳）：真实走 processLog 的解码→落库→回调，
+// 断言回调拿到的 contract_address 就是 lg.address（单合约模式下即 contract.address）。
+test "事件回调携带日志来源地址（真实 processLog 路径）" {
+    const alloc = std.testing.allocator;
+    const db_cfg = db.DatabaseConfig{ .db_type = "sqlite", .db_name = ":memory:", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var database = try db.Client.init(alloc, &db_cfg);
+    defer database.deinit();
+    try database.migrate();
+
+    var rpc_cfg = config.RpcConfig{ .url = "", .retry_count = 0, .retry_delay_ms = 0, .request_timeout_ms = 0, .max_concurrent = 0 };
+    var rpc = eth_rpc.Client.init(alloc, undefined, &rpc_cfg);
+    defer rpc.deinit();
+
+    const contract = config.ContractConfig{
+        .name = "curve",
+        .address = "0xSINGLE",
+        .abi_path = "",
+        .from_block = 0,
+        .events = &.{"CurveCreated"},
+        .start_block = null,
+        .block_batch_size = null,
+        .poll_interval_ms = null,
+        .max_reorg_depth = null,
+        .filters = &.{},
+    };
+
+    // 构造 ABI 并建表（所有内存交给 Indexer.deinit 释放，与生产所有权一致）
+    const inputs = try alloc.alloc(abi.AbiEventInput, 1);
+    inputs[0] = .{ .name = try alloc.dupe(u8, "curve"), .type = try alloc.dupe(u8, "uint256"), .indexed = false };
+    const events = try alloc.alloc(abi.AbiEvent, 1);
+    events[0] = .{ .name = try alloc.dupe(u8, "CurveCreated"), .inputs = inputs, .signature = std.mem.zeroes([32]u8) };
+    var ac = abi.AbiContract{ .events = events, .functions = try alloc.alloc(abi.AbiFunction, 0) };
+    try database.autoMigrateContract("curve", &ac, &.{"CurveCreated"}, "0xSINGLE");
+
+    var idx = testIndexerWithDb(alloc, &database, &rpc, &contract);
+    defer idx.deinit();
+    idx.abi_contract = ac;
+
+    var seen_addr: ?[]const u8 = null;
+    var seen_event: ?[]const u8 = null;
+    const Ctx = struct {
+        addr: *?[]const u8,
+        event: *?[]const u8,
+        fn cb(ctx: ?*anyopaque, _: []const u8, event_name: []const u8, _: []const db.DecodedField, _: u64, _: u64, contract_address: []const u8) void {
+            const self_ptr: *@This() = @ptrCast(@alignCast(ctx.?));
+            self_ptr.addr.* = contract_address;
+            self_ptr.event.* = event_name;
+        }
+    };
+    var ctx = Ctx{ .addr = &seen_addr, .event = &seen_event };
+    idx.setEventCallback(&ctx, Ctx.cb);
+
+    // topic0 = 全零签名（与上面 events[0].signature 匹配）；data 一个 uint256 word
+    var topic0_buf: [66]u8 = undefined;
+    @memset(&topic0_buf, '0');
+    topic0_buf[0] = '0';
+    topic0_buf[1] = 'x';
+    var data_buf: [66]u8 = undefined;
+    @memset(&data_buf, '0');
+    data_buf[0] = '0';
+    data_buf[1] = 'x';
+    data_buf[65] = '7';
+
+    var topics = [_][]const u8{&topic0_buf};
+    try idx.processLog(.{
+        .address = "0xSINGLE",
+        .topics = &topics,
+        .data = &data_buf,
+        .block_number = 7,
+        .transaction_hash = "0xtx",
+        .log_index = 0,
+    });
+
+    try std.testing.expectEqualStrings("CurveCreated", seen_event.?);
+    try std.testing.expectEqualStrings("0xSINGLE", seen_addr.?);
 }

@@ -121,6 +121,21 @@ fn buildEventCacheKey(
     });
 }
 
+/// 序列化一条 SSE 事件的 `data:` 载荷（不含 `event:` 前缀与结尾空行）。
+/// `contract_address` 与事件表列名一致（REST `/events` 返回的行也是这个键）。
+fn writeSsePayload(w: *std.Io.Writer, ev: *const eb.Event) !void {
+    try w.print("{{\"contract\":\"{s}\",\"contract_address\":\"{s}\",\"block_number\":{d},\"fields\":{{", .{
+        ev.contract_name,
+        ev.contract_address,
+        ev.block_number,
+    });
+    for (ev.fields, 0..) |f, i| {
+        if (i > 0) try w.writeByte(',');
+        try w.print("\"{s}\":\"{s}\"", .{ f.name, f.value });
+    }
+    try w.writeAll("}}");
+}
+
 /// 全局令牌桶速率限制器
 const RateLimiter = struct {
     mutex: std.atomic.Mutex = .unlocked,
@@ -1027,12 +1042,9 @@ pub const Server = struct {
 
             var out: std.Io.Writer.Allocating = .init(self.alloc);
             defer out.deinit();
-            out.writer.print("event: {s}\ndata: {{\"contract\":\"{s}\",\"block_number\":{d},\"fields\":{{", .{ ev.event_name, ev.contract_name, ev.block_number }) catch continue;
-            for (ev.fields, 0..) |f, i| {
-                if (i > 0) out.writer.writeByte(',') catch break;
-                out.writer.print("\"{s}\":\"{s}\"", .{ f.name, f.value }) catch break;
-            }
-            out.writer.writeAll("}}}\n\n") catch continue;
+            out.writer.print("event: {s}\ndata: ", .{ev.event_name}) catch continue;
+            writeSsePayload(&out.writer, &ev) catch continue;
+            out.writer.writeAll("\n\n") catch continue;
 
             bw.writer.writeAll(out.written()) catch break;
             bw.writer.flush() catch break;
@@ -1413,4 +1425,26 @@ test "?address= 解析结果透传到 queryEventLogs" {
 
     try std.testing.expect(std.mem.indexOf(u8, json_str, "0xB") != null);
     try std.testing.expect(std.mem.indexOf(u8, json_str, "0xA") == null);
+}
+
+test "SSE 载荷含 contract_address" {
+    const alloc = std.testing.allocator;
+    const fields = [_]db.DecodedField{ .{ .name = "value", .value = "1" }, .{ .name = "to", .value = "0xBB" } };
+    const ev = eb.Event{
+        .contract_name = "curve",
+        .event_name = "Transfer",
+        .contract_address = "0xCLONE",
+        .block_number = 5,
+        .block_timestamp = 1700000123,
+        .fields = @constCast(&fields),
+    };
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try writeSsePayload(&out.writer, &ev);
+
+    try std.testing.expectEqualStrings(
+        "{\"contract\":\"curve\",\"contract_address\":\"0xCLONE\",\"block_number\":5,\"fields\":{\"value\":\"1\",\"to\":\"0xBB\"}}",
+        out.written(),
+    );
 }
