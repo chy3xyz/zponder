@@ -843,7 +843,9 @@ pub const Client = struct {
         _ = try self.ponderExec(sql, &.{ .{ .text = template }, .{ .text = address }, .{ .integer = @intCast(from_block) } });
     }
 
-    /// 列出模板持有的全部 clone 地址（按 from_block、address 排序）。
+    /// 列出模板持有的全部 clone 地址（按 from_block、address 排序，仅供稳定/可复现输出）。
+    /// 不得据此推断同块内的发现顺序：同块发现的行 from_block 相同，排序退化为地址字典序
+    /// （跨后端 collation 还不一致），也表达不出 log_index。
     /// 内存约定同 getSyncState：返回堆数组，调用方负责释放——
     /// `for (list) |item| alloc.free(item.address);` 之后 `alloc.free(list)`。
     pub fn listTemplateAddresses(self: *Client, template: []const u8) ![]TemplateAddress {
@@ -2647,6 +2649,58 @@ test "db template_addresses 落库失败向上返回" {
     if (client.addTemplateAddress("curve", "0xA", 100)) |_| {
         return error.TestUnexpectedResult;
     } else |_| {}
+}
+
+test "db template_addresses list 分配失败路径不泄漏" {
+    const alloc = std.testing.allocator;
+    const cfg = DatabaseConfig{ .db_type = "sqlite", .db_name = ":memory:", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var client = try Client.init(alloc, &cfg);
+    defer client.deinit();
+    try client.migrate();
+    try client.addTemplateAddress("curve", "0xA", 100);
+    try client.addTemplateAddress("curve", "0xB", 200);
+
+    // 库与数据先用稳定的 testing.allocator 建好，只把 listTemplateAddresses 自身的分配切到
+    // 注入分配器：Client.init / migrate / ponderQuery 里另有既存的 OOM 泄漏点，直接对整条
+    // 调用跑 std.testing.checkAllAllocationFailures 会先撞上它们，无法隔离本函数的 errdefer
+    // （实测见 task-4-report §5）。故只对 listTemplateAddresses 自己的分配点逐个注入。
+
+    // 先数出一次成功调用的分配点数（含 ponderQuery 的开销，仅供定位尾部用）
+    var counter = std.testing.FailingAllocator.init(alloc, .{});
+    client.alloc = counter.allocator();
+    {
+        const list = try client.listTemplateAddresses("curve");
+        freeTemplateAddressList(counter.allocator(), list);
+    }
+    try std.testing.expectEqual(counter.allocated_bytes, counter.freed_bytes);
+    const total = counter.alloc_index;
+
+    // listTemplateAddresses 自己的分配点都在末尾：结果数组 1 次 + 每行一次 address dupe（2 行）
+    const own_alloc_points = 1 + 2;
+    try std.testing.expect(total > own_alloc_points);
+    for (total - own_alloc_points..total) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
+        client.alloc = failing.allocator();
+        try std.testing.expectError(error.OutOfMemory, client.listTemplateAddresses("curve"));
+        // 注入失败后 errdefer 必须释放已填充的 address 与结果数组：分配/释放字节数必须相等
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+}
+
+test "db template_addresses list 列类型漂移的部分填充失败路径" {
+    const alloc = std.testing.allocator;
+    const cfg = DatabaseConfig{ .db_type = "sqlite", .db_name = ":memory:", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var client = try Client.init(alloc, &cfg);
+    defer client.deinit();
+    try client.migrate();
+    try client.addTemplateAddress("curve", "0xA", 100);
+    // backfilled 是 INTEGER 亲和性列，写入非数字文本 'x' 时 SQLite 原样存为 TEXT：
+    // 第二行会在第一行已填充之后命中 switch 的 error.InvalidData 分支
+    _ = try client.ponderExec("INSERT INTO template_addresses (template, address, from_block, backfilled) VALUES ('curve', '0xB', 200, 'x');", &.{});
+
+    try std.testing.expectError(error.InvalidData, client.listTemplateAddresses("curve"));
+    // 该路径上 errdefer 必须释放已填充的 list[0].address 与结果数组；
+    // 若漏掉，std.testing.allocator 会在本测试结束时以泄漏判失败
 }
 
 test "db template_addresses PostgreSQL 后端" {
