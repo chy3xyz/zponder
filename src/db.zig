@@ -1623,22 +1623,27 @@ pub const Client = struct {
 
     /// 老库升级（PG）：补 contract_address 列 + 回填 + 唯一键换成含地址的版本。
     /// 幂等：列与唯一键都已就位时直接返回。
+    /// 作用域一致性：先把表解析成「search_path 可见的那张表」的 schema 限定名，之后探测
+    /// （列 / 唯一约束）与改动（ALTER / UPDATE / DROP / ADD）全用同一个名字——否则同库
+    /// 别 schema 的同名表会被算进来，出现「探测说已就位、改动落空」→ 本表退化成无唯一键。
     fn migrateEventTableAddressPG(self: *Client, contract_name: []const u8, evt: *const abi.AbiEvent, contract_address: []const u8) !void {
         const table = try std.fmt.allocPrint(self.alloc, "event_{s}_{s}", .{ contract_name, evt.name });
         defer self.alloc.free(table);
 
-        // 1) 表不存在：按新结构建（IF NOT EXISTS，随后 createEventTablePG 是空操作）
-        if (!try self.pgTableExists(table)) return self.createEventTablePG(contract_name, evt);
+        // 1) 表不存在（search_path 不可见）：按新结构建（IF NOT EXISTS，随后 createEventTablePG 是空操作）
+        const target = (try self.pgResolveVisibleTable(table)) orelse return self.createEventTablePG(contract_name, evt);
+        defer self.alloc.free(target);
 
-        // 2) 是否已有地址列
+        // 2) 是否已有地址列（限定到同一张表）
         const has_address = blk: {
-            const sql = "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = current_schema() AND lower(table_name) = lower($1) AND column_name = 'contract_address';";
-            var res = try self.pgconn.?.execParams(sql, &.{table});
+            const sql = "SELECT COUNT(*) FROM pg_catalog.pg_attribute WHERE attrelid = $1::regclass AND attname = 'contract_address' AND attnum > 0 AND NOT attisdropped;";
+            var res = try self.pgconn.?.execParams(sql, &.{target});
             defer res.deinit();
             break :blk res.rows() > 0 and !res.isNull(0, 0) and !std.mem.eql(u8, res.get(0, 0), "0");
         };
 
-        // 3) 表上的唯一约束现状：目标是恰好一个含地址的唯一键
+        // 3) 这张表上的唯一约束：目标是含地址三元组那一个；只有形态「正好等于」旧键
+        //    UNIQUE(tx_hash, log_index) 的才允许 DROP，用户自加的其他唯一约束一律不动
         var stale_names: std.ArrayList([]u8) = .empty;
         defer {
             for (stale_names.items) |nm| self.alloc.free(nm);
@@ -1646,14 +1651,15 @@ pub const Client = struct {
         }
         var has_target = false;
         {
-            const sql = "SELECT c.conname, pg_get_constraintdef(c.oid) FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid WHERE lower(t.relname) = lower($1) AND c.contype = 'u';";
-            var res = try self.pgconn.?.execParams(sql, &.{table});
+            const sql = "SELECT c.conname, pg_get_constraintdef(c.oid) FROM pg_catalog.pg_constraint c WHERE c.conrelid = $1::regclass AND c.contype = 'u';";
+            var res = try self.pgconn.?.execParams(sql, &.{target});
             defer res.deinit();
             var i: c_int = 0;
             while (i < res.rows()) : (i += 1) {
-                if (try ddlHasAddressUnique(self.alloc, res.get(i, 1))) {
+                const def = res.get(i, 1);
+                if (try constraintDefEquals(self.alloc, def, "unique(contract_address,tx_hash,log_index)")) {
                     has_target = true;
-                } else {
+                } else if (try constraintDefEquals(self.alloc, def, "unique(tx_hash,log_index)")) {
                     const nm = try self.alloc.dupe(u8, res.get(i, 0));
                     errdefer self.alloc.free(nm);
                     try stale_names.append(self.alloc, nm);
@@ -1666,11 +1672,11 @@ pub const Client = struct {
         errdefer self.pgconn.?.exec("ROLLBACK;") catch {};
 
         if (!has_address) {
-            const add_sql = try std.fmt.allocPrint(self.alloc, "ALTER TABLE {s} ADD COLUMN IF NOT EXISTS contract_address TEXT NOT NULL DEFAULT '';", .{table});
+            const add_sql = try std.fmt.allocPrint(self.alloc, "ALTER TABLE {s} ADD COLUMN IF NOT EXISTS contract_address TEXT NOT NULL DEFAULT '';", .{target});
             defer self.alloc.free(add_sql);
             try self.pgconn.?.exec(add_sql);
             // 老行地址为空串，用本合约地址回填（新行不会命中：插入时已带真实地址）
-            const upd_sql = try std.fmt.allocPrint(self.alloc, "UPDATE {s} SET contract_address = $1 WHERE contract_address = '';", .{table});
+            const upd_sql = try std.fmt.allocPrint(self.alloc, "UPDATE {s} SET contract_address = $1 WHERE contract_address = '';", .{target});
             defer self.alloc.free(upd_sql);
             var res = try self.pgconn.?.execParams(upd_sql, &.{contract_address});
             res.deinit();
@@ -1681,10 +1687,10 @@ pub const Client = struct {
             defer ddl_buf.deinit();
             const w = &ddl_buf.writer;
             for (stale_names.items) |nm| {
-                try w.print("ALTER TABLE {s} DROP CONSTRAINT IF EXISTS \"{s}\";\n", .{ table, nm });
+                try w.print("ALTER TABLE {s} DROP CONSTRAINT IF EXISTS \"{s}\";\n", .{ target, nm });
             }
             if (!has_target) {
-                try w.print("ALTER TABLE {s} ADD CONSTRAINT event_{s}_{s}_addr_uniq UNIQUE (contract_address, tx_hash, log_index);\n", .{ table, contract_name, evt.name });
+                try w.print("ALTER TABLE {s} ADD CONSTRAINT event_{s}_{s}_addr_uniq UNIQUE (contract_address, tx_hash, log_index);\n", .{ target, contract_name, evt.name });
             }
             var list = ddl_buf.toArrayList();
             defer list.deinit(self.alloc);
@@ -1692,14 +1698,23 @@ pub const Client = struct {
         }
 
         try self.pgconn.?.exec("COMMIT;");
-        log.info("事件表 {s} 已迁移（PG）：补 contract_address 列 + 地址唯一键", .{table});
+        log.info("事件表 {s} 已迁移（PG）：补 contract_address 列 + 地址唯一键", .{target});
     }
 
-    fn pgTableExists(self: *Client, table: []const u8) !bool {
-        const sql = "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = current_schema() AND lower(table_name) = lower($1);";
+    /// 把不带 schema 的表名解析成「search_path 可见的那张表」的 schema 限定名
+    /// （= 非限定 `ALTER TABLE event_x` 的解析结果）；不可见则返回 null。
+    fn pgResolveVisibleTable(self: *Client, table: []const u8) !?[]u8 {
+        const sql =
+            \\SELECT pg_catalog.quote_ident(n.nspname) || '.' || pg_catalog.quote_ident(c.relname)
+            \\FROM pg_catalog.pg_class c
+            \\JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+            \\WHERE c.relname = lower($1) AND c.relkind IN ('r', 'p') AND pg_catalog.pg_table_is_visible(c.oid)
+            \\LIMIT 1;
+        ;
         var res = try self.pgconn.?.execParams(sql, &.{table});
         defer res.deinit();
-        return res.rows() > 0 and !res.isNull(0, 0) and !std.mem.eql(u8, res.get(0, 0), "0");
+        if (res.rows() == 0 or res.isNull(0, 0)) return null;
+        return try self.alloc.dupe(u8, res.get(0, 0));
     }
 
     fn createEventTablePG(self: *Client, contract_name: []const u8, evt: *const abi.AbiEvent) !void {
@@ -2399,27 +2414,42 @@ fn columnIndex(cols: []const []u8, name: []const u8) ?usize {
     return null;
 }
 
-/// 建表 DDL / 约束定义里唯一键是否已含地址列。
+/// 建表 DDL 里唯一键是否已含地址列（SQLite：约束内嵌在 CREATE TABLE 语句里，用子串匹配）。
 fn ddlHasAddressUnique(alloc: std.mem.Allocator, ddl: []const u8) !bool {
     return ddlHasUniqueKey(alloc, ddl, "unique(contract_address,tx_hash,log_index)");
 }
 
-/// 建表 DDL / 约束定义里是否还带着 Task 1 之前的唯一键 `UNIQUE(tx_hash, log_index)`。
+/// 建表 DDL 里是否还带着 Task 1 之前的唯一键 `UNIQUE(tx_hash, log_index)`。
 /// 光有地址列还不够：旧键留着会把同 tx 不同合约的事件顶掉。
 fn ddlHasLegacyUnique(alloc: std.mem.Allocator, ddl: []const u8) !bool {
     return ddlHasUniqueKey(alloc, ddl, "unique(tx_hash,log_index)");
 }
 
-/// 去空白 + 转小写后做子串匹配，兼容 `UNIQUE(a, b, c)` 与 `UNIQUE (a,b,c)`。
+/// 子串匹配（用于整条 CREATE TABLE 语句）：去空白 + 转小写，兼容 `UNIQUE(a, b, c)` 与 `UNIQUE (a,b,c)`。
 fn ddlHasUniqueKey(alloc: std.mem.Allocator, ddl: []const u8, needle: []const u8) !bool {
-    var norm: std.ArrayList(u8) = .empty;
-    defer norm.deinit(alloc);
-    try norm.ensureTotalCapacity(alloc, ddl.len);
-    for (ddl) |ch| {
+    const norm = try normalizeSql(alloc, ddl);
+    defer alloc.free(norm);
+    return std.mem.indexOf(u8, norm, needle) != null;
+}
+
+/// PG 的 `pg_get_constraintdef()` 输出是否「正好是」某个唯一键形态。
+/// 这里必须精确相等而不是子串：DROP 只允许针对形态等于旧键的约束，用户自加的其他唯一约束要留着。
+fn constraintDefEquals(alloc: std.mem.Allocator, def: []const u8, needle: []const u8) !bool {
+    const norm = try normalizeSql(alloc, def);
+    defer alloc.free(norm);
+    return std.mem.eql(u8, norm, needle);
+}
+
+/// 归一化 SQL 文本：去掉所有空白字符并转小写。
+fn normalizeSql(alloc: std.mem.Allocator, sql: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(alloc);
+    try buf.ensureTotalCapacity(alloc, sql.len);
+    for (sql) |ch| {
         if (std.ascii.isWhitespace(ch)) continue;
-        try norm.append(alloc, std.ascii.toLower(ch));
+        try buf.append(alloc, std.ascii.toLower(ch));
     }
-    return std.mem.indexOf(u8, norm.items, needle) != null;
+    return buf.toOwnedSlice(alloc);
 }
 
 // ============================================================================
@@ -3004,14 +3034,15 @@ test "db 老事件表迁移（PostgreSQL）：补地址列并换唯一键" {
     var client = try Client.init(alloc, &cfg);
     try client.migrate();
 
-    // 手工造"旧结构"表（无 contract_address、旧唯一键）
+    // 手工造"旧结构"表（无 contract_address、旧唯一键），外加一条用户自加的唯一约束
     _ = try client.ponderExec(
         \\CREATE TABLE event_dai_Transfer (
         \\  id SERIAL PRIMARY KEY,
         \\  evt_from TEXT, evt_value TEXT,
         \\  block_number BIGINT NOT NULL, tx_hash TEXT NOT NULL, log_index BIGINT NOT NULL,
         \\  created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-        \\  UNIQUE(tx_hash, log_index));
+        \\  UNIQUE(tx_hash, log_index),
+        \\  UNIQUE(evt_value));
     , &.{});
     _ = try client.ponderExec("INSERT INTO event_dai_Transfer (evt_from, evt_value, block_number, tx_hash, log_index) VALUES ('0xa','1',10,'0xt',0);", &.{});
 
@@ -3041,6 +3072,13 @@ test "db 老事件表迁移（PostgreSQL）：补地址列并换唯一键" {
     defer client.freeQueryRows(after);
     try std.testing.expectEqual(@as(i64, 2), after[0].values[0].integer);
     try std.testing.expectError(error.ExecFailed, client.insertEventLog("dai", "Transfer", &f, 10, "0xt", 0, "0xOTHER"));
+
+    // 约束收尾状态：只把旧键换成含地址的键，用户自加的 UNIQUE(evt_value) 必须留着
+    const cons = try client.ponderQuery("SELECT pg_get_constraintdef(c.oid) AS def FROM pg_constraint c WHERE c.conrelid = 'event_dai_Transfer'::regclass AND c.contype = 'u' ORDER BY 1;", &.{});
+    defer client.freeQueryRows(cons);
+    try std.testing.expectEqual(@as(usize, 2), cons.len);
+    try std.testing.expectEqualStrings("UNIQUE (contract_address, tx_hash, log_index)", cons[0].values[0].text);
+    try std.testing.expectEqualStrings("UNIQUE (evt_value)", cons[1].values[0].text);
 
     // 清理测试库
     client.deinit();
@@ -3087,4 +3125,97 @@ test "db 老事件表迁移：已有地址列时保留原地址，只换唯一�
     const after = try client.ponderQuery("SELECT COUNT(*) AS n FROM event_dai_Transfer;", &.{});
     defer client.freeQueryRows(after);
     try std.testing.expectEqual(@as(i64, 3), after[0].values[0].integer);
+}
+
+test "db 老事件表迁移（PostgreSQL）：别 schema 同名表不得干扰探测与改动" {
+    const alloc = std.testing.allocator;
+    const admin_cfg = DatabaseConfig{ .db_type = "postgresql", .db_name = "host=localhost port=5432 dbname=postgres", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var admin = Client.init(alloc, &admin_cfg) catch return error.SkipZigTest;
+    _ = admin.ponderExec("DROP DATABASE IF EXISTS zponder_mig_schema_test;", &.{}) catch {};
+    _ = admin.ponderExec("CREATE DATABASE zponder_mig_schema_test;", &.{}) catch {
+        admin.deinit();
+        return error.SkipZigTest;
+    };
+    admin.deinit();
+
+    const cfg = DatabaseConfig{ .db_type = "postgresql", .db_name = "host=localhost port=5432 dbname=zponder_mig_schema_test", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var client = try Client.init(alloc, &cfg);
+    try client.migrate();
+
+    // 目标表（当前 schema）：旧结构 + 一行数据
+    _ = try client.ponderExec(
+        \\CREATE TABLE event_dai_Transfer (
+        \\  id SERIAL PRIMARY KEY,
+        \\  evt_from TEXT, evt_value TEXT,
+        \\  block_number BIGINT NOT NULL, tx_hash TEXT NOT NULL, log_index BIGINT NOT NULL,
+        \\  created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+        \\  UNIQUE(tx_hash, log_index));
+    , &.{});
+    _ = try client.ponderExec("INSERT INTO event_dai_Transfer (evt_from, evt_value, block_number, tx_hash, log_index) VALUES ('0xa','1',10,'0xt',0);", &.{});
+
+    // 另一个 schema 的同名表，且已经带地址三元组唯一键：
+    // 不限 schema 的探测会把它算成本表的约束 → 本表旧键被删却不补新键
+    _ = try client.ponderExec("CREATE SCHEMA other;", &.{});
+    _ = try client.ponderExec(
+        \\CREATE TABLE other.event_dai_Transfer (
+        \\  id SERIAL PRIMARY KEY,
+        \\  evt_from TEXT,
+        \\  contract_address TEXT NOT NULL DEFAULT '',
+        \\  block_number BIGINT NOT NULL, tx_hash TEXT NOT NULL, log_index BIGINT NOT NULL,
+        \\  UNIQUE(contract_address, tx_hash, log_index));
+    , &.{});
+    _ = try client.ponderExec("INSERT INTO other.event_dai_Transfer (evt_from, contract_address, block_number, tx_hash, log_index) VALUES ('0xz','0xOTHER',10,'0xt',0);", &.{});
+
+    const other_cols_before = try client.ponderQuery("SELECT COUNT(*) AS n FROM information_schema.columns WHERE table_schema = 'other' AND table_name = 'event_dai_transfer';", &.{});
+    defer client.freeQueryRows(other_cols_before);
+
+    const test_evt = abi.AbiEvent{ .name = "Transfer", .inputs = &.{
+        .{ .name = "from", .type = "address", .indexed = true },
+        .{ .name = "value", .type = "uint256", .indexed = false },
+    }, .signature = std.mem.zeroes([32]u8) };
+    var events = try alloc.alloc(abi.AbiEvent, 1);
+    events[0] = test_evt;
+    defer alloc.free(events);
+    const ac = abi.AbiContract{ .events = events, .functions = &.{} };
+    try client.autoMigrateContract("dai", &ac, &.{"Transfer"}, "0xDAI");
+    try client.autoMigrateContract("dai", &ac, &.{"Transfer"}, "0xDAI");
+
+    // 目标表必须真的换成含地址的唯一键（不是「删了旧的、没补新的」）
+    const cons = try client.ponderQuery("SELECT pg_get_constraintdef(c.oid) AS def FROM pg_constraint c WHERE c.conrelid = 'event_dai_Transfer'::regclass AND c.contype = 'u';", &.{});
+    defer client.freeQueryRows(cons);
+    try std.testing.expectEqual(@as(usize, 1), cons.len);
+    try std.testing.expectEqualStrings("UNIQUE (contract_address, tx_hash, log_index)", cons[0].values[0].text);
+
+    // 旧行地址已回填
+    const rows = try client.ponderQuery("SELECT contract_address FROM event_dai_Transfer;", &.{});
+    defer client.freeQueryRows(rows);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualStrings("0xDAI", rows[0].values[0].text);
+
+    // 唯一键真的在起作用：同 (tx_hash, log_index) 不同地址可共存，真重复被拒
+    const f = [_]DecodedField{.{ .name = "from", .value = "0xb" }};
+    try client.insertEventLog("dai", "Transfer", &f, 10, "0xt", 0, "0xOTHER");
+    try std.testing.expectError(error.ExecFailed, client.insertEventLog("dai", "Transfer", &f, 10, "0xt", 0, "0xOTHER"));
+
+    // 别 schema 的同名表必须原封不动：列数、唯一约束、数据都不变
+    const other_cols_after = try client.ponderQuery("SELECT COUNT(*) AS n FROM information_schema.columns WHERE table_schema = 'other' AND table_name = 'event_dai_transfer';", &.{});
+    defer client.freeQueryRows(other_cols_after);
+    try std.testing.expectEqual(other_cols_before[0].values[0].integer, other_cols_after[0].values[0].integer);
+
+    const other_cons = try client.ponderQuery("SELECT pg_get_constraintdef(c.oid) AS def FROM pg_constraint c WHERE c.conrelid = 'other.event_dai_Transfer'::regclass AND c.contype = 'u';", &.{});
+    defer client.freeQueryRows(other_cons);
+    try std.testing.expectEqual(@as(usize, 1), other_cons.len);
+    try std.testing.expectEqualStrings("UNIQUE (contract_address, tx_hash, log_index)", other_cons[0].values[0].text);
+
+    const other_rows = try client.ponderQuery("SELECT evt_from, contract_address FROM other.event_dai_Transfer;", &.{});
+    defer client.freeQueryRows(other_rows);
+    try std.testing.expectEqual(@as(usize, 1), other_rows.len);
+    try std.testing.expectEqualStrings("0xz", other_rows[0].values[0].text);
+    try std.testing.expectEqualStrings("0xOTHER", other_rows[0].values[1].text);
+
+    // 清理测试库
+    client.deinit();
+    var cleanup = Client.init(alloc, &admin_cfg) catch return;
+    _ = cleanup.ponderExec("DROP DATABASE IF EXISTS zponder_mig_schema_test;", &.{}) catch {};
+    cleanup.deinit();
 }
