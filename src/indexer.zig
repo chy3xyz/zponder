@@ -45,7 +45,10 @@ pub const PendingBackfill = struct { address: []const u8, from_block: u64 };
 /// （携转约束 3：template_addresses 主键精确 TEXT 比较，大小写不同会各占一行）。
 pub const TemplateAddressSet = struct {
     alloc: std.mem.Allocator,
+    /// live 地址（主 sweep 的过滤集合），与 `live_blocks` 一一对应。
     live: std.ArrayList([]const u8) = .empty,
+    /// 每个 live 地址的发现区块（与 `live` 同长），供重组按块作废使用。
+    live_blocks: std.ArrayList(u64) = .empty,
     pending_list: std.ArrayList(PendingBackfill) = .empty,
 
     pub fn init(alloc: std.mem.Allocator) TemplateAddressSet {
@@ -56,6 +59,7 @@ pub const TemplateAddressSet = struct {
         for (self.live.items) |a| self.alloc.free(a);
         for (self.pending_list.items) |p| self.alloc.free(p.address);
         self.live.deinit(self.alloc);
+        self.live_blocks.deinit(self.alloc);
         self.pending_list.deinit(self.alloc);
     }
 
@@ -101,8 +105,45 @@ pub const TemplateAddressSet = struct {
             self.live.append(self.alloc, moved.address) catch {
                 // 并入 live 失败：已从 pending 摘除，释放避免泄漏（该地址本轮到不了 live）
                 self.alloc.free(moved.address);
+                return;
+            };
+            self.live_blocks.append(self.alloc, moved.from_block) catch {
+                // 保持 live / live_blocks 等长：回滚刚追加的 live 项
+                const dropped = self.live.pop().?;
+                self.alloc.free(dropped);
+                return;
             };
             return;
+        }
+    }
+
+    /// 重组：作废发现区块 >= `from_block` 的条目（与 DB 的
+    /// `deleteTemplateAddressesFromBlock` 同语义），pending 与 live 都移除并释放，
+    /// 使内存集合与 DB 一致。`from_block < from_block` 的真实 clone 保留。
+    ///
+    /// 若不这样做：fork 之后创建的 clone 在 DB 里被删、内存 live 仍留着；新链上重新发现
+    /// 同一地址时 `add` 因去重返回 false → 不再落库；本进程内无碍，但**重启后**该地址
+    /// 从库里消失 → 不再进 live → 主 sweep 从已越过其发现块的游标开始 → 该 clone 后续
+    /// 事件静默不再索引（跨重启漏索引）。
+    pub fn removeFromBlock(self: *TemplateAddressSet, from_block: u64) void {
+        var i: usize = 0;
+        while (i < self.pending_list.items.len) {
+            if (self.pending_list.items[i].from_block >= from_block) {
+                const removed = self.pending_list.orderedRemove(i);
+                self.alloc.free(removed.address);
+            } else {
+                i += 1;
+            }
+        }
+        i = 0;
+        while (i < self.live.items.len) {
+            if (self.live_blocks.items[i] >= from_block) {
+                const removed = self.live.orderedRemove(i);
+                _ = self.live_blocks.orderedRemove(i);
+                self.alloc.free(removed);
+            } else {
+                i += 1;
+            }
         }
     }
 };
@@ -115,12 +156,34 @@ fn computeBackfillRange(discovered_at_block: u64, current_cursor: u64) [2]u64 {
     return .{ discovered_at_block, current_cursor };
 }
 
-/// 补扫分块推进：`from` 起、闭区间上界 `last`，返回本块闭区间 `[from, end]`。
-/// 返回 null 表示已越过末尾。`eth_getLogs` 的 toBlock 是闭区间，补扫的"半开上界 - 1"
-/// 由调用方换算成 `last`，本函数只负责按 batch_size 切连续的块。
-fn nextBackfillChunk(from: u64, batch_size: u64, last: u64) ?[2]u64 {
-    if (from > last) return null;
-    return .{ from, @min(from +| (batch_size - 1), last) };
+/// 补扫的闭区间上界：把半开上界（= 探测时游标，不含游标块）换算成 eth_getLogs
+/// 的 `toBlock`。调用方须保证 `to_exclusive > from_block >= 0`，故不欠账。
+/// 单点收敛该换算，测试可直接断言 `backfillLast(cursor) == cursor - 1`。
+fn backfillLast(to_exclusive: u64) u64 {
+    return to_exclusive - 1;
+}
+
+/// 补扫分块推进：`from` 起、半开上界 `to_exclusive`，返回本块**闭区间** `[from, end]`。
+/// 返回 null 表示已越过末尾（含 `batch_size == 0`：防 `batch_size - 1` 下溢 panic）。
+/// eth_getLogs 的 toBlock 是闭区间，故内部经 `backfillLast` 做一次上界换算；
+/// 这样"补扫恰好覆盖 [from, 游标)"的换算不会漏在调用方里。
+fn nextBackfillChunk(from: u64, batch_size: u64, to_exclusive: u64) ?[2]u64 {
+    if (batch_size == 0) return null;
+    if (from >= to_exclusive) return null;
+    return .{ from, @min(from +| (batch_size - 1), backfillLast(to_exclusive)) };
+}
+
+/// `loadTemplateAddresses` 的前置校验：未开模板模式必须报错。
+/// 若静默返回，Task 8 把 `setTemplateMode(true)` 写在 `loadTemplateAddresses()` 之后时，
+/// 携转约束 2 的启动期 fail-fast（RocksDB 也含在内）会失效；地址集合恒为空 → 空集短路
+/// 让主 sweep 照常推进游标 → 进程"看起来在跑"却什么都没索引。
+fn ensureTemplateMode(template_mode: bool) !void {
+    if (!template_mode) return error.NotTemplateMode;
+}
+
+/// `setTemplateMode` 的前置校验：运行中不得再切换模板模式（游标 key/运行态都依赖它）。
+fn ensureNotRunning(state: IndexerState) !void {
+    if (state == .running or state == .replaying) return error.AlreadyRunning;
 }
 
 /// 地址归一化（小写 hex）——模板模式的**唯一**归一化点。
@@ -163,6 +226,24 @@ fn loadTemplateAddressesInto(set: *TemplateAddressSet, client: *db.Client, templ
         _ = set.add(item.address, item.from_block);
         if (item.backfilled) set.markBackfilled(item.address);
     }
+}
+
+/// 复制 pending 队列为可独立使用的切片（调用方可在释放锁后安全迭代/做 RPC）。
+/// 每个 `address` 都是新 dupe；调用方须逐个 `alloc.free(p.address)` 再 `alloc.free(切片)`。
+/// 调用方须保证持有 `template_set` 的锁（或处于单线程启动期）。
+fn dupePending(set: *TemplateAddressSet, alloc: std.mem.Allocator) ![]PendingBackfill {
+    const src = set.pending();
+    const out = try alloc.alloc(PendingBackfill, src.len);
+    var filled: usize = 0;
+    errdefer {
+        for (out[0..filled]) |p| alloc.free(p.address);
+        alloc.free(out);
+    }
+    for (src, 0..) |p, i| {
+        out[i] = .{ .address = try alloc.dupe(u8, p.address), .from_block = p.from_block };
+        filled = i + 1;
+    }
+    return out;
 }
 
 /// 核心索引器
@@ -292,11 +373,17 @@ pub const Indexer = struct {
     }
 
     /// 开启模板模式：一个 Indexer 承载一批动态发现的 clone 地址，共用一套事件表。
-    /// 必须在 `start()` 之前调用。开启后：
+    /// 必须在 `start()` 之前调用；运行中调用会被拒绝（log.err 后 no-op）。开启后：
     /// - 游标/hash/快照改用合成 key `template:<模板名>`（模板的 contract.address 是空串，
     ///   直接用会与"无地址"发生碰撞；合成 key 与设计文档 §2.2.1 的约定一致）；
     /// - 重新按该 key 载入断点（`init` 时还不知道模板模式，读的是空地址的键）。
     pub fn setTemplateMode(self: *Indexer, enabled: bool) void {
+        // 运行中切换会让游标 key 与已推进的 state 不一致，直接拒绝（Task 8 有启动顺序 bug 时能立刻暴露）
+        ensureNotRunning(self.state.load(.monotonic)) catch |e| {
+            log.err("模板 {s}: setTemplateMode 必须在 start() 之前调用，已忽略: {any}", .{ self.contract.name, e });
+            return;
+        };
+
         self.template_mode = enabled;
         if (!enabled) {
             self.template_state_key_len = 0;
@@ -370,10 +457,12 @@ pub const Indexer = struct {
     }
 
     /// 启动时从库恢复模板地址集合。必须在 `start()` 之前调用。
+    /// 未开模板模式时返回 `error.NotTemplateMode`（**不静默返回**：Task 8 若把
+    /// `setTemplateMode(true)` 写在后面，这里会立刻炸，携转约束 2 的 fail-fast 不会失效）。
     /// 读库错误（含 RocksDB 后端的 `error.UnsupportedOperation`）原样上抛，
     /// 由 Task 8 在启动期转成 fail-fast——不会等到发现第一个 clone 才炸（携转约束 2）。
     pub fn loadTemplateAddresses(self: *Indexer) !void {
-        if (!self.template_mode) return;
+        try ensureTemplateMode(self.template_mode);
         try loadTemplateAddressesInto(&self.template_set, self.database, self.contract.name);
         log.info("模板 {s}: 从库恢复 {d} 个 clone 地址", .{ self.contract.name, self.template_set.count() });
     }
@@ -670,8 +759,9 @@ pub const Indexer = struct {
 
     /// 回滚到 `fork_block`（含）：事件表删 `block_number >= fork_block`，
     /// 快照/区块 hash/sync_state 按 `stateKey()` 清理。
-    /// 模板模式额外删除 `from_block >= fork_block` 的 clone 记录——fork 之后创建的
-    /// clone 与它们的全部事件一致作废（模板内所有地址都是链级事实，无需地址谓词）。
+    /// 模板模式额外作废 `from_block >= fork_block` 的 clone 记录——DB 与内存集合
+    /// **一起**删（fork 之后创建的 clone 与它们的全部事件一致作废，无需地址谓词）。
+    /// 两者在 `template_mutex` 内串行，故与并发 `discoverAddress` 不会交错出内存/DB 分叉。
     fn rollbackTo(self: *Indexer, fork_block: u64) void {
         self.database.rollbackFromBlock(
             self.stateKey(),
@@ -682,9 +772,12 @@ pub const Indexer = struct {
             log.err("回滚数据失败: {any}", .{e});
         };
         if (self.template_mode) {
+            self.lockTemplateSet();
+            defer self.unlockTemplateSet();
             self.database.deleteTemplateAddressesFromBlock(self.contract.name, fork_block) catch |e| {
                 log.warn("清理克隆地址记录失败: {any}", .{e});
             };
+            self.template_set.removeFromBlock(fork_block);
         }
     }
 
@@ -779,7 +872,7 @@ pub const Indexer = struct {
                             const topics_json = formatTopicsJson(self.alloc, lg.topics) catch continue;
                             defer self.alloc.free(topics_json);
                             self.database.insertRawLog(
-                                self.contract.address,
+                                self.stateKey(),
                                 lg.block_number,
                                 lg.transaction_hash,
                                 lg.log_index,
@@ -924,14 +1017,11 @@ pub const Indexer = struct {
     }
 
     /// 按 batch_size 分块补扫半开区间 `[from_block, to_block)`。
-    /// eth_getLogs 的 toBlock 是**闭区间**，故把上界换算为 `to_block - 1`——补扫恰好覆盖
-    /// "发现块 .. 游标-1"，与主 sweep（从游标块起，闭区间）无缝衔接且不重叠。
+    /// 闭区间换算与分块都在 `nextBackfillChunk` 内（含 batch_size==0 保护）。
     fn backfillRange(self: *Indexer, address: []const u8, from_block: u64, to_block: u64) !void {
-        // 调用方保证 to_block > from_block，故 last 不欠账
-        const last = to_block - 1;
         const one = [_][]const u8{address};
         var from = from_block;
-        while (nextBackfillChunk(from, self.batch_size, last)) |chunk| {
+        while (nextBackfillChunk(from, self.batch_size, to_block)) |chunk| {
             try self.syncRangeWithAddresses(&one, chunk[0], chunk[1]);
             from = chunk[1] + 1;
         }
@@ -953,19 +1043,7 @@ pub const Indexer = struct {
     fn snapshotPending(self: *Indexer) ![]PendingBackfill {
         self.lockTemplateSet();
         defer self.unlockTemplateSet();
-
-        const src = self.template_set.pending();
-        const out = try self.alloc.alloc(PendingBackfill, src.len);
-        var filled: usize = 0;
-        errdefer {
-            for (out[0..filled]) |p| self.alloc.free(p.address);
-            self.alloc.free(out);
-        }
-        for (src, 0..) |p, i| {
-            out[i] = .{ .address = try self.alloc.dupe(u8, p.address), .from_block = p.from_block };
-            filled = i + 1;
-        }
-        return out;
+        return dupePending(&self.template_set, self.alloc);
     }
 
     /// 解析字符串为 u256（支持十进制和 0x 十六进制）
@@ -1467,24 +1545,36 @@ test "template computeBackfillRange 无缺口无重叠" {
     try std.testing.expectEqual([2]u64{ 0, 1 }, computeBackfillRange(0, 1));
 }
 
+test "template backfillLast = 游标 - 1（不含游标块）" {
+    // eth_getLogs 的 toBlock 是闭区间；半开上界（游标）换算成 toBlock 必须减 1，
+    // 否则补扫会多扫游标块、与主 sweep 重叠（UNIQUE 冲突 → raw_logs 死信噪声）。
+    try std.testing.expectEqual(@as(u64, 249), backfillLast(250));
+    try std.testing.expectEqual(@as(u64, 99), backfillLast(100));
+    try std.testing.expectEqual(@as(u64, 0), backfillLast(1));
+    // 与分块联动：终块的闭区间上界必须是 游标-1，绝不含游标块
+    try std.testing.expectEqual(@as(u64, 249), nextBackfillChunk(100, 500, 250).?[1]);
+}
+
 test "template 补扫分块连续无重叠（闭区间换算）" {
-    // 半开区间 [5, 25) → eth_getLogs 闭区间 [5, 24]；batch=10 → [5,14] [15,24]
-    const last: u64 = 24;
+    // 游标 25（半开 [5, 25)）→ eth_getLogs 闭区间上界 24；batch=10 → [5,14] [15,24]
     var from: u64 = 5;
     var chunks: [8][2]u64 = undefined;
     var n: usize = 0;
-    while (nextBackfillChunk(from, 10, last)) |c| {
+    while (nextBackfillChunk(from, 10, 25)) |c| {
         chunks[n] = c;
         n += 1;
         from = c[1] + 1;
     }
     try std.testing.expectEqual(@as(usize, 2), n);
     try std.testing.expectEqual([2]u64{ 5, 14 }, chunks[0]);
-    try std.testing.expectEqual([2]u64{ 15, 24 }, chunks[1]);
+    try std.testing.expectEqual([2]u64{ 15, 24 }, chunks[1]); // 不含游标块 25
 
-    // 单块（batch 足够大）；越过末尾返回 null
-    try std.testing.expectEqual([2]u64{ 100, 249 }, nextBackfillChunk(100, 500, 249).?);
-    try std.testing.expect(nextBackfillChunk(250, 500, 249) == null);
+    // 单块（batch 足够大）：终块恰好到 游标-1，绝不含游标块
+    try std.testing.expectEqual([2]u64{ 100, 249 }, nextBackfillChunk(100, 500, 250).?);
+    // 起点即游标 → 无块
+    try std.testing.expect(nextBackfillChunk(250, 500, 250) == null);
+    // batch_size == 0 不得下溢 panic（block_batch_size = 0 是合法配置输入）
+    try std.testing.expect(nextBackfillChunk(0, 0, 100) == null);
 }
 
 test "template 地址集合去重/补扫流转" {
@@ -1584,8 +1674,111 @@ test "template loadTemplateAddresses 上抛读库错误（携转约束 2：不�
     // 未 migrate：表不存在。RocksDB 后端则是 error.UnsupportedOperation。
     // 两种情况都必须原样上抛，由 Task 8 在启动期转成 fail-fast——
     // 绝不能吞掉当成"空地址集合"继续跑（那会在第一个 clone 才发现时炸，或静默漏索引）。
+    // 注意：此用例在**任何分配之前**就返回错误，故它只证明"错误上抛"，
+    // 不构成"释放约定无泄漏"的证据——后者由下面的成功路径用例负责。
     if (loadTemplateAddressesInto(&set, &client, "curve")) |_| {
         return error.TestUnexpectedResult;
     } else |_| {}
     try std.testing.expectEqual(@as(usize, 0), set.count());
+}
+
+test "template loadTemplateAddresses 成功路径（约束 5：释放约定无泄漏）" {
+    const alloc = std.testing.allocator;
+    const cfg = db.DatabaseConfig{
+        .db_type = "sqlite",
+        .db_name = ":memory:",
+        .wal_mode = true,
+        .busy_timeout_ms = 5000,
+        .max_connections = 10,
+    };
+    var client = try db.Client.init(alloc, &cfg);
+    defer client.deinit();
+    try client.migrate();
+
+    try client.addTemplateAddress("curve", "0xaa", 100);
+    try client.addTemplateAddress("curve", "0xbb", 200);
+    try client.addTemplateAddress("curve", "0xcc", 300);
+    try client.markTemplateAddressBackfilled("curve", "0xaa");
+    try client.markTemplateAddressBackfilled("curve", "0xbb");
+
+    var set = TemplateAddressSet.init(alloc);
+    defer set.deinit();
+    try loadTemplateAddressesInto(&set, &client, "curve");
+
+    // 2 行已回填 → live；1 行未回填 → pending 重新补扫
+    try std.testing.expectEqual(@as(usize, 2), set.all().len);
+    try std.testing.expectEqualStrings("0xaa", set.all()[0]);
+    try std.testing.expectEqualStrings("0xbb", set.all()[1]);
+    try std.testing.expectEqual(@as(usize, 1), set.pending().len);
+    try std.testing.expectEqualStrings("0xcc", set.pending()[0].address);
+    try std.testing.expectEqual(@as(u64, 300), set.pending()[0].from_block);
+    // 释放约定（逐个 free address + free 数组）若写错，testing.allocator 在退出时判失败
+}
+
+test "template 地址集合 deinit 释放 pending 与 live（无泄漏）" {
+    const alloc = std.testing.allocator;
+    var set = TemplateAddressSet.init(alloc);
+    try std.testing.expect(set.add("0xaaa", 1));
+    set.markBackfilled("0xaaa"); // live 非空
+    try std.testing.expect(set.add("0xbbb", 2)); // 故意留一个 pending 到 deinit
+    try std.testing.expectEqual(@as(usize, 1), set.pending().len);
+    try std.testing.expectEqual(@as(usize, 2), set.count());
+    set.deinit(); // 覆盖 live + pending 两个释放分支；漏任一个即 leak 失败
+}
+
+test "template dupePending 复制 pending 且调用方可独立释放" {
+    const alloc = std.testing.allocator;
+    var set = TemplateAddressSet.init(alloc);
+    defer set.deinit();
+    try std.testing.expect(set.add("0xaaa", 10));
+    try std.testing.expect(set.add("0xbbb", 20));
+
+    const snap = try dupePending(&set, alloc);
+    defer {
+        for (snap) |p| alloc.free(p.address);
+        alloc.free(snap);
+    }
+    try std.testing.expectEqual(@as(usize, 2), snap.len);
+    try std.testing.expectEqualStrings("0xaaa", snap[0].address);
+    try std.testing.expectEqual(@as(u64, 10), snap[0].from_block);
+    try std.testing.expectEqualStrings("0xbbb", snap[1].address);
+
+    // 复制独立：原集合流转不影响快照（若 dupePending 偷懒共享指针，这里会 double-free）
+    set.markBackfilled("0xaaa");
+    try std.testing.expectEqualStrings("0xaaa", snap[0].address);
+}
+
+test "template 重组作废发现块 >= fork 的条目（pending 与 live）" {
+    const alloc = std.testing.allocator;
+    var set = TemplateAddressSet.init(alloc);
+    defer set.deinit();
+
+    try std.testing.expect(set.add("0xold", 50)); // 早于 fork（保留）
+    set.markBackfilled("0xold");
+    try std.testing.expect(set.add("0xlive_lt", 100)); // fork 前发现、晚回填（保留）
+    set.markBackfilled("0xlive_lt");
+    try std.testing.expect(set.add("0xlive_eq", 101)); // 恰为 fork（作废，含边界）
+    set.markBackfilled("0xlive_eq");
+    try std.testing.expect(set.add("0xpending_gt", 120)); // fork 后 pending（作废）
+
+    set.removeFromBlock(101); // fork = 101
+
+    // 保留 from_block < 101
+    try std.testing.expectEqual(@as(usize, 2), set.all().len);
+    try std.testing.expectEqualStrings("0xold", set.all()[0]);
+    try std.testing.expectEqualStrings("0xlive_lt", set.all()[1]);
+    // 移除 from_block >= 101（live 与 pending 都处理；live/live_blocks 保持等长）
+    try std.testing.expectEqual(@as(usize, 0), set.pending().len);
+    try std.testing.expectEqual(@as(usize, 2), set.count());
+}
+
+test "template 模式守卫（未开模板模式 / 运行中切换）" {
+    // loadTemplateAddresses 在未开模板模式时必须报错，不能静默返回
+    try std.testing.expectError(error.NotTemplateMode, ensureTemplateMode(false));
+    try ensureTemplateMode(true);
+    // setTemplateMode 运行中必须拒绝
+    try ensureNotRunning(.stopped);
+    try ensureNotRunning(.error_state);
+    try std.testing.expectError(error.AlreadyRunning, ensureNotRunning(.running));
+    try std.testing.expectError(error.AlreadyRunning, ensureNotRunning(.replaying));
 }
