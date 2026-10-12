@@ -9,6 +9,7 @@ const template = @import("template.zig");
 const dashboard = @import("dashboard.zig");
 const eb = @import("event_bus.zig");
 const js_engine = @import("js_engine.zig");
+const abi = @import("abi.zig");
 
 const build_options = @import("build_options");
 
@@ -23,6 +24,101 @@ fn urlDecodeAlloc(alloc: std.mem.Allocator, input: []const u8) std.mem.Allocator
     const result = try alloc.dupe(u8, decoded);
     alloc.free(buf);
     return result;
+}
+
+/// `/events/:contract/:event` 的查询参数。tx_hash / address 是 dupe 出的所有权切片，
+/// 由 `deinit` 释放；null = 未提供，空串 = 提供了空值（两者 SQL 语义不同）。
+const EventQueryParams = struct {
+    block_from: ?u64 = null,
+    block_to: ?u64 = null,
+    tx_hash: ?[]const u8 = null,
+    address: ?[]const u8 = null,
+    limit: u32 = 100,
+    offset: u32 = 0,
+    order_desc: bool = true,
+
+    fn deinit(self: *EventQueryParams, alloc: std.mem.Allocator) void {
+        if (self.tx_hash) |t| alloc.free(t);
+        if (self.address) |a| alloc.free(a);
+        self.* = .{};
+    }
+};
+
+/// 解析 query string（不含 `?`）。重复参数后者生效：先 dupe 成功再释放旧值，
+/// 这样 dupe 失败（由 errdefer 统一回收）时不会留下陈旧指针或泄漏。
+fn parseEventQueryParams(alloc: std.mem.Allocator, query: []const u8) !EventQueryParams {
+    var params = EventQueryParams{};
+    errdefer params.deinit(alloc);
+
+    var param_it = std.mem.splitSequence(u8, query, "&");
+    while (param_it.next()) |param| {
+        var kv = std.mem.splitSequence(u8, param, "=");
+        const key = kv.next() orelse continue;
+        const val = kv.next() orelse continue;
+
+        const decoded = urlDecodeAlloc(alloc, val) catch continue;
+        defer alloc.free(decoded);
+
+        if (std.mem.eql(u8, key, "block_from")) {
+            params.block_from = std.fmt.parseInt(u64, decoded, 10) catch null;
+        } else if (std.mem.eql(u8, key, "block_to")) {
+            params.block_to = std.fmt.parseInt(u64, decoded, 10) catch null;
+        } else if (std.mem.eql(u8, key, "tx_hash")) {
+            const dup = try alloc.dupe(u8, decoded);
+            if (params.tx_hash) |old| alloc.free(old);
+            params.tx_hash = dup;
+        } else if (std.mem.eql(u8, key, "address")) {
+            const dup = try alloc.dupe(u8, decoded);
+            if (params.address) |old| alloc.free(old);
+            params.address = dup;
+        } else if (std.mem.eql(u8, key, "limit")) {
+            params.limit = std.fmt.parseInt(u32, decoded, 10) catch 100;
+            if (params.limit > 1000) params.limit = 1000;
+        } else if (std.mem.eql(u8, key, "offset")) {
+            params.offset = std.fmt.parseInt(u32, decoded, 10) catch 0;
+        } else if (std.mem.eql(u8, key, "order")) {
+            params.order_desc = !std.mem.eql(u8, decoded, "asc");
+        }
+    }
+    return params;
+}
+
+/// 事件查询缓存键。自由文本维度（合约/事件/tx_hash/address）一律加长度前缀，
+/// 因为 tx_hash 与 address 可含 `:`，直接拼接会让不同过滤条件得到同一个键；
+/// `*set` 标记是否提供了该参数 —— 长度前缀区分不了 null 与空串，而两者 SQL 语义不同。
+/// 单射论证：字段顺序与标签固定，数值/布尔/标记字段不含 `:`，自由文本字段先读十进制
+/// 长度再读恰好该长度的字节，故任意两个不同参数元组必得不同键。
+fn buildEventCacheKey(
+    alloc: std.mem.Allocator,
+    contract_name: []const u8,
+    event_name: []const u8,
+    block_from: ?u64,
+    block_to: ?u64,
+    tx_hash: ?[]const u8,
+    address: ?[]const u8,
+    limit: u32,
+    offset: u32,
+    order_desc: bool,
+) ![]u8 {
+    const tx: []const u8 = tx_hash orelse "";
+    const ad: []const u8 = address orelse "";
+    return std.fmt.allocPrint(alloc, "c={d}:{s}:e={d}:{s}:bf={?d}:bt={?d}:txset={d}:tx={d}:{s}:adset={d}:ad={d}:{s}:l={d}:o={d}:od={}", .{
+        contract_name.len,
+        contract_name,
+        event_name.len,
+        event_name,
+        block_from,
+        block_to,
+        @intFromBool(tx_hash != null),
+        tx.len,
+        tx,
+        @intFromBool(address != null),
+        ad.len,
+        ad,
+        limit,
+        offset,
+        order_desc,
+    });
 }
 
 /// 全局令牌桶速率限制器
@@ -492,51 +588,9 @@ pub const Server = struct {
         }
 
         // 解析查询参数
-        var block_from: ?u64 = null;
-        var block_to: ?u64 = null;
-        var tx_hash: ?[]const u8 = null;
-        var tx_hash_owned = false;
-        var address: ?[]const u8 = null;
-        var address_owned = false;
-        var limit: u32 = 100;
-        var offset: u32 = 0;
-        var order_desc: bool = true;
-
-        const query_start = std.mem.indexOf(u8, request.head.target, "?");
-        if (query_start) |qs| {
-            const query = request.head.target[qs + 1 ..];
-            var param_it = std.mem.splitSequence(u8, query, "&");
-            while (param_it.next()) |param| {
-                var kv = std.mem.splitSequence(u8, param, "=");
-                const key = kv.next() orelse continue;
-                const val = kv.next() orelse continue;
-
-                // URL 解码参数值
-                const decoded = urlDecodeAlloc(self.alloc, val) catch continue;
-                defer self.alloc.free(decoded);
-
-                if (std.mem.eql(u8, key, "block_from")) {
-                    block_from = std.fmt.parseInt(u64, decoded, 10) catch null;
-                } else if (std.mem.eql(u8, key, "block_to")) {
-                    block_to = std.fmt.parseInt(u64, decoded, 10) catch null;
-                } else if (std.mem.eql(u8, key, "tx_hash")) {
-                    tx_hash = try self.alloc.dupe(u8, decoded);
-                    tx_hash_owned = true;
-                } else if (std.mem.eql(u8, key, "address")) {
-                    address = try self.alloc.dupe(u8, decoded);
-                    address_owned = true;
-                } else if (std.mem.eql(u8, key, "limit")) {
-                    limit = std.fmt.parseInt(u32, decoded, 10) catch 100;
-                    if (limit > 1000) limit = 1000;
-                } else if (std.mem.eql(u8, key, "offset")) {
-                    offset = std.fmt.parseInt(u32, decoded, 10) catch 0;
-                } else if (std.mem.eql(u8, key, "order")) {
-                    order_desc = !std.mem.eql(u8, decoded, "asc");
-                }
-            }
-        }
-        defer if (tx_hash_owned) self.alloc.free(tx_hash.?);
-        defer if (address_owned) self.alloc.free(address.?);
+        const query = if (std.mem.indexOf(u8, request.head.target, "?")) |qs| request.head.target[qs + 1 ..] else "";
+        var params = try parseEventQueryParams(self.alloc, query);
+        defer params.deinit(self.alloc);
 
         // 计算当前同步区块
         var current_sync_block: u64 = 0;
@@ -547,9 +601,7 @@ pub const Server = struct {
             }
         }
 
-        const cache_key = try std.fmt.allocPrint(self.alloc, "{s}:{s}:bf={?d}:bt={?d}:tx={s}:ad={s}:adset={d}:l={d}:o={d}:od={}", .{
-            contract_name, event_name, block_from, block_to, tx_hash orelse "", address orelse "", @intFromBool(address != null), limit, offset, order_desc,
-        });
+        const cache_key = try buildEventCacheKey(self.alloc, contract_name, event_name, params.block_from, params.block_to, params.tx_hash, params.address, params.limit, params.offset, params.order_desc);
         defer self.alloc.free(cache_key);
 
         if (self.cache.get(cache_key, current_sync_block)) |cached| {
@@ -559,9 +611,9 @@ pub const Server = struct {
 
         const result = self.database.queryEventLogs(
             contract_name, event_name,
-            block_from, block_to, tx_hash,
-            address,
-            limit, offset, order_desc,
+            params.block_from, params.block_to, params.tx_hash,
+            params.address,
+            params.limit, params.offset, params.order_desc,
         ) catch |e| {
             log.warn("查询事件日志失败 {s}.{s}: {any}", .{ contract_name, event_name, e });
             try self.sendJson(request, "{\"error\":\"query failed\"}", .internal_server_error);
@@ -1215,4 +1267,150 @@ test "RateLimiter zero rate means unlimited" {
     var rl = RateLimiter.init(0.0, 0.0);
     try std.testing.expect(rl.allow(1000));
     try std.testing.expect(rl.allow(1000));
+}
+
+test "parseEventQueryParams 解析 /events 查询参数" {
+    const alloc = std.testing.allocator;
+
+    {
+        // 默认值
+        var p = try parseEventQueryParams(alloc, "");
+        defer p.deinit(alloc);
+        try std.testing.expect(p.block_from == null);
+        try std.testing.expect(p.block_to == null);
+        try std.testing.expect(p.tx_hash == null);
+        try std.testing.expect(p.address == null);
+        try std.testing.expectEqual(@as(u32, 100), p.limit);
+        try std.testing.expectEqual(@as(u32, 0), p.offset);
+        try std.testing.expect(p.order_desc);
+    }
+    {
+        // 标量参数：limit 夹紧、order=asc
+        var p = try parseEventQueryParams(alloc, "block_from=5&block_to=9&limit=2000&offset=3&order=asc");
+        defer p.deinit(alloc);
+        try std.testing.expectEqual(@as(?u64, 5), p.block_from);
+        try std.testing.expectEqual(@as(?u64, 9), p.block_to);
+        try std.testing.expectEqual(@as(u32, 1000), p.limit);
+        try std.testing.expectEqual(@as(u32, 3), p.offset);
+        try std.testing.expect(!p.order_desc);
+    }
+    {
+        // address 透传 + URL 解码；空串是"已提供地址"而非"未提供"
+        var p = try parseEventQueryParams(alloc, "address=0xA%3Aad%3Db");
+        defer p.deinit(alloc);
+        try std.testing.expect(p.address != null);
+        try std.testing.expectEqualStrings("0xA:ad=b", p.address.?);
+
+        var q = try parseEventQueryParams(alloc, "address=");
+        defer q.deinit(alloc);
+        try std.testing.expect(q.address != null);
+        try std.testing.expectEqualStrings("", q.address.?);
+    }
+    {
+        // 重复参数后者生效，且前一次的 dupe 必须被释放（testing allocator 会报泄漏）
+        var p = try parseEventQueryParams(alloc, "address=a&address=b&tx_hash=t1&tx_hash=t2");
+        defer p.deinit(alloc);
+        try std.testing.expectEqualStrings("b", p.address.?);
+        try std.testing.expectEqualStrings("t2", p.tx_hash.?);
+    }
+    {
+        // 未知键忽略；含 ':' 的值（百分号编码）原样进参数
+        var p = try parseEventQueryParams(alloc, "nope=1&tx_hash=a%3Aad");
+        defer p.deinit(alloc);
+        try std.testing.expectEqualStrings("a:ad", p.tx_hash.?);
+        try std.testing.expect(p.address == null);
+    }
+    {
+        // 审查给出的两个撞键请求：解析后字段切分不同（旧拼接格式会得到同一个键）
+        var p = try parseEventQueryParams(alloc, "tx_hash=a%3Aad%3Db&address=c");
+        defer p.deinit(alloc);
+        try std.testing.expectEqualStrings("a:ad=b", p.tx_hash.?);
+        try std.testing.expectEqualStrings("c", p.address.?);
+
+        var q = try parseEventQueryParams(alloc, "tx_hash=a&address=b%3Aad%3Dc");
+        defer q.deinit(alloc);
+        try std.testing.expectEqualStrings("a", q.tx_hash.?);
+        try std.testing.expectEqualStrings("b:ad=c", q.address.?);
+    }
+}
+
+test "buildEventCacheKey 单射：任意两个不同请求产生不同键" {
+    const alloc = std.testing.allocator;
+
+    const Case = struct {
+        label: []const u8,
+        tx: ?[]const u8 = null,
+        addr: ?[]const u8 = null,
+        limit: u32 = 100,
+        offset: u32 = 0,
+        desc: bool = true,
+        bf: ?u64 = null,
+        bt: ?u64 = null,
+    };
+    const cases = [_]Case{
+        .{ .label = "无地址" },
+        .{ .label = "空地址（模板行）", .addr = "" },
+        .{ .label = "地址 0xAAAA", .addr = "0xAAAA" },
+        .{ .label = "地址 0xaaaa（大小写不同 = 不同过滤条件）", .addr = "0xaaaa" },
+        .{ .label = "空 tx_hash", .tx = "" },
+        .{ .label = "tx_hash 含冒号 A", .tx = "a:ad=b", .addr = "c" },
+        .{ .label = "tx_hash 含冒号 B（旧拼接格式下与上一行撞键）", .tx = "a", .addr = "b:ad=c" },
+        .{ .label = "limit 不同", .addr = "0xAAAA", .limit = 101 },
+        .{ .label = "offset 不同", .addr = "0xAAAA", .offset = 1 },
+        .{ .label = "order 不同", .addr = "0xAAAA", .desc = false },
+        .{ .label = "block_from 不同", .addr = "0xAAAA", .bf = 7 },
+        .{ .label = "block_to 不同", .addr = "0xAAAA", .bt = 7 },
+    };
+
+    var keys: [cases.len][]u8 = undefined;
+    for (cases, 0..) |c, i| {
+        keys[i] = try buildEventCacheKey(alloc, "curve", "Transfer", c.bf, c.bt, c.tx, c.addr, c.limit, c.offset, c.desc);
+    }
+    defer for (keys) |k| alloc.free(k);
+
+    for (cases, 0..) |a, i| {
+        for (cases, 0..) |b, j| {
+            if (i >= j) continue;
+            if (std.mem.eql(u8, keys[i], keys[j])) {
+                std.debug.print("撞键: [{s}] 与 [{s}] 同为 {s}\n", .{ a.label, b.label, keys[i] });
+                return error.EventCacheKeyCollision;
+            }
+        }
+    }
+
+    // 正向对照：完全相同的参数必须得到完全相同的键（缓存仍能命中）
+    const k1 = try buildEventCacheKey(alloc, "curve", "Transfer", null, null, "a", "0xAAAA", 100, 0, true);
+    defer alloc.free(k1);
+    const k2 = try buildEventCacheKey(alloc, "curve", "Transfer", null, null, "a", "0xAAAA", 100, 0, true);
+    defer alloc.free(k2);
+    try std.testing.expectEqualStrings(k1, k2);
+}
+
+test "?address= 解析结果透传到 queryEventLogs" {
+    const alloc = std.testing.allocator;
+
+    const cfg = db.DatabaseConfig{ .db_type = "sqlite", .db_name = ":memory:", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var client = try db.Client.init(alloc, &cfg);
+    defer client.deinit();
+    try client.migrate();
+
+    const evt = abi.AbiEvent{ .name = "Transfer", .inputs = &.{.{ .name = "value", .type = "uint256", .indexed = false }}, .signature = std.mem.zeroes([32]u8) };
+    var events = try alloc.alloc(abi.AbiEvent, 1);
+    events[0] = evt;
+    defer alloc.free(events);
+    const ac = abi.AbiContract{ .events = events, .functions = &.{} };
+    try client.autoMigrateContract("curve", &ac, &.{"Transfer"}, "");
+    const fields = [_]db.DecodedField{.{ .name = "value", .value = "7" }};
+    try client.insertEventLog("curve", "Transfer", &fields, 10, "0xt1", 0, "0xA");
+    try client.insertEventLog("curve", "Transfer", &fields, 11, "0xt2", 0, "0xB");
+
+    // 真实请求形态：/events/curve/Transfer?address=0xB&limit=50
+    var p = try parseEventQueryParams(alloc, "address=0xB&limit=50");
+    defer p.deinit(alloc);
+
+    const json_str = try client.queryEventLogs("curve", "Transfer", p.block_from, p.block_to, p.tx_hash, p.address, p.limit, p.offset, p.order_desc);
+    defer alloc.free(json_str);
+
+    try std.testing.expect(std.mem.indexOf(u8, json_str, "0xB") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json_str, "0xA") == null);
 }
