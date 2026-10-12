@@ -535,7 +535,7 @@ git commit -m "feat: LogFilter 支持地址数组（多 clone 一次 getLogs）"
 - Test: `src/config.zig`
 
 **Interfaces:**
-- Produces: `TemplateConfig{ name, abi_path, events: []const []const u8, factory_name: []const u8, discovery_event: []const u8, discovery_address_field: []const u8, from_block: u64, poll_interval_ms: ?u32, block_batch_size: ?u32 }`；`Config.templates: []TemplateConfig`
+- Produces: `TemplateConfig{ name, abi_path, events: []const []const u8, factory_name: []const u8, discovery_event: []const u8, discovery_address_field: []const u8, from_block: u64, poll_interval_ms: ?u32, block_batch_size: ?u32 }`；`Config.templates: []TemplateConfig`；**并给 `FactoryConfig` 加 `template_name: []const u8`（默认 `""`）及其解析**（Task 8 只做行为分发，不再改配置层）
 
 - [ ] **Step 1: 写失败测试**
 
