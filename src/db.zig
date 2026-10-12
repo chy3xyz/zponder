@@ -270,10 +270,12 @@ pub const Client = struct {
         try w.writeAll("\n  block_number INTEGER NOT NULL,");
         try w.writeAll("\n  tx_hash TEXT NOT NULL,");
         try w.writeAll("\n  log_index INTEGER NOT NULL,");
+        try w.writeAll("\n  contract_address TEXT NOT NULL DEFAULT '',");
         try w.writeAll("\n  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,");
-        try w.print("\n  UNIQUE(tx_hash, log_index)\n);", .{});
+        try w.print("\n  UNIQUE(contract_address, tx_hash, log_index)\n);", .{});
         try w.print("\nCREATE INDEX IF NOT EXISTS idx_{s}_{s}_block ON event_{s}_{s}(block_number);", .{ contract_name, evt.name, contract_name, evt.name });
         try w.print("\nCREATE INDEX IF NOT EXISTS idx_{s}_{s}_tx ON event_{s}_{s}(tx_hash);", .{ contract_name, evt.name, contract_name, evt.name });
+        try w.print("\nCREATE INDEX IF NOT EXISTS idx_{s}_{s}_addr_block ON event_{s}_{s}(contract_address, block_number);", .{ contract_name, evt.name, contract_name, evt.name });
         var list = sql_buf.toArrayList();
         defer list.deinit(self.alloc);
         try self.exec(list.items);
@@ -304,9 +306,10 @@ pub const Client = struct {
         block_number: u64,
         tx_hash: []const u8,
         log_index: u64,
+        contract_address: []const u8,
     ) !void {
-        if (self.backend_type == .rocksdb) return self.insertEventLogRocks(contract_name, event_name, fields, block_number, tx_hash, log_index);
-        if (self.backend_type == .postgresql) return self.insertEventLogPG(contract_name, event_name, fields, block_number, tx_hash, log_index);
+        if (self.backend_type == .rocksdb) return self.insertEventLogRocks(contract_name, event_name, fields, block_number, tx_hash, log_index, contract_address);
+        if (self.backend_type == .postgresql) return self.insertEventLogPG(contract_name, event_name, fields, block_number, tx_hash, log_index, contract_address);
 
         var sql_buf: std.Io.Writer.Allocating = .init(self.alloc);
         defer sql_buf.deinit();
@@ -318,12 +321,12 @@ pub const Client = struct {
             defer self.alloc.free(col);
             try w.writeAll(col);
         }
-        try w.writeAll(",block_number,tx_hash,log_index) VALUES (");
+        try w.writeAll(",block_number,tx_hash,log_index,contract_address) VALUES (");
         for (fields, 0..) |_, i| {
             if (i > 0) try w.writeByte(',');
             try w.writeByte('?');
         }
-        try w.writeAll(",?,?,?);");
+        try w.writeAll(",?,?,?,?);");
         var sql_list = sql_buf.toArrayList();
         defer sql_list.deinit(self.alloc);
         var stmt: ?*c.sqlite3_stmt = null;
@@ -340,6 +343,8 @@ pub const Client = struct {
         if (c.sqlite3_bind_text(stmt, col_idx, tx_hash.ptr, @intCast(tx_hash.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.BindFailed;
         col_idx += 1;
         if (c.sqlite3_bind_int64(stmt, col_idx, @intCast(log_index)) != c.SQLITE_OK) return error.BindFailed;
+        col_idx += 1;
+        if (c.sqlite3_bind_text(stmt, col_idx, contract_address.ptr, @intCast(contract_address.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.BindFailed;
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.ExecFailed;
         if (self.cache) |cc| cc.invalidate(contract_name, event_name);
     }
@@ -352,7 +357,10 @@ pub const Client = struct {
         block_number: u64,
         tx_hash: []const u8,
         log_index: u64,
+        contract_address: []const u8,
     ) !void {
+        // RocksDB 无 SQL，不支持模板模式/地址列（延后项，见 task-1-report）
+        _ = contract_address;
         var key_buf: [512]u8 = undefined;
         const key = try std.fmt.bufPrint(&key_buf, "e:{s}:{s}:{d:0>20}:{s}:{d:0>20}", .{ contract_name, event_name, block_number, tx_hash, log_index });
         var val_buf: std.Io.Writer.Allocating = .init(self.alloc);
@@ -1466,10 +1474,12 @@ pub const Client = struct {
         try w.writeAll("\n  block_number BIGINT NOT NULL,");
         try w.writeAll("\n  tx_hash TEXT NOT NULL,");
         try w.writeAll("\n  log_index BIGINT NOT NULL,");
+        try w.writeAll("\n  contract_address TEXT NOT NULL DEFAULT '',");
         try w.writeAll("\n  created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,");
-        try w.print("\n  UNIQUE(tx_hash, log_index)\n);", .{});
+        try w.print("\n  UNIQUE(contract_address, tx_hash, log_index)\n);", .{});
         try w.print("\nCREATE INDEX IF NOT EXISTS idx_{s}_{s}_block ON event_{s}_{s}(block_number);", .{ contract_name, evt.name, contract_name, evt.name });
         try w.print("\nCREATE INDEX IF NOT EXISTS idx_{s}_{s}_tx ON event_{s}_{s}(tx_hash);", .{ contract_name, evt.name, contract_name, evt.name });
+        try w.print("\nCREATE INDEX IF NOT EXISTS idx_{s}_{s}_addr_block ON event_{s}_{s}(contract_address, block_number);", .{ contract_name, evt.name, contract_name, evt.name });
         var list = sql_buf.toArrayList();
         defer list.deinit(self.alloc);
         try self.pgconn.?.exec(list.items);
@@ -1483,6 +1493,7 @@ pub const Client = struct {
         block_number: u64,
         tx_hash: []const u8,
         log_index: u64,
+        contract_address: []const u8,
     ) !void {
         var sql_buf: std.Io.Writer.Allocating = .init(self.alloc);
         defer sql_buf.deinit();
@@ -1494,16 +1505,16 @@ pub const Client = struct {
             defer self.alloc.free(col);
             try w.writeAll(col);
         }
-        try w.writeAll(",block_number,tx_hash,log_index) VALUES (");
+        try w.writeAll(",block_number,tx_hash,log_index,contract_address) VALUES (");
         for (fields, 0..) |_, i| {
             if (i > 0) try w.writeByte(',');
             try w.print("${d}", .{i + 1});
         }
-        try w.print(",${d},${d},${d});", .{ fields.len + 1, fields.len + 2, fields.len + 3 });
+        try w.print(",${d},${d},${d},${d});", .{ fields.len + 1, fields.len + 2, fields.len + 3, fields.len + 4 });
         var sql_list = sql_buf.toArrayList();
         defer sql_list.deinit(self.alloc);
 
-        var params = try std.ArrayList([]const u8).initCapacity(self.alloc, fields.len + 3);
+        var params = try std.ArrayList([]const u8).initCapacity(self.alloc, fields.len + 4);
         defer params.deinit(self.alloc);
         for (fields) |f| try params.append(self.alloc, f.value);
         var block_buf: [21]u8 = undefined;
@@ -1513,6 +1524,7 @@ pub const Client = struct {
         var logidx_buf: [21]u8 = undefined;
         const li_str = try std.fmt.bufPrint(&logidx_buf, "{}", .{log_index});
         try params.append(self.alloc, li_str);
+        try params.append(self.alloc, contract_address);
 
         var result = try self.pgconn.?.execParams(sql_list.items, params.items);
         defer result.deinit();
@@ -2247,12 +2259,12 @@ test "db event table insert and query" {
     const test_contract = abi.AbiContract{ .events = events, .functions = &.{} };
     try client.autoMigrateContract("test", &test_contract, &.{"Transfer"});
     const fields = &.{ DecodedField{ .name = "from", .value = "0x1111" }, DecodedField{ .name = "to", .value = "0x2222" }, DecodedField{ .name = "value", .value = "0x64" } };
-    try client.insertEventLog("test", "Transfer", fields, 100, "0xtxhash", 0);
+    try client.insertEventLog("test", "Transfer", fields, 100, "0xtxhash", 0, "0xtest");
     const result = try client.queryEventLogs("test", "Transfer", 0, null, null, 10, 0, true);
     defer alloc.free(result);
     try std.testing.expect(std.mem.indexOf(u8, result, "0xtxhash") != null);
     const fields2 = &.{ DecodedField{ .name = "from", .value = "0xaaaa" }, DecodedField{ .name = "to", .value = "0xbbbb" }, DecodedField{ .name = "value", .value = "0x96" } };
-    try client.insertEventLog("test", "Transfer", fields2, 200, "0xtxhash2", 1);
+    try client.insertEventLog("test", "Transfer", fields2, 200, "0xtxhash2", 1, "0xtest");
     const r1 = try client.queryEventLogs("test", "Transfer", 150, null, null, 10, 0, true);
     defer alloc.free(r1);
     try std.testing.expect(std.mem.indexOf(u8, r1, "0xtxhash2") != null);
@@ -2340,9 +2352,9 @@ test "db deleteEventLogsInRange" {
     const test_contract = abi.AbiContract{ .events = events, .functions = &.{} };
     try client.autoMigrateContract("test", &test_contract, &.{"Transfer"});
     const f = &.{ DecodedField{ .name = "from", .value = "0x1111" }, DecodedField{ .name = "to", .value = "0x2222" }, DecodedField{ .name = "value", .value = "0x64" } };
-    try client.insertEventLog("test", "Transfer", f, 100, "0xtx1", 0);
-    try client.insertEventLog("test", "Transfer", f, 200, "0xtx2", 1);
-    try client.insertEventLog("test", "Transfer", f, 300, "0xtx3", 2);
+    try client.insertEventLog("test", "Transfer", f, 100, "0xtx1", 0, "0xtest");
+    try client.insertEventLog("test", "Transfer", f, 200, "0xtx2", 1, "0xtest");
+    try client.insertEventLog("test", "Transfer", f, 300, "0xtx3", 2, "0xtest");
     try client.deleteEventLogsInRange("test", "Transfer", 150, 250);
     const r = try client.queryEventLogs("test", "Transfer", null, null, null, 10, 0, true);
     defer alloc.free(r);
@@ -2378,7 +2390,7 @@ test "db rocksdb event insert and query" {
     defer client.deinit();
 
     const fields = &.{ DecodedField{ .name = "from", .value = "0x1111" }, DecodedField{ .name = "to", .value = "0x2222" }, DecodedField{ .name = "value", .value = "0x64" } };
-    try client.insertEventLog("test", "Transfer", fields, 100, "0xtxhash", 0);
+    try client.insertEventLog("test", "Transfer", fields, 100, "0xtxhash", 0, "0xtest");
 
     const result = try client.queryEventLogs("test", "Transfer", 0, null, null, 10, 0, true);
     defer alloc.free(result);
@@ -2392,9 +2404,9 @@ test "db rocksdb count and delete" {
     defer client.deinit();
 
     const f = &.{ DecodedField{ .name = "from", .value = "0xaa" }, DecodedField{ .name = "to", .value = "0xbb" } };
-    try client.insertEventLog("t", "Evt", f, 100, "0x1", 0);
-    try client.insertEventLog("t", "Evt", f, 200, "0x2", 1);
-    try client.insertEventLog("t", "Evt", f, 300, "0x3", 2);
+    try client.insertEventLog("t", "Evt", f, 100, "0x1", 0, "0xt");
+    try client.insertEventLog("t", "Evt", f, 200, "0x2", 1, "0xt");
+    try client.insertEventLog("t", "Evt", f, 300, "0x3", 2, "0xt");
 
     const count = try client.countEventRows("t", "Evt");
     try std.testing.expectEqual(@as(u64, 3), count);
@@ -2557,4 +2569,34 @@ test "db 打开非 NUL 结尾路径（回归：C 字符串终止符）" {
     defer client.deinit();
     try client.migrate();
     _ = try client.ponderExec("CREATE TABLE IF NOT EXISTS nul_regress (a INTEGER);", &.{});
+}
+
+test "db 事件表 contract_address 列：同 tx 不同合约都能落库" {
+    const alloc = std.testing.allocator;
+    const cfg = DatabaseConfig{ .db_type = "sqlite", .db_name = ":memory:", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var client = try Client.init(alloc, &cfg);
+    defer client.deinit();
+    try client.migrate();
+
+    const test_evt = abi.AbiEvent{ .name = "Transfer", .inputs = &.{
+        .{ .name = "from", .type = "address", .indexed = true },
+        .{ .name = "value", .type = "uint256", .indexed = false },
+    }, .signature = std.mem.zeroes([32]u8) };
+    var events = try alloc.alloc(abi.AbiEvent, 1);
+    events[0] = test_evt;
+    defer alloc.free(events);
+    const ac = abi.AbiContract{ .events = events, .functions = &.{} };
+    try client.autoMigrateContract("curve", &ac, &.{"Transfer"});
+
+    const fields = [_]DecodedField{
+        .{ .name = "from", .value = "0xaaa" },
+        .{ .name = "value", .value = "1" },
+    };
+    // 同一 tx_hash/log_index，两个不同 clone：都必须存在（旧唯一键会把第二条顶掉）
+    try client.insertEventLog("curve", "Transfer", &fields, 100, "0xtx1", 0, "0xCLONE_A");
+    try client.insertEventLog("curve", "Transfer", &fields, 100, "0xtx1", 0, "0xCLONE_B");
+
+    const rows = try client.ponderQuery("SELECT contract_address, COUNT(*) AS n FROM event_curve_Transfer GROUP BY contract_address;", &.{});
+    defer client.freeQueryRows(rows);
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
 }

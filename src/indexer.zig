@@ -699,6 +699,7 @@ pub const Indexer = struct {
                         lg.block_number,
                         lg.transaction_hash,
                         lg.log_index,
+                        self.contract.address,
                     );
 
                     if (std.mem.eql(u8, evt.name, "Transfer")) {
