@@ -172,7 +172,7 @@ zponder is a layered Ethereum event indexer. Each layer has a single responsibil
 | `account_states` | `UNIQUE(contract, account)`  | Account balance snapshots                |
 | `snapshots`      | —                            | Periodic indexer state snapshots         |
 | `raw_logs`       | —                            | Dead letter queue for undecodable logs   |
-| `block_hashes`   | `UNIQUE(contract, block)`    | Per-contract block hashes (reorg detect) |
+| `block_hashes`   | `UNIQUE(contract_address, block_number)`    | Per-contract block hashes (reorg detect) |
 | `blocks`         | `UNIQUE(chain, block_number)`| Chain-wide block metadata               |
 | `call_cache`     | `UNIQUE(cache_key)`          | eth_call result cache                    |
 | `template_addresses` | `PRIMARY KEY (template, address)` | Template-mode clone address set + backfill progress |
