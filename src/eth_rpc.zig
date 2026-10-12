@@ -17,7 +17,10 @@ pub const Log = struct {
 
 /// 日志过滤条件
 pub const LogFilter = struct {
-    address: ?[]const u8 = null,
+    /// 地址集合（模板模式下一次 eth_getLogs 覆盖多个 clone 地址）。
+    /// null 与长度 0 语义相同，都表示"不过滤地址"：序列化时两者都写成 JSON null，
+    /// 不写成 `[]`——部分 RPC 对空地址数组的行为不一致。
+    addresses: ?[]const []const u8 = null,
     topics: ?[]const []const u8 = null,
     from_block: ?u64 = null,
     to_block: ?u64 = null,
@@ -391,14 +394,25 @@ pub const Client = struct {
 
 /// 将 LogFilter 格式化为 JSON 对象字符串（非数组包裹）。
 /// `include_block_range` 为 true 时写入 fromBlock/toBlock（eth_getLogs）；
+/// addresses 写成 `"address":["0xA","0xB"]`（单元素也是数组；null/空数组都写 `null`）；
 /// topics 按 topic0 OR 语义写成 `[["sig1","sig2",...]]`。
 pub fn formatLogFilterObject(alloc: std.mem.Allocator, filter: LogFilter, include_block_range: bool) ![]u8 {
     var buf: std.Io.Writer.Allocating = .init(alloc);
     defer buf.deinit();
 
     try buf.writer.writeAll("{\"address\":");
-    if (filter.address) |addr| {
-        try buf.writer.print("\"{s}\"", .{addr});
+    if (filter.addresses) |addrs| {
+        // 空数组与 null 等价：都输出 null（见 LogFilter.addresses 注释）。
+        if (addrs.len == 0) {
+            try buf.writer.writeAll("null");
+        } else {
+            try buf.writer.writeByte('[');
+            for (addrs, 0..) |a, i| {
+                if (i > 0) try buf.writer.writeByte(',');
+                try buf.writer.print("\"{s}\"", .{a});
+            }
+            try buf.writer.writeByte(']');
+        }
     } else {
         try buf.writer.writeAll("null");
     }
@@ -641,7 +655,7 @@ test "formatLogFilter" {
     };
     var client = Client.init(alloc, undefined, &rpc_cfg);
     const filter = LogFilter{
-        .address = "0xabc",
+        .addresses = &[_][]const u8{"0xabc"},
         .from_block = 100,
         .to_block = 200,
         .topics = &[_][]const u8{"0x123", "0x456"},
@@ -654,6 +668,34 @@ test "formatLogFilter" {
     try std.testing.expect(std.mem.indexOf(u8, params, "0x123") != null);
     // topic0 OR 语义
     try std.testing.expect(std.mem.indexOf(u8, params, "[[\"0x123\",\"0x456\"]]") != null);
+}
+
+test "eth_rpc LogFilter 地址数组序列化" {
+    const alloc = std.testing.allocator;
+    const addrs = [_][]const u8{ "0xA", "0xB" };
+    const f1 = LogFilter{ .addresses = &addrs, .from_block = 1, .to_block = 2 };
+    const s1 = try formatLogFilterObject(alloc, f1, true);
+    defer alloc.free(s1);
+    try std.testing.expectEqualStrings("{\"address\":[\"0xA\",\"0xB\"],\"fromBlock\":\"0x1\",\"toBlock\":\"0x2\"}", s1);
+
+    const f2 = LogFilter{ .from_block = 1 };
+    const s2 = try formatLogFilterObject(alloc, f2, true);
+    defer alloc.free(s2);
+    try std.testing.expectEqualStrings("{\"address\":null,\"fromBlock\":\"0x1\"}", s2);
+
+    // 单元素也输出数组（不做回退成字符串）
+    const one = [_][]const u8{"0xA"};
+    const f3 = LogFilter{ .addresses = &one };
+    const s3 = try formatLogFilterObject(alloc, f3, false);
+    defer alloc.free(s3);
+    try std.testing.expectEqualStrings("{\"address\":[\"0xA\"]}", s3);
+
+    // 空数组与 null 等价：都输出 null（部分 RPC 对空地址数组行为不一致）
+    const empty = [_][]const u8{};
+    const f4 = LogFilter{ .addresses = &empty };
+    const s4 = try formatLogFilterObject(alloc, f4, false);
+    defer alloc.free(s4);
+    try std.testing.expectEqualStrings("{\"address\":null}", s4);
 }
 
 test "freeLogs" {

@@ -474,8 +474,9 @@ pub const Indexer = struct {
             };
             defer self.freeEventTopics(topics);
 
+            const addrs = [_][]const u8{self.contract.address};
             const filter = eth_rpc.LogFilter{
-                .address = self.contract.address,
+                .addresses = &addrs,
                 .topics = if (topics.len > 0) topics else null,
             };
             const filter_obj = self.rpc.formatSubscribeLogsFilter(filter) catch |e| {
@@ -578,8 +579,9 @@ pub const Indexer = struct {
         const topics = try self.buildEventTopics();
         defer self.freeEventTopics(topics);
 
+        const addrs = [_][]const u8{self.contract.address};
         const filter = eth_rpc.LogFilter{
-            .address = self.contract.address,
+            .addresses = &addrs,
             .topics = if (topics.len > 0) topics else null,
             .from_block = from_block,
             .to_block = to_block,
