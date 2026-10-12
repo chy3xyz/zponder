@@ -112,14 +112,14 @@ kill -0 "$ANVIL_PID" 2>/dev/null || { cat "$ANVIL_LOG"; die "anvil did not start
 say "[3/7] Compile Launchpad.sol + Curve.sol and deploy"
 rm -rf "$BUILD_DIR"; mkdir -p "$BUILD_DIR"
 if ! solc --abi --bin --optimize --overwrite \
-    "$DEMO_DIR/Launchpad.sol" "$DEMO_DIR/Curve.sol" -o "$BUILD_DIR" >"$BUILD_DIR/solc.log" 2>&1; then
+    "$DEMO_DIR/Launchpad.sol" "$DEMO_DIR/Curve.sol" "$DEMO_DIR/Pair.sol" -o "$BUILD_DIR" >"$BUILD_DIR/solc.log" 2>&1; then
     cat "$BUILD_DIR/solc.log"; die "solc failed"
 fi
 # The config points at the committed ABIs — make sure they match the sources.
 python3 -c '
 import json, sys
 build, demo = sys.argv[1], sys.argv[2]
-for name in ("Launchpad", "Curve"):
+for name in ("Launchpad", "Curve", "Pair"):
     if json.load(open(build + "/" + name + ".abi")) != json.load(open(demo + "/" + name + ".abi")):
         print("ABI drift: " + name)
         sys.exit(1)
@@ -134,7 +134,7 @@ LAUNCHPAD=$(send --create "$(cat "$BUILD_DIR/Launchpad.bin")" | jget 'import jso
 pass "Launchpad deployed at $LAUNCHPAD"
 
 # ── 4. create clones + buys ────────────────────────────────────────────────
-say "[4/7] createCurve() ×3, then buy() on each clone"
+say "[4/7] createCurve() ×3, buy() on each, then clone1 announces a pair"
 CURVES=()
 for i in 1 2 3; do
     RECEIPT=$(send "$LAUNCHPAD" "createCurve()")
@@ -156,6 +156,14 @@ done
 TOTAL_BUYS=0
 for n in "${BUYS_PER_CLONE[@]}"; do TOTAL_BUYS=$((TOTAL_BUYS + n)); done
 echo "  total Buy events expected: $TOTAL_BUYS"
+
+# ── post-graduation market: 地址只有 clone 知道，靠 clone 的 Paired 事件发现 ──
+PAIR=$(send --create "$(cat "$BUILD_DIR/Pair.bin")" | jget 'import json,sys;print(json.load(sys.stdin)["contractAddress"].lower())')
+pass "Pair deployed at $PAIR"
+send "${CURVES[0]}" "setPair(address)" "$PAIR" >/dev/null
+pass "clone1 announced it via Paired($PAIR)"
+send "$PAIR" "swap(uint256,uint256)" 1000000000000000000 900000000000000000 >/dev/null
+pass "pair swapped once (Swap → event_pair_Swap)"
 
 # ── 5. start zponder ───────────────────────────────────────────────────────
 say "[5/7] Start zponder (factory discovery → curve template)"
@@ -195,10 +203,14 @@ wait_sql() { # sql expected label
 }
 wait_sql "SELECT COUNT(*) FROM template_addresses WHERE template='curve';" 3 "template_addresses 3"
 wait_sql "SELECT COUNT(*) FROM event_curve_Buy;" "$TOTAL_BUYS" "event_curve_Buy $TOTAL_BUYS"
+# 第二个模板：clone1 的 Paired 事件被 curve 模板解出 → 工厂分发表 → pair 地址
+# 进 pair 模板地址集合，随后补扫到 Swap（发现源是模板，不是具体合约地址）。
+wait_sql "SELECT COUNT(*) FROM template_addresses WHERE template='pair';" 1 "template_addresses pair 1"
+wait_sql "SELECT COUNT(*) FROM event_pair_Swap;" 1 "event_pair_Swap 1"
 # template_addresses only reaches 3 once discovery ran; the event count only
 # reaches 6 once the template backfill + sweep covered every clone.
 sleep 1
-pass "converged: 3 cloned addresses discovered, $TOTAL_BUYS Buy events indexed"
+pass "converged: 3 cloned addresses + 1 pair discovered, $TOTAL_BUYS Buy + 1 Swap indexed"
 
 # ── 7. assertions ──────────────────────────────────────────────────────────
 say "[7/7] Assertions"
@@ -229,9 +241,12 @@ check_eq "A3 rows WHERE contract_address='${CURVES[1]}'" "${BUYS_PER_CLONE[1]}" 
 check_eq "A4 template_addresses WHERE template='curve'" 3 \
     "$(sqlite3 "$DB" "SELECT COUNT(*) FROM template_addresses WHERE template='curve';")"
 
-# A5 — exactly one set of event_curve_* tables (not one per clone)
-check_eq "A5 COUNT(tables LIKE 'event_curve_*')" 1 \
+# A5 — 每个模板一套事件表，与 clone/pair 数量无关：
+#      curve 模板 2 个事件（Buy/Paired）→ 2 张表；pair 模板 1 个事件 → 1 张表
+check_eq "A5 COUNT(tables LIKE 'event_curve_*')" 2 \
     "$(sqlite3 "$DB" '.tables' | tr -s ' ' '\n' | grep -c '^event_curve_' || true)"
+check_eq "A5b COUNT(tables LIKE 'event_pair_*')" 1 \
+    "$(sqlite3 "$DB" '.tables' | tr -s ' ' '\n' | grep -c '^event_pair_' || true)"
 ls -1 "$DB"* | sed 's/^/    /'
 
 # A6 — REST ?address= narrows to the requested clone
@@ -244,6 +259,17 @@ check_eq "A6b REST ?address= distinct contract_address" "${CURVES[1]}" \
 # A7 — unfiltered REST sees every clone's events in the same table
 check_eq "A7 REST unfiltered row count" "$TOTAL_BUYS" \
     "$(curl -s "http://127.0.0.1:${HTTP_PORT}/events/curve/Buy?limit=100" | jget 'import json,sys;print(len(json.load(sys.stdin)))')"
+
+# A8-A10 — 第二个模板：地址由 clone 的 Paired 事件发现（from_template 发现源）
+echo "  event_pair_Swap (discovered via the curve template):"
+sqlite3 -header -column "$DB" \
+    "SELECT contract_address, evt_amountin, evt_amountout FROM event_pair_Swap;" | sed 's/^/    /'
+check_eq "A8 template_addresses WHERE template='pair'" 1 \
+    "$(sqlite3 "$DB" "SELECT COUNT(*) FROM template_addresses WHERE template='pair';")"
+check_eq "A9 event_pair_Swap rows" 1 \
+    "$(sqlite3 "$DB" "SELECT COUNT(*) FROM event_pair_Swap;")"
+check_eq "A10 event_pair_Swap 来自被发现的 pair 地址" "$PAIR" \
+    "$(sqlite3 "$DB" "SELECT contract_address FROM event_pair_Swap LIMIT 1;")"
 
 echo ""
 echo -e "${GREEN}${BOLD}All assertions passed.${NC}"

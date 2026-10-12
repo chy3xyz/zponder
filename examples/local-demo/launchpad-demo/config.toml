@@ -53,7 +53,9 @@ max_children = 100000
 [[templates]]
 name = "curve"
 abi_path = "./examples/local-demo/launchpad-demo/Curve.abi"
-events = ["Buy"]
+# `Paired` 不是给业务表用的，而是给下面 pair_discovery 的发现源用的：
+# 发现源索引器必须能解出该事件，工厂分发表才会被触发。
+events = ["Buy", "Paired"]
 factory_name = "launchpad_factory"
 # discovery_event / discovery_address_field are NOT used at runtime: dispatch is
 # decided by the [[factories]] entry above (creation_event / child_address_field).
@@ -65,3 +67,26 @@ poll_interval_ms = 200
 block_batch_size = 500
 # Optional; default 200. Upper bound on clone addresses per eth_getLogs request.
 max_addresses_per_request = 200
+
+# ── discovery #2: the clone itself announces its post-graduation pair ──────
+# `from_template` (instead of `address`) makes the discovery source a template's
+# address set rather than a concrete contract: the pair address is only known to
+# the Curve clone (`Paired(pair)`), never to the factory. One source can carry
+# several rules; here it carries exactly one.
+[[factories]]
+name = "pair_discovery"
+from_template = "curve"
+creation_event = "Paired"
+child_address_field = "pair"
+template_name = "pair"
+max_children = 100000
+
+# ── the second template: one indexer serving every discovered pair ─────────
+[[templates]]
+name = "pair"
+abi_path = "./examples/local-demo/launchpad-demo/Pair.abi"
+events = ["Swap"]
+factory_name = "pair_discovery"
+from_block = 0
+poll_interval_ms = 200
+block_batch_size = 500

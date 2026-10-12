@@ -10,6 +10,11 @@ contract Curve {
 
     event Buy(address buyer, uint256 amount);
 
+    /// 毕业后市场（Pancake pair）地址：由 clone 自己发出 —— zponder 的
+    /// `[[factories]] from_template` 以本模板的事件作为发现源，把 pair 喂给
+    /// 第二个模板（见 config.toml 的 pair_discovery）。
+    event Paired(address indexed pair);
+
     constructor(address _token) {
         token = _token;
     }
@@ -17,5 +22,9 @@ contract Curve {
     function buy(uint256 amount) external {
         totalBought += amount;
         emit Buy(msg.sender, amount);
+    }
+
+    function setPair(address pair) external {
+        emit Paired(pair);
     }
 }
