@@ -93,7 +93,60 @@ ponder.http.post("/api/echo", (c) => {
 
 ---
 
+## 四、业务投影写库（`ponder.db`）
+
+把事件写成派生表（K 线、聚合、快照）。参数化绑定，不用拼字符串。
+
+```javascript
+// 建表放脚本顶层：加载时执行一次
+ponder.db.exec(`
+  CREATE TABLE IF NOT EXISTS proj_erc20_kline (
+    block_number INTEGER NOT NULL PRIMARY KEY,
+    ts           INTEGER NOT NULL,
+    total        TEXT NOT NULL,
+    tx_count     INTEGER NOT NULL DEFAULT 0
+  );
+`);
+
+ponder.on("ERC20:Transfer", (event) => {
+  const { from, to, value } = event.args;
+  const amount = String(BigInt(value || "0x0"));
+
+  // 逐笔明细
+  ponder.db.exec(
+    "INSERT OR REPLACE INTO proj_erc20_flow (block_number, ts, from_addr, to_addr, amount) VALUES (?, ?, ?, ?, ?);",
+    event.block.number, event.block.timestamp, from, to, amount,
+  );
+
+  // 每块聚合（K 线柱）：同块多笔累加
+  ponder.db.exec(
+    `INSERT INTO proj_erc20_kline (block_number, ts, total, tx_count) VALUES (?, ?, ?, 1)
+     ON CONFLICT(block_number) DO UPDATE SET
+       total = CAST(CAST(total AS INTEGER) + CAST(excluded.total AS INTEGER) AS TEXT),
+       tx_count = tx_count + 1;`,
+    event.block.number, event.block.timestamp, amount,
+  );
+});
+```
+
+API：
+
+| 调用 | 说明 |
+|------|------|
+| `ponder.db.exec(sql, ...params)` | 写语句（DDL/DML），返回 affected rows |
+| `ponder.db.query(sql, ...params)` | 查询，返回行对象数组（列名为 key） |
+
+- 参数用 `?` 占位（SQLite）/ `$1..$n`（PostgreSQL），值类型：`number`（整数值存 INTEGER，否则 REAL）、`string`、`boolean`、`null`、`ArrayBuffer`（BLOB）
+- 结果类型：INTEGER/REAL → number，TEXT → string，BLOB → ArrayBuffer，NULL → null
+- 后端：SQLite / PostgreSQL 可用；RocksDB 无 SQL，调用时抛错
+- 投影表命名约定 `proj_` 前缀 + 必须含 `block_number` 列：**重组回滚时引擎按 `block_number >= fork_point` 级联删除**，不会留下脏数据
+- 写入失败不中断索引：`log.err` + `/metrics` 的 `zponder_projection_errors_total` 计数，修好后删表重放即可
+- 参考 `erc20_projection.js`
+
+---
+
 ## 说明
 
 - 索引数据查询用内置 **REST**（`/events/:contract/:event`）或 **GraphQL**（`/graphql`）；`ponder.http` 适合自定义轻量接口
 - 实时事件流用 **SSE**（`/stream`）或 **GraphQL Subscription**（`newBlocks`）
+- **同一事件键只保留最后注册的 handler**：多个脚本对 `Contract:Event`（或裸 `Event`）重复注册时后者覆盖前者，建议一个事件只有一个归属脚本

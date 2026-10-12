@@ -17,8 +17,9 @@
 | `build.zig` + `build.zig.zon` | Complete (embeds QuickJS-ng v0.17.0 + zgraphql v0.8.0, vendored) |
 | `src/` source files     | 22+ Zig files |
 | `config.toml`           | Complete (`ws_url` / `ws_urls` optional) |
-| Unit tests              | 70+ passing  |
+| Unit tests              | 98 passing  |
 | QuickJS Script Engine   | Production (Ponder-style `ponder.on` JS API) |
+| 业务投影 (ponder.db)     | Production (`exec`/`query` 参数化写库 + `proj_` 表重组级联回滚) |
 | Async Webhook Queue     | Production   |
 | SSE Stream API          | Production (`/stream`, `/api/v1/stream`) |
 | WSS Live Subscribe      | Production (HTTP catch-up → tip `eth_subscribe(logs)`) |
@@ -39,6 +40,7 @@
 | HTTP Server        | `std.http.Server` + `std.Io`                 |
 | GraphQL Engine     | [zgraphql](https://github.com/chy3xyz/zgraphql) v0.8.0 (vendored) |
 | RPC Client         | HTTP JSON-RPC failover + optional WSS `eth_subscribe` |
+| 事件时间戳          | 有 JS handler 时惰性拉取 + 缓存（`event.block.timestamp`） |
 | Build              | `build.zig` + `build.zig.zon`                 |
 
 ---

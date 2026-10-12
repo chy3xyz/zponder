@@ -11,6 +11,71 @@ fn jsUndefined(ctx: ?*c.JSContext) c.JSValue {
     return .{ .u = .{ .int32 = 0 }, .tag = @as(i64, c.JS_TAG_UNDEFINED) };
 }
 
+/// JS null 值（同 JS_UNDEFINED，c.JS_NULL 宏在 Zig 0.17 有 zeroInit 兼容问题）
+fn jsNull(ctx: ?*c.JSContext) c.JSValue {
+    _ = ctx;
+    return .{ .u = .{ .int32 = 0 }, .tag = @as(i64, c.JS_TAG_NULL) };
+}
+
+/// 抛出 JS TypeError（错误文案），返回值供 C 回调直接 return
+fn throwDbError(ctx: ?*c.JSContext, err: anyerror) c.JSValue {
+    var buf: [160]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, "ponder.db 执行失败: {s}", .{@errorName(err)}) catch
+        "ponder.db 执行失败";
+    const len = if (msg.len < buf.len) msg.len else buf.len - 1;
+    buf[len] = 0;
+    return c.JS_ThrowTypeError(ctx, "%s", @as([*c]const u8, buf[0..len :0].ptr));
+}
+
+/// JS 值 -> SqlValue；text 需要 JS_ToCStringLen 的所有权，记录在 out_cstr 由调用方释放。
+/// blob 借 JS ArrayBuffer 缓冲（调用期间 JS 值存活即可），不复制。
+fn jsToSqlValue(ctx: ?*c.JSContext, val: c.JSValue, out_cstr: *?[*c]const u8) ?db.SqlValue {
+    out_cstr.* = null;
+    if (c.JS_IsNull(val) or c.JS_IsUndefined(val)) return .null;
+    if (c.JS_IsBool(val)) {
+        const b = c.JS_ToBool(ctx, val);
+        return .{ .integer = if (b > 0) 1 else 0 };
+    }
+    if (c.JS_IsNumber(val)) {
+        var d: f64 = 0;
+        if (c.JS_ToFloat64(ctx, &d, val) < 0) return null;
+        // 整数值且 i64 范围内走 INTEGER，避免 SQLite 全部存成 REAL
+        if (@floor(d) == d and d >= -9223372036854775808.0 and d < 9223372036854775808.0) {
+            return .{ .integer = @intFromFloat(d) };
+        }
+        if (std.math.isNan(d) or std.math.isInf(d)) return null;
+        return .{ .float = d };
+    }
+    if (c.JS_IsString(val)) {
+        var len: usize = 0;
+        const cstr = c.JS_ToCStringLen(ctx, &len, val) orelse return null;
+        out_cstr.* = cstr;
+        return .{ .text = std.mem.span(cstr)[0..len] };
+    }
+    // ArrayBuffer -> BLOB
+    if (c.JS_IsObject(val)) {
+        var size: usize = 0;
+        const buf = c.JS_GetArrayBuffer(ctx, &size, val);
+        if (buf != null) {
+            _ = c.JS_GetException(ctx); // 非 ArrayBuffer 时清理可能的异常
+            return .{ .blob = @as([*]const u8, @ptrCast(buf))[0..size] };
+        }
+        _ = c.JS_GetException(ctx);
+    }
+    return null;
+}
+
+/// SqlValue -> JS 值（text/blob 拷贝进 JS 堆）
+fn sqlValueToJs(ctx: ?*c.JSContext, v: db.SqlValue) c.JSValue {
+    return switch (v) {
+        .null => jsNull(ctx),
+        .integer => |i| c.JS_NewInt64(ctx, i),
+        .float => |f| c.JS_NewFloat64(ctx, f),
+        .text => |t| c.JS_NewStringLen(ctx, t.ptr, t.len),
+        .blob => |b| c.JS_NewArrayBufferCopy(ctx, b.ptr, b.len),
+    };
+}
+
 /// ponder.http 路由（Hono-like 最小实现）
 pub const HttpRoute = struct {
     method: HttpMethod,
@@ -61,6 +126,10 @@ pub const JsEngine = struct {
     current_req: ?*const HttpRequestCtx = null,
     // 当前 middleware 分发上下文
     dispatch_ctx: ?*DispatchCtx = null,
+    // ponder.db 写库客户端（由 main 注入；RocksDB 后端调用时抛错）
+    db_client: ?*db.Client = null,
+    // 投影错误计数（JS handler 写库失败），供 /metrics 读取
+    projection_errors: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     // 当前响应的 content type / status / headers（c.json/c.text/c.status/c.header 设置）
     current_content_type: ContentType = .json,
     current_status: u16 = 200,
@@ -117,6 +186,23 @@ pub const JsEngine = struct {
         self.alloc.destroy(self);
     }
 
+    /// 注入 ponder.db 的数据库客户端（main 启动时调用一次）
+    pub fn setDb(self: *JsEngine, client: *db.Client) void {
+        self.db_client = client;
+    }
+
+    /// 已注册的事件 handler 数量（>0 时才需要为事件解析链上时间戳）
+    pub fn handlerCount(self: *JsEngine) usize {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        return self.handlers.count();
+    }
+
+    /// 投影失败累计数（供 /metrics 暴露）
+    pub fn projectionErrorCount(self: *JsEngine) u64 {
+        return self.projection_errors.load(.monotonic);
+    }
+
     /// 注入全局 ponder 对象 + ponder.on(event, handler)
     fn injectPonder(self: *JsEngine) !void {
         const ctx = self.ctx orelse return error.NoContext;
@@ -126,6 +212,14 @@ pub const JsEngine = struct {
         const ponder = c.JS_NewObject(ctx);
         const on_fn = c.JS_NewCFunction2(ctx, ponderOnCallback, "on", 2, 0, 0);
         _ = c.JS_SetPropertyStr(ctx, ponder, "on", on_fn);
+
+        // ponder.db（业务投影）：exec(sql, ...params) / query(sql, ...params)
+        const db_obj = c.JS_NewObject(ctx);
+        const db_exec_fn = c.JS_NewCFunction2(ctx, dbExecCallback, "exec", 1, 0, 0);
+        const db_query_fn = c.JS_NewCFunction2(ctx, dbQueryCallback, "query", 1, 0, 0);
+        _ = c.JS_SetPropertyStr(ctx, db_obj, "exec", db_exec_fn);
+        _ = c.JS_SetPropertyStr(ctx, db_obj, "query", db_query_fn);
+        _ = c.JS_SetPropertyStr(ctx, ponder, "db", db_obj);
 
         // ponder.http（Hono-like）：.use/.get/.post/.put/.delete(path, handler)
         const http_obj = c.JS_NewObject(ctx);
@@ -161,6 +255,85 @@ pub const JsEngine = struct {
 
         engine.registerHandler(evt_name, handler_val);
         return jsUndefined(ctx);
+    }
+
+    /// ponder.db.exec(sql, ...params)
+    fn dbExecCallback(ctx: ?*c.JSContext, _: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+        return dbCallImpl(ctx, argc, argv, false);
+    }
+
+    /// ponder.db.query(sql, ...params)
+    fn dbQueryCallback(ctx: ?*c.JSContext, _: c.JSValue, argc: c_int, argv: [*c]c.JSValue) callconv(.c) c.JSValue {
+        return dbCallImpl(ctx, argc, argv, true);
+    }
+
+    /// ponder.db 调用共享实现（exec/query），参数化绑定，不拼接 SQL。
+    fn dbCallImpl(ctx: ?*c.JSContext, argc: c_int, argv: [*c]c.JSValue, is_query: bool) c.JSValue {
+        const rt = c.JS_GetRuntime(ctx);
+        const opaque_ptr = c.JS_GetRuntimeOpaque(rt) orelse return c.JS_ThrowTypeError(ctx, "ponder.db 未初始化");
+        const engine = @as(*JsEngine, @ptrCast(@alignCast(opaque_ptr)));
+        const client = engine.db_client orelse return c.JS_ThrowTypeError(ctx, "ponder.db 未注入数据库客户端");
+        if (client.backend_type == .rocksdb) {
+            return c.JS_ThrowTypeError(ctx, "ponder.db 需要 SQL 后端（当前为 rocksdb，无 SQL 支持）");
+        }
+        if (argc < 1 or !c.JS_IsString(argv[0])) {
+            return c.JS_ThrowTypeError(ctx, "ponder.db 第一个参数必须是 SQL 字符串");
+        }
+
+        var sql_len: usize = 0;
+        const sql_cstr = c.JS_ToCStringLen(ctx, &sql_len, argv[0]) orelse return jsUndefined(ctx);
+        defer c.JS_FreeCString(ctx, sql_cstr);
+        const sql = std.mem.span(sql_cstr)[0..sql_len];
+
+        const nparams: usize = if (argc > 1) @intCast(argc - 1) else 0;
+        const params = engine.alloc.alloc(db.SqlValue, nparams) catch
+            return c.JS_ThrowTypeError(ctx, "ponder.db 参数分配失败");
+        defer engine.alloc.free(params);
+        // text 参数的 C 字符串由 QuickJS 分配，语句执行完统一释放
+        const cstrs = engine.alloc.alloc(?[*c]const u8, nparams) catch
+            return c.JS_ThrowTypeError(ctx, "ponder.db 参数分配失败");
+        defer {
+            for (cstrs) |cs| {
+                if (cs) |p| c.JS_FreeCString(ctx, p);
+            }
+            engine.alloc.free(cstrs);
+        }
+        for (0..nparams) |i| {
+            params[i] = jsToSqlValue(ctx, argv[i + 1], &cstrs[i]) orelse
+                return c.JS_ThrowTypeError(ctx, "ponder.db 不支持的参数类型（number/string/boolean/null/ArrayBuffer）");
+        }
+
+        if (is_query) {
+            const rows = client.ponderQuery(sql, params) catch |e| {
+                engine.recordProjectionError(sql, e);
+                return throwDbError(ctx, e);
+            };
+            defer client.freeQueryRows(rows);
+            const arr = c.JS_NewArray(ctx);
+            for (rows, 0..) |row, ri| {
+                const obj = c.JS_NewObject(ctx);
+                for (row.names, row.values) |name, val| {
+                    const name_z = engine.alloc.dupeSentinel(u8, name, 0) catch continue;
+                    defer engine.alloc.free(name_z);
+                    _ = c.JS_SetPropertyStr(ctx, obj, name_z.ptr, sqlValueToJs(ctx, val));
+                }
+                _ = c.JS_SetPropertyUint32(ctx, arr, @intCast(ri), obj);
+            }
+            return arr;
+        }
+
+        const changes = client.ponderExec(sql, params) catch |e| {
+            engine.recordProjectionError(sql, e);
+            return throwDbError(ctx, e);
+        };
+        return c.JS_NewInt64(ctx, @intCast(changes));
+    }
+
+    /// 记录一次投影失败（日志 + 计数），不中断索引
+    fn recordProjectionError(self: *JsEngine, sql: []const u8, e: anyerror) void {
+        _ = self.projection_errors.fetchAdd(1, .monotonic);
+        log.err("投影写入失败 ({s}): {any}", .{ @errorName(e), e });
+        log.err("  失败 SQL: {s}", .{sql});
     }
 
     /// ponder.http.get(path, handler) 回调
@@ -360,7 +533,7 @@ pub const JsEngine = struct {
     }
 
     /// 事件触发入口（indexer 线程）：查找匹配 handler 并执行
-    pub fn handleEvent(self: *JsEngine, contract_name: []const u8, event_name: []const u8, fields: []const db.DecodedField, block_number: u64) void {
+    pub fn handleEvent(self: *JsEngine, contract_name: []const u8, event_name: []const u8, fields: []const db.DecodedField, block_number: u64, block_timestamp: u64) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
 
@@ -391,10 +564,23 @@ pub const JsEngine = struct {
         const block_obj = c.JS_NewObject(ctx);
         const bn = c.JS_NewInt64(ctx, @intCast(block_number));
         _ = c.JS_SetPropertyStr(ctx, block_obj, "number", bn);
+        const bts = c.JS_NewInt64(ctx, @intCast(block_timestamp));
+        _ = c.JS_SetPropertyStr(ctx, block_obj, "timestamp", bts);
         _ = c.JS_SetPropertyStr(ctx, event_obj, "block", block_obj);
 
         // 调用 handler(event)
         const result = c.JS_Call(ctx, handler, jsUndefined(ctx), 1, &event_obj);
+        // handler 抛错不中断索引，但必须可见：记录日志 + 计数（设计 §5 失败语义）
+        if (c.JS_IsException(result)) {
+            const exc = c.JS_GetException(ctx);
+            const str = c.JS_ToCString(ctx, exc);
+            if (str != null) {
+                defer c.JS_FreeCString(ctx, str);
+                log.err("JS handler 异常 ({s}:{s} @ block {d}): {s}", .{ contract_name, event_name, block_number, str });
+            }
+            c.JS_FreeValue(ctx, exc);
+            _ = self.projection_errors.fetchAdd(1, .monotonic);
+        }
         c.JS_FreeValue(ctx, result);
 
         // 驱动 async handler 的 pending jobs（有限次，避免长任务阻塞索引）
@@ -658,7 +844,7 @@ test "js engine ponder.on 注册与事件触发" {
 
     // 触发事件（Contract:Event 与 Event 两种写法都应匹配）
     const fields = [_]db.DecodedField{.{ .name = "value", .value = "100" }};
-    engine.handleEvent("dai", "Transfer", &fields, 123);
+    engine.handleEvent("dai", "Transfer", &fields, 123, 1700000000);
 
     // 验证 handler 被调用
     try engine.evalScript("if (received !== 123) throw new Error('handler not called: ' + received);", "check.js");
@@ -675,7 +861,7 @@ test "js engine ponder.on Contract:Event 全名匹配" {
     , "test.js");
 
     const fields = [_]db.DecodedField{.{ .name = "value", .value = "0x64" }};
-    engine.handleEvent("Dai", "Transfer", &fields, 1);
+    engine.handleEvent("Dai", "Transfer", &fields, 1, 1700000000);
 
     try engine.evalScript("if (hit !== '0x64') throw new Error('not hit: ' + hit);", "check.js");
 }
@@ -783,4 +969,71 @@ test "js engine ponder.http handler 异常返回 500" {
     }
     try std.testing.expectEqual(@as(u16, 500), resp.status);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "kaboom") != null);
+}
+
+test "js engine ponder.db 投影写库与查询" {
+    const alloc = std.testing.allocator;
+    const cfg = db.DatabaseConfig{ .db_type = "sqlite", .db_name = ":memory:", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var client = try db.Client.init(alloc, &cfg);
+    defer client.deinit();
+    try client.migrate();
+
+    var engine = try JsEngine.init(alloc, undefined);
+    defer engine.deinit();
+    engine.setDb(&client);
+
+    try engine.evalScript(
+        \\ponder.db.exec("CREATE TABLE proj_t (block_number INTEGER NOT NULL, v TEXT);");
+        \\var n = ponder.db.exec("INSERT INTO proj_t (block_number, v) VALUES (?, ?);", 7, "abc");
+        \\if (n !== 1) throw new Error("changes=" + n);
+        \\var rows = ponder.db.query("SELECT block_number, v FROM proj_t WHERE block_number = ?;", 7);
+        \\if (rows.length !== 1) throw new Error("rows=" + rows.length);
+        \\if (rows[0].v !== "abc") throw new Error("v=" + rows[0].v);
+        \\if (rows[0].block_number !== 7) throw new Error("bn=" + rows[0].block_number);
+        \\var empty = ponder.db.query("SELECT * FROM proj_t WHERE block_number = ?;", 999);
+        \\if (empty.length !== 0) throw new Error("empty=" + empty.length);
+        \\var nul = ponder.db.query("SELECT NULL AS x;");
+        \\if (nul[0].x !== null) throw new Error("null=" + nul[0].x);
+    , "db.js");
+}
+
+test "js engine ponder.db 未注入客户端与 SQL 错误均抛异常" {
+    const alloc = std.testing.allocator;
+    var engine = try JsEngine.init(alloc, undefined);
+    defer engine.deinit();
+
+    // 未注入 db：调用抛 JS 异常（可被 handler catch）
+    try engine.evalScript(
+        \\var caught = false;
+        \\try { ponder.db.exec("SELECT 1;"); } catch (e) { caught = true; }
+        \\if (!caught) throw new Error("expected throw without db client");
+    , "nodb.js");
+
+    // 注入后 SQL 语法错误同样抛异常而非崩溃
+    const cfg = db.DatabaseConfig{ .db_type = "sqlite", .db_name = ":memory:", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var client = try db.Client.init(alloc, &cfg);
+    defer client.deinit();
+    engine.setDb(&client);
+    try engine.evalScript(
+        \\var caught2 = false;
+        \\try { ponder.db.exec("THIS IS NOT SQL;"); } catch (e) { caught2 = true; }
+        \\if (!caught2) throw new Error("expected throw on bad SQL");
+    , "badsql.js");
+    try std.testing.expect(engine.projectionErrorCount() >= 1);
+}
+
+test "js engine event.block.timestamp 注入" {
+    const alloc = std.testing.allocator;
+    var engine = try JsEngine.init(alloc, undefined);
+    defer engine.deinit();
+
+    try engine.evalScript(
+        \\var ts = null;
+        \\ponder.on("Transfer", function(event) { ts = event.block.timestamp; });
+    , "test.js");
+
+    const fields = [_]db.DecodedField{.{ .name = "value", .value = "1" }};
+    engine.handleEvent("dai", "Transfer", &fields, 5, 1700000123);
+
+    try engine.evalScript("if (ts !== 1700000123) throw new Error('ts=' + ts);", "check.js");
 }

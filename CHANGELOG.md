@@ -5,13 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **`ponder.db` 业务投影 API**：JS handler 内 `ponder.db.exec/query` 参数化写读派生表
+  （SQLite/PostgreSQL；RocksDB 无 SQL 明确报错）。支持 number/string/boolean/null/
+  ArrayBuffer 全类型绑定与结果映射。
+- **投影表重组级联回滚**：`proj_` 前缀 + `block_number` 列的约定表，在
+  `rollbackFromBlock` 事务内按 `block_number >= fork_point` 级联删除。
+- **`event.block.timestamp`**：事件对象携带链上区块时间，有 JS handler 时按需拉取
+  并缓存（无 handler 零额外 RPC），K 线/时序投影不再依赖 `track_blocks`。
+- `zponder_projection_errors_total` 指标；handler 抛错与 SQL 失败均记录日志并可观测。
+- 示例 `examples/handlers/erc20_projection.js`（逐笔明细 + 每块 K 线聚合）。
+
+### Fixed
+- **C 字符串终止符越界读取（多处）**：`config.db_name` 等 Zig 切片直接以 `.ptr`
+  传给 `sqlite3_open_v2` / `sqlite3_exec` / `rocksdb_open` / `PQconnectdb` / `PQexec`，
+  这些 C API 按 NUL 结尾解析，切片无终止符时会读到越界内存——表现为随机
+  `DatabaseOpenFailed (CANTOPEN)`、构造失败等布局相关故障。现统一复制并补终止符，
+  并加回归测试覆盖。
+- JS 事件 handler 抛出的异常此前被静默吞掉，现记录 `log.err` 并计入指标。
+
 ## [0.8.2] - 2026-10-05
 
 ### Changed
 - zgraphql 依赖引用改为 **`git+https` URL 直连**（build.zig.zon 内
   `#fa62443…` commit 锁定 + 内容哈希校验），取代拷贝式 vendor 目录与
-  git submodule；`zig fetch` 原生支持，clone 无需 `--recursive`，
-  发布 CI 无需 `submodules: true`。
+  git submodule；`zig fetch` 原生支持，clone 无需 `--recursive`。
 
 ## [0.8.1] - 2026-10-04
 

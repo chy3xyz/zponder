@@ -6,9 +6,10 @@ pub const Event = struct {
     contract_name: []const u8,
     event_name: []const u8,
     block_number: u64,
+    block_timestamp: u64,
     fields: []db.DecodedField,
 
-    pub fn clone(alloc: std.mem.Allocator, contract_name: []const u8, event_name: []const u8, fields: []const db.DecodedField, block_number: u64) !Event {
+    pub fn clone(alloc: std.mem.Allocator, contract_name: []const u8, event_name: []const u8, fields: []const db.DecodedField, block_number: u64, block_timestamp: u64) !Event {
         const fields_copy = try alloc.alloc(db.DecodedField, fields.len);
         var filled: usize = 0;
         errdefer {
@@ -34,6 +35,7 @@ pub const Event = struct {
             .contract_name = cn,
             .event_name = en,
             .block_number = block_number,
+            .block_timestamp = block_timestamp,
             .fields = fields_copy,
         };
     }
@@ -150,11 +152,11 @@ pub const EventBus = struct {
     }
 
     /// 广播事件到所有订阅者（每个订阅者深拷贝一份）。
-    pub fn publish(self: *EventBus, contract_name: []const u8, event_name: []const u8, fields: []const db.DecodedField, block_number: u64) void {
+    pub fn publish(self: *EventBus, contract_name: []const u8, event_name: []const u8, fields: []const db.DecodedField, block_number: u64, block_timestamp: u64) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
         for (self.subscribers.items) |s| {
-            const ev = Event.clone(self.alloc, contract_name, event_name, fields, block_number) catch continue;
+            const ev = Event.clone(self.alloc, contract_name, event_name, fields, block_number, block_timestamp) catch continue;
             s.push(ev);
         }
     }

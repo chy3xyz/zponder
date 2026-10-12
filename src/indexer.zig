@@ -30,6 +30,7 @@ pub const EventHookCallback = *const fn (
     event_name: []const u8,
     fields: []const db.DecodedField,
     block_number: u64,
+    block_timestamp: u64,
 ) void;
 
 /// 核心索引器
@@ -54,6 +55,11 @@ pub const Indexer = struct {
     factory_idx: usize,
     event_callback_ctx: ?*anyopaque = null,
     event_callback: ?EventHookCallback = null,
+    /// 事件回调是否需要链上区块时间戳（JS handler 存在时开启）；
+    /// 关闭时不产生任何额外 RPC。
+    event_ts_needed: bool = false,
+    /// block_number -> block timestamp 缓存（惰性拉取；上限后整体清空）
+    block_ts_cache: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     /// Set while runLiveWs owns a Session (for stop() to unblock).
     ws_session: ?*ws_rpc.Session = null,
 
@@ -130,6 +136,32 @@ pub const Indexer = struct {
         self.event_callback = cb;
     }
 
+    /// 开启后事件回调携带链上区块时间戳（含惰性 RPC + 缓存）；默认关闭零开销。
+    pub fn setEventTimestampsEnabled(self: *Indexer, enabled: bool) void {
+        self.event_ts_needed = enabled;
+        if (!enabled) {
+            self.block_ts_cache.deinit(self.alloc);
+            self.block_ts_cache = .empty;
+        }
+    }
+
+    /// 解析区块时间戳（惰性拉取 + 缓存）；失败或未开启返回 0。
+    fn resolveBlockTimestamp(self: *Indexer, block_number: u64) u64 {
+        if (!self.event_ts_needed) return 0;
+        if (self.block_ts_cache.get(block_number)) |ts| return ts;
+        const block_data = (self.rpc.getBlockData(block_number) catch return 0) orelse return 0;
+        defer {
+            self.alloc.free(block_data.hash);
+            self.alloc.free(block_data.miner);
+            self.alloc.free(block_data.base_fee_per_gas);
+        }
+        const ts = block_data.timestamp;
+        // 上限保护：缓存过大时整体清空（最坏回退为重新拉取）
+        if (self.block_ts_cache.count() > 4096) self.block_ts_cache.clearRetainingCapacity();
+        self.block_ts_cache.put(self.alloc, block_number, ts) catch {};
+        return ts;
+    }
+
     pub fn deinit(self: *Indexer) void {
         self.stop();
         if (self.thread) |t| {
@@ -140,6 +172,8 @@ pub const Indexer = struct {
             ac.deinit(self.alloc);
             self.abi_contract = null;
         }
+        self.block_ts_cache.deinit(self.alloc);
+        self.block_ts_cache = .empty;
     }
 
     /// 启动同步协程
@@ -679,7 +713,8 @@ pub const Indexer = struct {
                         }
                     }
                     if (self.event_callback) |cb| {
-                        cb(self.event_callback_ctx, self.contract.name, evt.name, db_fields.items, lg.block_number);
+                        const block_ts = self.resolveBlockTimestamp(lg.block_number);
+                        cb(self.event_callback_ctx, self.contract.name, evt.name, db_fields.items, lg.block_number, block_ts);
                     }
                     return;
                 }
@@ -767,6 +802,10 @@ pub const Indexer = struct {
             .base_fee_per_gas = block_data.base_fee_per_gas,
             .transaction_count = block_data.transaction_count,
         });
+        // 顺手喂给事件时间戳缓存（track_blocks 已拉取过，避免重复 RPC）
+        if (self.event_ts_needed) {
+            self.block_ts_cache.put(self.alloc, block_data.number, block_data.timestamp) catch {};
+        }
     }
 
     /// 检查并创建快照

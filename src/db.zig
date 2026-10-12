@@ -34,6 +34,21 @@ pub const DecodedField = struct {
     value: []const u8,
 };
 
+/// ponder.db 参数/结果值模型（js_engine 负责 JS 值 <-> SqlValue 转换）
+pub const SqlValue = union(enum) {
+    null,
+    integer: i64,
+    float: f64,
+    text: []const u8,
+    blob: []const u8,
+};
+
+/// ponder.db 查询结果行；names/values 归调用方所有，经 Client.freeQueryRows 释放。
+pub const QueryRow = struct {
+    names: [][]const u8,
+    values: []SqlValue,
+};
+
 pub const BlockRecord = struct {
     chain: []const u8,
     block_number: u64,
@@ -45,6 +60,13 @@ pub const BlockRecord = struct {
     base_fee_per_gas: []const u8,
     transaction_count: u64,
 };
+
+/// 复制并补 0 终止符（libpq text 参数按 NUL 结尾解析，Zig 切片无终止符）
+fn allocSentinelCopy(alloc: std.mem.Allocator, s: []const u8) ![:0]const u8 {
+    const buf = try alloc.allocSentinel(u8, s.len, 0);
+    @memcpy(buf, s);
+    return buf;
+}
 
 pub const Client = struct {
     alloc: std.mem.Allocator,
@@ -70,11 +92,19 @@ pub const Client = struct {
     fn initSqlite(alloc: std.mem.Allocator, config: *const DatabaseConfig) !Client {
         var db: ?*c.sqlite3 = null;
         const path = if (config.db_name.len > 0) config.db_name else ":memory:";
+        // sqlite3_open_v2 需要 NUL 结尾的 C 字符串；config.db_name 是 TOML 切片，
+        // 不保证终止符（此前偶发 CANTOPEN / 读到越界垃圾即源于此）。
+        const path_z = try alloc.allocSentinel(u8, path.len, 0);
+        defer alloc.free(path_z);
+        @memcpy(path_z, path);
         // 写连接用 FULLMUTEX：多个索引器线程并发写同一连接，sqlite3 连接
         // 本身非线程安全（默认无内部锁），FULLMUTEX 使其线程安全。
         const w_flags: c_int = c.SQLITE_OPEN_READWRITE | c.SQLITE_OPEN_CREATE | c.SQLITE_OPEN_FULLMUTEX;
-        const rc = c.sqlite3_open_v2(path.ptr, &db, w_flags, null);
-        if (rc != c.SQLITE_OK) return error.DatabaseOpenFailed;
+        const rc = c.sqlite3_open_v2(path_z.ptr, &db, w_flags, null);
+        if (rc != c.SQLITE_OK) {
+            log.err("SQLite 打开失败 path={s} rc={d} errmsg={s}", .{ path, rc, std.mem.sliceTo(c.sqlite3_errmsg(db), 0) });
+            return error.DatabaseOpenFailed;
+        }
         try checkPragma(db, "PRAGMA foreign_keys = ON;");
         try checkPragma(db, "PRAGMA journal_mode = WAL;");
         try checkPragma(db, "PRAGMA synchronous = NORMAL;");
@@ -89,7 +119,7 @@ pub const Client = struct {
         var read_db: ?*c.sqlite3 = null;
         if (!std.mem.eql(u8, path, ":memory:")) {
             const flags: c_int = c.SQLITE_OPEN_READONLY | c.SQLITE_OPEN_FULLMUTEX;
-            if (c.sqlite3_open_v2(path.ptr, &read_db, flags, null) != c.SQLITE_OK) {
+            if (c.sqlite3_open_v2(path_z.ptr, &read_db, flags, null) != c.SQLITE_OK) {
                 read_db = null;
             }
         }
@@ -1195,6 +1225,38 @@ pub const Client = struct {
             if (c.sqlite3_bind_text(stmt, 2, contract_address.ptr, @intCast(contract_address.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.BindFailed;
             if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.ExecFailed;
         }
+        // 业务投影表级联回滚：proj_* 前缀约定 + block_number 列
+        {
+            var proj_names: std.ArrayList([]u8) = .empty;
+            defer {
+                for (proj_names.items) |n| self.alloc.free(n);
+                proj_names.deinit(self.alloc);
+            }
+            {
+                const sql = "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'proj\\_%' ESCAPE '\\';";
+                var stmt: ?*c.sqlite3_stmt = null;
+                if (c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null) == c.SQLITE_OK) {
+                    defer _ = c.sqlite3_finalize(stmt);
+                    while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+                        const name = std.mem.sliceTo(c.sqlite3_column_text(stmt, 0), 0);
+                        const dup = self.alloc.dupe(u8, name) catch continue;
+                        proj_names.append(self.alloc, dup) catch self.alloc.free(dup);
+                    }
+                }
+            }
+            for (proj_names.items) |tbl| {
+                var del_buf: [512]u8 = undefined;
+                const del_sql = std.fmt.bufPrint(&del_buf, "DELETE FROM \"{s}\" WHERE block_number >= ?;", .{tbl}) catch continue;
+                var dstmt: ?*c.sqlite3_stmt = null;
+                if (c.sqlite3_prepare_v2(self.db, del_sql.ptr, @intCast(del_sql.len), &dstmt, null) != c.SQLITE_OK) continue;
+                defer _ = c.sqlite3_finalize(dstmt);
+                if (c.sqlite3_bind_int64(dstmt, 1, @intCast(from_block)) != c.SQLITE_OK) continue;
+                if (c.sqlite3_step(dstmt) != c.SQLITE_DONE) continue;
+            }
+            if (proj_names.items.len > 0) {
+                log.info("重组回滚：级联清理 {d} 张投影表 (block >= {d})", .{ proj_names.items.len, from_block });
+            }
+        }
         try self.exec("COMMIT;");
     }
 
@@ -1690,6 +1752,23 @@ pub const Client = struct {
             var result = try self.pgconn.?.execParams(sql, &.{ contract_address, block_str });
             defer result.deinit();
         }
+        // 业务投影表级联回滚：proj_* 前缀约定 + block_number 列
+        {
+            const sql = "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' AND table_name LIKE 'proj\\_%' ESCAPE '\\';";
+            var result = try self.pgconn.?.execParams(sql, &.{});
+            defer result.deinit();
+            const nrows = result.rows();
+            var i: c_int = 0;
+            while (i < nrows) : (i += 1) {
+                const tbl = result.get(i, 0);
+                // 标识符内出现双引号则跳过（避免 SQL 拼接被破坏）
+                if (std.mem.indexOfScalar(u8, tbl, '"') != null) continue;
+                var del_buf: [512]u8 = undefined;
+                const del_sql = std.fmt.bufPrint(&del_buf, "DELETE FROM \"{s}\" WHERE block_number >= $1;", .{tbl}) catch continue;
+                var del_result = self.pgconn.?.execParams(del_sql, &.{block_str}) catch continue;
+                del_result.deinit();
+            }
+        }
         {
             var rollback_buf: [21]u8 = undefined;
             const rollback_block = if (from_block > 0) from_block - 1 else 0;
@@ -1818,6 +1897,206 @@ pub const Client = struct {
         return try self.alloc.dupe(u8, list.items);
     }
 
+    // ========================================================================
+    // ponder.db：JS handler 业务投影 API（参数化 exec/query，与 QuickJS 解耦）
+    // ========================================================================
+
+    /// 执行写语句（CREATE/INSERT/UPDATE/DELETE），返回 affected rows。
+    /// 注意：text/blob 参数按 SQLITE_STATIC 绑定，调用期间须保持有效。
+    pub fn ponderExec(self: *Client, sql: []const u8, params: []const SqlValue) !usize {
+        switch (self.backend_type) {
+            .sqlite => return self.ponderExecSqlite(sql, params),
+            .postgresql => return self.ponderExecPG(sql, params),
+            .rocksdb => return error.UnsupportedOperation,
+        }
+    }
+
+    /// 执行查询，返回行数组（调用方负责 freeQueryRows）。非 SELECT 返回空数组。
+    pub fn ponderQuery(self: *Client, sql: []const u8, params: []const SqlValue) ![]QueryRow {
+        switch (self.backend_type) {
+            .sqlite => return self.ponderQuerySqlite(sql, params),
+            .postgresql => return self.ponderQueryPG(sql, params),
+            .rocksdb => return error.UnsupportedOperation,
+        }
+    }
+
+    pub fn freeQueryRows(self: *Client, rows: []QueryRow) void {
+        for (rows) |row| self.freeQueryRow(row);
+        self.alloc.free(rows);
+    }
+
+    fn freeQueryRow(self: *Client, row: QueryRow) void {
+        for (row.names) |n| self.alloc.free(n);
+        self.alloc.free(row.names);
+        for (row.values) |v| switch (v) {
+            .text => |t| self.alloc.free(t),
+            .blob => |b| self.alloc.free(b),
+            else => {},
+        };
+        self.alloc.free(row.values);
+    }
+
+    fn bindParamsSqlite(stmt: ?*c.sqlite3_stmt, params: []const SqlValue) !void {
+        for (params, 0..) |p, i| {
+            const idx: c_int = @intCast(i + 1);
+            const rc = switch (p) {
+                .null => c.sqlite3_bind_null(stmt, idx),
+                .integer => |v| c.sqlite3_bind_int64(stmt, idx, v),
+                .float => |v| c.sqlite3_bind_double(stmt, idx, v),
+                // SQLITE_STATIC：调用期间参数缓冲区由 js_engine 持有，禁止提前释放
+                .text => |v| c.sqlite3_bind_text(stmt, idx, v.ptr, @intCast(v.len), c.SQLITE_STATIC),
+                .blob => |v| c.sqlite3_bind_blob(stmt, idx, v.ptr, @intCast(v.len), c.SQLITE_STATIC),
+            };
+            if (rc != c.SQLITE_OK) return error.BindFailed;
+        }
+    }
+
+    fn ponderExecSqlite(self: *Client, sql: []const u8, params: []const SqlValue) !usize {
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK) {
+            return error.PrepareFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindParamsSqlite(stmt, params);
+        const rc = c.sqlite3_step(stmt);
+        if (rc != c.SQLITE_DONE and rc != c.SQLITE_ROW) return error.ExecFailed;
+        return @intCast(c.sqlite3_changes(self.db));
+    }
+
+    fn ponderQuerySqlite(self: *Client, sql: []const u8, params: []const SqlValue) ![]QueryRow {
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK) {
+            return error.PrepareFailed;
+        }
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindParamsSqlite(stmt, params);
+
+        var rows: std.ArrayList(QueryRow) = .empty;
+        errdefer {
+            for (rows.items) |row| self.freeQueryRow(row);
+            rows.deinit(self.alloc);
+        }
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            const ncols: usize = @intCast(c.sqlite3_column_count(stmt));
+            const names = try self.alloc.alloc([]const u8, ncols);
+            errdefer self.alloc.free(names);
+            const values = try self.alloc.alloc(SqlValue, ncols);
+            errdefer self.alloc.free(values);
+
+            for (0..ncols) |i| {
+                const ci: c_int = @intCast(i);
+                names[i] = try self.alloc.dupe(u8, std.mem.sliceTo(c.sqlite3_column_name(stmt, ci), 0));
+                values[i] = switch (c.sqlite3_column_type(stmt, ci)) {
+                    c.SQLITE_INTEGER => .{ .integer = c.sqlite3_column_int64(stmt, ci) },
+                    c.SQLITE_FLOAT => .{ .float = c.sqlite3_column_double(stmt, ci) },
+                    c.SQLITE_NULL => .null,
+                    c.SQLITE_BLOB => blk: {
+                        const len: usize = @intCast(c.sqlite3_column_bytes(stmt, ci));
+                        const raw = c.sqlite3_column_blob(stmt, ci);
+                        if (raw == null or len == 0) break :blk .{ .blob = try self.alloc.dupe(u8, &.{}) };
+                        break :blk .{ .blob = try self.alloc.dupe(u8, @as([*]const u8, @ptrCast(raw))[0..len]) };
+                    },
+                    else => .{ .text = try self.alloc.dupe(u8, std.mem.sliceTo(c.sqlite3_column_text(stmt, ci), 0)) },
+                };
+            }
+            try rows.append(self.alloc, .{ .names = names, .values = values });
+        }
+        return rows.toOwnedSlice(self.alloc);
+    }
+
+    /// SqlValue -> PG 文本参数（null 表示 SQL NULL）。
+    /// 注意：libpq 的 text 格式参数按 NUL 结尾解析（忽略 length），
+    /// 所有格式化结果必须补终止符（Zig 切片本身无 0 结尾）。
+    fn toPgParams(self: *Client, arena: std.mem.Allocator, params: []const SqlValue) ![]const ?[]const u8 {
+        _ = self;
+        const out = try arena.alloc(?[]const u8, params.len);
+        for (params, 0..) |p, i| {
+            out[i] = switch (p) {
+                .null => null,
+                .integer => |v| try allocSentinelCopy(arena, try std.fmt.allocPrint(arena, "{d}", .{v})),
+                .float => |v| try allocSentinelCopy(arena, try std.fmt.allocPrint(arena, "{d}", .{v})),
+                // JS 侧字符串来自 JS_ToCStringLen，已是 NUL 结尾，可直接透传
+                .text => |v| v,
+                .blob => |v| blk: {
+                    var buf: std.ArrayList(u8) = .empty;
+                    try buf.appendSlice(arena, "\\x");
+                    const hex = "0123456789abcdef";
+                    for (v) |byte| {
+                        try buf.append(arena, hex[byte >> 4]);
+                        try buf.append(arena, hex[byte & 0x0f]);
+                    }
+                    break :blk try allocSentinelCopy(arena, buf.items);
+                },
+            };
+        }
+        return out;
+    }
+
+    /// PG 后端：按结果 OID 映射类型（int/float -> 数值，bytea -> blob，其余 -> 文本）
+    fn pgValueFromText(alloc: std.mem.Allocator, oid: u32, text: []const u8) !SqlValue {
+        return switch (oid) {
+            20, 21, 23 => .{ .integer = std.fmt.parseInt(i64, text, 10) catch return .{ .text = try alloc.dupe(u8, text) } },
+            700, 701, 1700 => .{ .float = std.fmt.parseFloat(f64, text) catch return .{ .text = try alloc.dupe(u8, text) } },
+            17 => blk: {
+                // PG text 格式 bytea 为 \x<hex>
+                const hex_part = if (std.mem.startsWith(u8, text, "\\x")) text[2..] else text;
+                if (hex_part.len % 2 != 0) break :blk .{ .text = try alloc.dupe(u8, text) };
+                const out = try alloc.alloc(u8, hex_part.len / 2);
+                _ = std.fmt.hexToBytes(out, hex_part) catch {
+                    alloc.free(out);
+                    break :blk .{ .text = try alloc.dupe(u8, text) };
+                };
+                break :blk .{ .blob = out };
+            },
+            else => .{ .text = try alloc.dupe(u8, text) },
+        };
+    }
+
+    fn ponderExecPG(self: *Client, sql: []const u8, params: []const SqlValue) !usize {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const pgparams = try self.toPgParams(arena.allocator(), params);
+        var res = try self.pgconn.?.execParamsNull(sql, pgparams);
+        defer res.deinit();
+        const tuples = res.cmdTuples();
+        return std.fmt.parseInt(usize, std.mem.trim(u8, tuples, " \t\r\n"), 10) catch 0;
+    }
+
+    fn ponderQueryPG(self: *Client, sql: []const u8, params: []const SqlValue) ![]QueryRow {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const pgparams = try self.toPgParams(arena.allocator(), params);
+        var res = try self.pgconn.?.execParamsNull(sql, pgparams);
+        defer res.deinit();
+
+        const nrows: usize = @intCast(res.rows());
+        const ncols: usize = @intCast(res.cols());
+        const rows = try self.alloc.alloc(QueryRow, nrows);
+        var filled: usize = 0;
+        errdefer {
+            for (rows[0..filled]) |row| self.freeQueryRow(row);
+            self.alloc.free(rows);
+        }
+        for (0..nrows) |r| {
+            const names = try self.alloc.alloc([]const u8, ncols);
+            errdefer self.alloc.free(names);
+            const values = try self.alloc.alloc(SqlValue, ncols);
+            errdefer self.alloc.free(values);
+            for (0..ncols) |col| {
+                const ci: c_int = @intCast(col);
+                names[col] = try self.alloc.dupe(u8, res.colName(ci));
+                if (res.isNull(@intCast(r), ci)) {
+                    values[col] = .null;
+                } else {
+                    values[col] = try pgValueFromText(self.alloc, res.colType(ci), res.get(@intCast(r), ci));
+                }
+            }
+            rows[r] = .{ .names = names, .values = values };
+            filled = r + 1;
+        }
+        return rows;
+    }
+
     // ===== 内部辅助函数 =====
 
     fn checkPragma(db: ?*c.sqlite3, pragma: []const u8) !void {
@@ -1835,8 +2114,12 @@ pub const Client = struct {
     }
 
     fn exec(self: *Client, sql: []const u8) !void {
+        // sqlite3_exec 需要 NUL 结尾；调用方会传 bufPrint/拼装的 SQL
+        const sql_z = try self.alloc.allocSentinel(u8, sql.len, 0);
+        defer self.alloc.free(sql_z);
+        @memcpy(sql_z, sql);
         var err_msg: [*c]u8 = null;
-        const rc = c.sqlite3_exec(self.db, sql.ptr, null, null, &err_msg);
+        const rc = c.sqlite3_exec(self.db, sql_z.ptr, null, null, &err_msg);
         if (rc != c.SQLITE_OK) {
             if (err_msg) |msg| {
                 defer _ = c.sqlite3_free(msg);
@@ -2133,4 +2416,145 @@ test "db rocksdb snapshot" {
     try std.testing.expectEqual(@as(u64, 50), snap.?.block_number);
     alloc.free(snap.?.contract_address);
     alloc.free(snap.?.snapshot_data);
+}
+
+test "db ponderExec/ponderQuery 参数绑定与类型往返" {
+    const alloc = std.testing.allocator;
+    const cfg = DatabaseConfig{ .db_type = "sqlite", .db_name = ":memory:", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var client = try Client.init(alloc, &cfg);
+    defer client.deinit();
+    try client.migrate();
+
+    _ = try client.ponderExec("CREATE TABLE proj_t (a INTEGER, b REAL, c TEXT, d BLOB, e INTEGER);", &.{});
+    const changes = try client.ponderExec(
+        "INSERT INTO proj_t (a, b, c, d, e) VALUES (?, ?, ?, ?, ?);",
+        &.{
+            .{ .integer = 42 },
+            .{ .float = 3.5 },
+            .{ .text = "hello" },
+            .{ .blob = &.{ 1, 2, 3 } },
+            .null,
+        },
+    );
+    try std.testing.expectEqual(@as(usize, 1), changes);
+
+    const rows = try client.ponderQuery("SELECT a, b, c, d, e FROM proj_t WHERE a = ?;", &.{.{ .integer = 42 }});
+    defer client.freeQueryRows(rows);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    const row = rows[0];
+    try std.testing.expectEqualStrings("a", row.names[0]);
+    try std.testing.expectEqualStrings("e", row.names[4]);
+    try std.testing.expectEqual(@as(i64, 42), row.values[0].integer);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.5), row.values[1].float, 0.0001);
+    try std.testing.expectEqualStrings("hello", row.values[2].text);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, row.values[3].blob);
+    try std.testing.expect(row.values[4] == .null);
+
+    // 空结果集
+    const none = try client.ponderQuery("SELECT * FROM proj_t WHERE a = ?;", &.{.{ .integer = 999 }});
+    defer client.freeQueryRows(none);
+    try std.testing.expectEqual(@as(usize, 0), none.len);
+
+    // 非 SELECT 走 query 返回空数组；SQL 错误返回错误
+    const empty = try client.ponderQuery("UPDATE proj_t SET a = 1 WHERE a = 999;", &.{});
+    defer client.freeQueryRows(empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+    try std.testing.expectError(error.PrepareFailed, client.ponderExec("THIS IS NOT SQL;", &.{}));
+}
+
+test "db rollbackFromBlock 级联清理 proj_ 投影表" {
+    const alloc = std.testing.allocator;
+    const cfg = DatabaseConfig{ .db_type = "sqlite", .db_name = ":memory:", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var client = try Client.init(alloc, &cfg);
+    defer client.deinit();
+    try client.migrate();
+
+    _ = try client.ponderExec("CREATE TABLE proj_kline (block_number INTEGER NOT NULL, close TEXT);", &.{});
+    // 非 proj_ 前缀的表不应被级联（用户自建表自行负责）
+    _ = try client.ponderExec("CREATE TABLE other_data (block_number INTEGER NOT NULL);", &.{});
+    for ([_]u64{ 100, 150, 200 }) |bn| {
+        _ = try client.ponderExec("INSERT INTO proj_kline (block_number, close) VALUES (?, ?);", &.{ .{ .integer = @intCast(bn) }, .{ .text = "1.0" } });
+        _ = try client.ponderExec("INSERT INTO other_data (block_number) VALUES (?);", &.{.{ .integer = @intCast(bn) }});
+    }
+
+    try client.rollbackFromBlock("0xabc", "test", &.{}, 150);
+
+    const proj = try client.ponderQuery("SELECT block_number FROM proj_kline ORDER BY block_number;", &.{});
+    defer client.freeQueryRows(proj);
+    try std.testing.expectEqual(@as(usize, 1), proj.len);
+    try std.testing.expectEqual(@as(i64, 100), proj[0].values[0].integer);
+
+    const other = try client.ponderQuery("SELECT COUNT(*) AS n FROM other_data;", &.{});
+    defer client.freeQueryRows(other);
+    try std.testing.expectEqual(@as(i64, 3), other[0].values[0].integer);
+}
+
+test "db ponderExec/ponderQuery PostgreSQL 后端" {
+    const alloc = std.testing.allocator;
+    // 无本地 PG 时跳过（CI 不装 PG）
+    const admin_cfg = DatabaseConfig{ .db_type = "postgresql", .db_name = "host=localhost port=5432 dbname=postgres", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var admin = Client.init(alloc, &admin_cfg) catch return error.SkipZigTest;
+    // 独立测试库，避免污染 postgres 库
+    _ = admin.ponderExec("DROP DATABASE IF EXISTS zponder_ponder_test;", &.{}) catch {};
+    _ = admin.ponderExec("CREATE DATABASE zponder_ponder_test;", &.{}) catch {
+        admin.deinit();
+        return error.SkipZigTest;
+    };
+    admin.deinit();
+
+    const cfg = DatabaseConfig{ .db_type = "postgresql", .db_name = "host=localhost port=5432 dbname=zponder_ponder_test", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var client = try Client.init(alloc, &cfg);
+    try client.migrate();
+
+    _ = try client.ponderExec("CREATE TABLE proj_pg_test (block_number BIGINT NOT NULL, v TEXT, n BIGINT, f DOUBLE PRECISION, b BYTEA);", &.{});
+
+    const changes = try client.ponderExec(
+        "INSERT INTO proj_pg_test (block_number, v, n, f, b) VALUES ($1, $2, $3, $4, $5);",
+        &.{ .{ .integer = 100 }, .{ .text = "pg" }, .{ .integer = -5 }, .{ .float = 2.25 }, .{ .blob = &.{ 0xde, 0xad } } },
+    );
+    try std.testing.expectEqual(@as(usize, 1), changes);
+    _ = try client.ponderExec("INSERT INTO proj_pg_test (block_number, v, n) VALUES ($1, $2, $3);", &.{ .{ .integer = 200 }, .null, .{ .integer = 1 } });
+
+    const rows = try client.ponderQuery("SELECT block_number, v, n, f, b FROM proj_pg_test WHERE block_number = $1;", &.{.{ .integer = 100 }});
+    defer client.freeQueryRows(rows);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualStrings("block_number", rows[0].names[0]);
+    try std.testing.expectEqual(@as(i64, 100), rows[0].values[0].integer);
+    try std.testing.expectEqualStrings("pg", rows[0].values[1].text);
+    try std.testing.expectEqual(@as(i64, -5), rows[0].values[2].integer);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.25), rows[0].values[3].float, 0.0001);
+    try std.testing.expectEqualSlices(u8, &.{ 0xde, 0xad }, rows[0].values[4].blob);
+
+    // NULL 往返
+    const null_rows = try client.ponderQuery("SELECT v FROM proj_pg_test WHERE block_number = $1;", &.{.{ .integer = 200 }});
+    defer client.freeQueryRows(null_rows);
+    try std.testing.expect(null_rows[0].values[0] == .null);
+
+    // 级联回滚：proj_ 表按 block_number 清理
+    try client.rollbackFromBlock("0xabc", "test", &.{}, 150);
+    const after = try client.ponderQuery("SELECT block_number FROM proj_pg_test ORDER BY block_number;", &.{});
+    defer client.freeQueryRows(after);
+    try std.testing.expectEqual(@as(usize, 1), after.len);
+    try std.testing.expectEqual(@as(i64, 100), after[0].values[0].integer);
+
+    // 清理测试库
+    client.deinit();
+    var cleanup = Client.init(alloc, &admin_cfg) catch return;
+    _ = cleanup.ponderExec("DROP DATABASE IF EXISTS zponder_ponder_test;", &.{}) catch {};
+    cleanup.deinit();
+}
+
+test "db 打开非 NUL 结尾路径（回归：C 字符串终止符）" {
+    const alloc = std.testing.allocator;
+    // 切片后紧跟非 0 字节，复现历史上 sqlite3_open_v2 读到越界垃圾的 CANTOPEN
+    const real = "/tmp/_zponder_nul_test.db";
+    const buf = try alloc.alloc(u8, real.len + 8);
+    defer alloc.free(buf);
+    @memcpy(buf[0..real.len], real);
+    @memset(buf[real.len..], 'X');
+    const cfg = DatabaseConfig{ .db_type = "sqlite", .db_name = buf[0..real.len], .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var client = try Client.init(alloc, &cfg);
+    defer client.deinit();
+    try client.migrate();
+    _ = try client.ponderExec("CREATE TABLE IF NOT EXISTS nul_regress (a INTEGER);", &.{});
 }

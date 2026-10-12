@@ -23,8 +23,12 @@ pub const Client = struct {
         const opts = c.rocksdb_options_create();
         c.rocksdb_options_set_create_if_missing(opts, 1);
 
+        // rocksdb_open 需要 NUL 结尾的 C 字符串；db_path 来自配置切片
+        const path_z = try alloc.allocSentinel(u8, db_path.len, 0);
+        defer alloc.free(path_z);
+        @memcpy(path_z, db_path);
         var err: [*c]u8 = ROCKSDB_OK;
-        const db = c.rocksdb_open(opts, db_path.ptr, &err);
+        const db = c.rocksdb_open(opts, path_z.ptr, &err);
         c.rocksdb_options_destroy(opts);
         try check(&err);
         if (db == null) return error.RocksDBOpenFailed;

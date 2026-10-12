@@ -190,6 +190,9 @@ zponder_indexer_current_block{contract="dai"} 20123456
 # HELP zponder_indexer_status Indexer status code
 # TYPE zponder_indexer_status gauge
 zponder_indexer_status{contract="dai"} 1
+# HELP zponder_projection_errors_total ponder.db projection write failures
+# TYPE zponder_projection_errors_total counter
+zponder_projection_errors_total 0
 ```
 
 Status codes: `1 = running`, `0 = stopped`, `2 = error`, `3 = replaying`.

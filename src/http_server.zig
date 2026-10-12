@@ -687,6 +687,16 @@ pub const Server = struct {
             );
         }
 
+        // 业务投影（ponder.db）写入失败计数
+        if (self.js) |js| {
+            try buf.writer.print(
+                "# HELP zponder_projection_errors_total ponder.db 投影写入失败总数\n" ++
+                "# TYPE zponder_projection_errors_total counter\n" ++
+                "zponder_projection_errors_total {d}\n",
+                .{js.projectionErrorCount()},
+            );
+        }
+
         for (self.indexers) |idx| {
             const status_str = switch (idx.getStatus()) {
                 .running => @as(u8, 1),

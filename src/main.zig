@@ -231,6 +231,8 @@ pub fn main(init: std.process.Init) !void {
     var event_bus = eb.EventBus.init(alloc);
     defer event_bus.deinit();
 
+    // ponder.db 必须在加载 handler 前注入：脚本顶层常以 ponder.db 建投影表
+    js_eng.setDb(&database);
     script_eng.loadDirectory("./handlers") catch {};
     script_eng.loadDirectory("./examples/handlers") catch {};
     js_eng.loadDirectory("./handlers") catch {};
@@ -247,12 +249,13 @@ pub fn main(init: std.process.Init) !void {
             event_name: []const u8,
             fields: []const db.DecodedField,
             block_number: u64,
+            block_timestamp: u64,
         ) void {
             if (ctx_ptr) |ptr| {
                 const self_ptr: *@This() = @ptrCast(@alignCast(ptr));
                 self_ptr.script_eng.processEvent(contract_name, event_name, fields, block_number);
-                self_ptr.js_eng.handleEvent(contract_name, event_name, fields, block_number);
-                self_ptr.bus.publish(contract_name, event_name, fields, block_number);
+                self_ptr.js_eng.handleEvent(contract_name, event_name, fields, block_number, block_timestamp);
+                self_ptr.bus.publish(contract_name, event_name, fields, block_number, block_timestamp);
             }
         }
     };
@@ -263,6 +266,8 @@ pub fn main(init: std.process.Init) !void {
     };
     for (indexers.items) |*idx| {
         idx.setEventCallback(&combined_hook, CombinedHook.callback);
+        // 有 JS handler 时才为事件解析链上时间戳（避免无谓 RPC）
+        if (js_eng.handlerCount() > 0) idx.setEventTimestampsEnabled(true);
     }
 
     // 8. 启动
