@@ -110,8 +110,10 @@
 
 - REST: `GET /events/:contract/:event?address=0x…` filters by contract address.
 - GraphQL: `latestEvents(..., address: String)` and `Event.contractAddress: String!`.
-- JS handlers expose `event.contractAddress`; SSE `/stream` payloads carry
-  `contract_address`.
+- JS handlers expose `event.contractAddress`, plus `event.transactionHash` /
+  `event.logIndex` (the log's position in its transaction — use them as a stable
+  projection primary key); SSE `/stream` payloads carry `contract_address`,
+  `tx_hash` and `log_index`.
 
 ---
 

@@ -25,6 +25,9 @@ ponder.on("合约名:事件名", (event) => {
 - `event.args` 里 **uint/int 值是 hex 字符串**（如 `"0xde0b6b3a7640000"`），用 `BigInt(...)` 解析
 - `address` 是 `"0x..."` 字符串；`bool` 是 `"true"/"false"`
 - `event.block.number` 是数字
+- `event.contractAddress` 是发出该事件的合约地址（模板模式下即该 clone）
+- `event.transactionHash` / `event.logIndex`：日志在交易内的位置，`(transactionHash, logIndex)`
+  唯一确定一条日志 —— 投影表拿它作主键就能跳区块浏览器
 - 支持 `"Contract:Event"` 全名与 `"Event"` 简写两种匹配
 
 ### 示例清单

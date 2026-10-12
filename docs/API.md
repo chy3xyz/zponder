@@ -58,7 +58,7 @@ event: connected
 data: {"status":"connected","service":"zponder SSE real-time stream"}
 
 event: log
-data: {"contract":"PancakePair","contract_address":"0xabc...","block_number":20123456,"fields":{"amount0In":"100000","amount1Out":"500"}}
+data: {"contract":"PancakePair","contract_address":"0xabc...","block_number":20123456,"tx_hash":"0xdef...","log_index":12,"fields":{"amount0In":"100000","amount1Out":"500"}}
 ```
 
 ---

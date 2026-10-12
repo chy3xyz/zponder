@@ -38,7 +38,7 @@ and query everything through REST, GraphQL, and SSE — all in one process.
 ### 🚀 Indexing & Scripting
 - **Embedded QuickJS Engine** — native JS runtime for event handlers:
   ```js
-  ponder.on("PancakePair:Swap", (event) => { /* event.args, event.block */ });
+  ponder.on("PancakePair:Swap", (event) => { /* event.args, event.block, event.transactionHash, event.logIndex */ });
   ```
 - **Custom HTTP routes** — `ponder.http.get/post/use(...)` define your own API (Hono-style) right in handlers.
 - **Auto Handler Scanning** — drop `.js` / `.json` files into `./handlers/`, they just work.
