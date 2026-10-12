@@ -970,6 +970,48 @@ git commit -m "test: launchpad 多 clone 端到端验收 + 模板模式文档"
 
 ---
 
+## Task 12: 修复本计划执行中发现的三个既有内存缺陷
+
+这三个缺陷都**不是**本计划引入的，但都由本计划的评审发现，且都在热路径上；合并前应修掉（每个都要有判别测试：修前红、修后绿）。
+
+**Files:**
+- Modify: `src/db.zig`（前两项）
+- Modify: `src/factory.zig`（第三项）
+- Test: 对应文件的 test 块
+
+**Interfaces:**
+- Consumes: 现有 `Client`/`FactoryManager` 接口，无新增公开 API
+- Produces: 无（纯修复）
+
+- [ ] **Step 1: `queryEventLogsPG` 的悬垂切片**（`src/db.zig`，Task 3 评审发现）
+
+`queryEventLogsPG` 把栈上 `[21]u8 buf`（`bufPrint` 出来的块号字符串）的切片塞进 `params`，出作用域后成为悬垂切片再交给 `execParams`。修法：把块号格式化改为在语句生存期内有效的缓冲区（例如与 SQL 同生命周期的 `std.Io.Writer.Allocating` 或 `allocSentinel` 复制），并确保释放。
+判别测试：一条走 `queryEventLogsPG` 且带 `block_from`/`block_to` 的 PG 用例（本机 PG 可用），断言返回行数正确；修前后行为在 Debug 下应有差异（悬垂切片可能读到污染数据）。
+
+- [ ] **Step 2: `ponderQuerySqlite` 部分填充失败泄漏**（`src/db.zig`，Task 4 评审发现）
+
+`ponderQuerySqlite` 逐行填充时，`names[i]`/`values[i]` 的 dupe 已入数组，但内层 `errdefer` 只释放数组本身、外层只处理已 append 的完整行 → "当前行填到一半"失败会泄漏已 dupe 的字符串（`ponderQuery` 是 JS 投影查询的公共路径）。
+修法：为"当前行"建立完整的清理路径（例如先本地持有 names/values 与填充计数，成功后再 append；或把已填充元素也纳入 `freeQueryRow` 的清理范围）。
+判别测试：复用 Task 4 已建立的 `std.testing.FailingAllocator` 尾部注入手法，对 `ponderQuery` 自身的分配点逐个注入失败，断言 `allocated_bytes == freed_bytes`。
+
+- [ ] **Step 3: 老工厂子索引器持有悬垂 `*ContractConfig`**（`src/factory.zig`，Task 8 评审发现，**三者中后果最重**）
+
+`onFactoryEventInner` 把栈局部 `child_config` 的地址存进 `child_idx.contract`（`Indexer.init(..., &child_config, ...)`），而堆上的 `child.contract_config` 从未回填给 `child.idx.contract`。函数返回后子索引器 `runLoop` 读 `self.contract.name`/`events` 即读失效栈帧 → 表名/事件错乱或崩溃。现有测试用 `max_children = 0` 绕开了该路径，所以长期未被发现。
+修法：让 `child.idx` 的 `contract` 指向**堆上稳定存储**（初始化后把 `&child.contract_config` 回填给 `child.idx.contract`，并确认 `ChildIndexer.deinit` 的释放顺序不会让 `idx` 先于 `contract_config` 失效；注意 `child` 是 `alloc.create` 出来的，地址稳定）。Task 8 的模板路径用堆上 `template_contracts` 规避了同类问题，可作为参照。
+判别测试：一条 `max_children >= 1` 的工厂发现用例，断言子索引器的 `contract.name`/`events` 在 `onFactoryEventInner` 返回后仍可正确读取（例如断言 `child.idx.contract.name` 内容等于 `child_name`、且 `events.len` 正确；更强的做法是断言指针落在堆上而非栈上）。
+
+- [ ] **Step 4: 全量验证与提交**
+
+Run: `zig build test --summary all` → EXIT=0，全部通过
+Run: `zig build -Doptimize=ReleaseSafe` → 通过
+
+```bash
+git add src/db.zig src/factory.zig
+git commit -m "fix: 修复评审发现的三个既有内存缺陷（PG 悬垂切片/部分填充泄漏/工厂子索引器悬垂配置）"
+```
+
+---
+
 ## 收尾检查
 
 - [ ] `zig build test` 全绿；`zig build -Doptimize=ReleaseSafe` 通过
