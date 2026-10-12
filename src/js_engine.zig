@@ -810,6 +810,12 @@ pub const JsEngine = struct {
         };
         defer self.alloc.free(contents);
 
+        // 提前判定编码：否则只有 QuickJS 那句 "invalid UTF-8 sequence"，
+        // 既看不出是加载失败还是哪份脚本，也看不出该怎么修。
+        if (!std.unicode.utf8ValidateSlice(contents)) {
+            log.err("JS Handler 脚本 {s} 不是合法 UTF-8：QuickJS 只会报 invalid UTF-8 sequence。请将文件转为 UTF-8（如: iconv -f GBK -t UTF-8 文件）", .{file_path});
+        }
+
         try self.evalScript(contents, file_path);
         log.info("成功编译并运行原生 QuickJS Handler 脚本: {s}", .{file_path});
     }

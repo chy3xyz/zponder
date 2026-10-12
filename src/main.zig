@@ -164,7 +164,13 @@ pub fn main(init: std.process.Init) !void {
             if (arg_idx + 1 < args.len and (std.mem.eql(u8, args[arg_idx + 1], "-c") or std.mem.eql(u8, args[arg_idx + 1], "--config"))) {
                 if (arg_idx + 2 < args.len) config_path = args[arg_idx + 2];
             }
-            try cmdCheck(alloc, init.io, config_path);
+            // 失败详情已由 cmdCheck 逐条 ✗ 打出；这里只把退出码置为非 0。
+            // 走 error 返回的话 Zig 会追加一段错误返回栈，而这属于用户配置问题，
+            // 不需要栈回溯。注意必须是"cmdCheck 正常展开（defer 里的日志 flush 完）
+            // 之后再 exit"。
+            cmdCheck(alloc, init.io, config_path) catch {
+                std.process.exit(1);
+            };
             return;
         }
         if (std.mem.eql(u8, arg, "install")) {
@@ -217,7 +223,8 @@ pub fn main(init: std.process.Init) !void {
     // 启动期 fail-fast：RocksDB 没有 template_addresses（携转约束 2）
     try checkTemplateBackendSupport(&cfg);
 
-    // 3. 自动获取 ABI + 自动发现事件
+    // 3. ABI 存在性检查（缺失即失败，见 ensureAbiFiles）+ 自动获取 ABI + 自动发现事件
+    try ensureAbiFiles(init.io, &cfg);
     var resolved = try resolveEvents(alloc, init.io, &cfg);
     defer resolved.deinit();
 
@@ -442,7 +449,12 @@ pub fn main(init: std.process.Init) !void {
 
     var server = http_server.Server.init(alloc, init.io, &cfg.http, &database, &query_cache, indexer_ptrs.items, cfg.queries, cfg.dashboards, &event_bus, js_eng);
     defer server.deinit();
-    try server.start();
+    server.start() catch |e| {
+        // 端口占用 / host 非法在这里只留一行 Zig 的错误返回栈（error: AddressInUse），
+        // 看不出是哪个地址、更看不出"是不是配置写错了"，补一条能直接照做的说明。
+        log.err("✗ HTTP 服务启动失败 {s}:{d}: {any}（检查端口是否已被占用、host 是否为合法 IP 或域名）", .{ cfg.http.host, cfg.http.port, e });
+        return e;
+    };
 
     // GraphQL server (optional)
     var graphql_shutdown = std.atomic.Value(bool).init(false);
@@ -495,7 +507,7 @@ fn cmdCheck(alloc: std.mem.Allocator, io: std.Io, config_path: []const u8) !void
 
     var cfg = config.load(alloc, io, config_path) catch |err| {
         log.err("✗ [1/4] 配置文件 [{s}] 解析错误: {any}", .{ config_path, err });
-        return;
+        return error.CheckFailed;
     };
     defer cfg.deinit(alloc);
     log.info("✓ [1/4] 配置文件格式校验通过: {s}", .{config_path});
@@ -504,21 +516,28 @@ fn cmdCheck(alloc: std.mem.Allocator, io: std.Io, config_path: []const u8) !void
     defer rpc.deinit();
     const block_num = rpc.getBlockNumber() catch |err| {
         log.err("✗ [2/4] RPC 节点连接失败 ({s}): {any}", .{ cfg.rpc.url, err });
-        return;
+        return error.CheckFailed;
     };
     log.info("✓ [2/4] RPC 节点连接正常, 当前最新区块: {d}", .{block_num});
 
     var database = db.Client.init(alloc, &cfg.database) catch |err| {
         log.err("✗ [3/4] 数据库初始化失败: {any}", .{err});
-        return;
+        return error.CheckFailed;
     };
     defer database.deinit();
-    try database.migrate();
+    database.migrate() catch |err| {
+        log.err("✗ [3/4] 数据库结构迁移失败 ({s}): {any}", .{ cfg.database.db_type, err });
+        return error.CheckFailed;
+    };
     log.info("✓ [3/4] 数据库 ({s}) 结构迁移校验通过", .{cfg.database.db_type});
 
+    ensureAbiFiles(io, &cfg) catch |err| {
+        log.err("✗ [4/4] 合约/模板/工厂的 ABI 文件检查未通过: {any}", .{err});
+        return error.CheckFailed;
+    };
     var resolved = resolveEvents(alloc, io, &cfg) catch |err| {
         log.err("✗ [4/4] ABI 与合约事件解析错误: {any}", .{err});
-        return;
+        return error.CheckFailed;
     };
     defer resolved.deinit();
     log.info("✓ [4/4] 所有 {d} 个合约 ABI 解析正常", .{resolved.contracts.len});
@@ -828,6 +847,34 @@ const ResolvedConfig = struct {
         self.alloc.free(self.owned);
     }
 };
+
+/// ABI 是硬依赖而非可选装饰：Indexer 拿不到 ABI 时既不建事件表，`processLog`
+/// 也会整条跳过该合约的所有日志（连 raw_logs 死信表都不写）——"只 WARN 然后继续"
+/// 等于静默丢数据，而且 `check` 仍会报"ABI 解析正常"。故 start / check 两个入口
+/// 都先做存在性检查并快速失败，错误信息里带上出问题的那条 abi_path。
+fn ensureAbiFiles(io: std.Io, cfg: *const config.Config) !void {
+    for (cfg.contracts) |c| {
+        if (c.abi_path.len == 0) continue;
+        std.Io.Dir.cwd().access(io, c.abi_path, .{}) catch {
+            log.err("✗ ABI 文件不存在: {s}（合约 {s}；路径相对启动目录）", .{ c.abi_path, c.name });
+            return error.AbiNotFound;
+        };
+    }
+    for (cfg.templates) |t| {
+        if (t.abi_path.len == 0) continue;
+        std.Io.Dir.cwd().access(io, t.abi_path, .{}) catch {
+            log.err("✗ ABI 文件不存在: {s}（模板 {s}；路径相对启动目录）", .{ t.abi_path, t.name });
+            return error.AbiNotFound;
+        };
+    }
+    for (cfg.factories) |f| {
+        if (f.abi_path.len == 0) continue;
+        std.Io.Dir.cwd().access(io, f.abi_path, .{}) catch {
+            log.err("✗ ABI 文件不存在: {s}（工厂 {s}；路径相对启动目录）", .{ f.abi_path, f.name });
+            return error.AbiNotFound;
+        };
+    }
+}
 
 fn resolveEvents(alloc: std.mem.Allocator, io: std.Io, cfg: *const config.Config) !ResolvedConfig {
     var resolved = try alloc.alloc(config.ContractConfig, cfg.contracts.len);
