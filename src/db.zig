@@ -610,12 +610,13 @@ pub const Client = struct {
         block_from: ?u64,
         block_to: ?u64,
         tx_hash: ?[]const u8,
+        address: ?[]const u8,
         limit: u32,
         offset: u32,
         order_desc: bool,
     ) ![]u8 {
-        if (self.backend_type == .rocksdb) return self.queryEventLogsRocks(contract_name, event_name, block_from, block_to, tx_hash, limit, offset, order_desc);
-        if (self.backend_type == .postgresql) return self.queryEventLogsPG(contract_name, event_name, block_from, block_to, tx_hash, limit, offset, order_desc);
+        if (self.backend_type == .rocksdb) return self.queryEventLogsRocks(contract_name, event_name, block_from, block_to, tx_hash, address, limit, offset, order_desc);
+        if (self.backend_type == .postgresql) return self.queryEventLogsPG(contract_name, event_name, block_from, block_to, tx_hash, address, limit, offset, order_desc);
 
         var sql_buf: std.Io.Writer.Allocating = .init(self.alloc);
         defer sql_buf.deinit();
@@ -624,6 +625,7 @@ pub const Client = struct {
         if (block_from) |_| try w.writeAll(" AND block_number >= ?");
         if (block_to) |_| try w.writeAll(" AND block_number <= ?");
         if (tx_hash) |_| try w.writeAll(" AND tx_hash = ?");
+        if (address) |_| try w.writeAll(" AND contract_address = ?");
         try w.writeAll(if (order_desc) " ORDER BY block_number DESC" else " ORDER BY block_number ASC");
         try w.writeAll(" LIMIT ? OFFSET ?;");
         var sql_list = sql_buf.toArrayList();
@@ -636,6 +638,7 @@ pub const Client = struct {
         if (block_from) |bf| { if (c.sqlite3_bind_int64(stmt, bind_idx, @intCast(bf)) != c.SQLITE_OK) return error.BindFailed; bind_idx += 1; }
         if (block_to) |bt| { if (c.sqlite3_bind_int64(stmt, bind_idx, @intCast(bt)) != c.SQLITE_OK) return error.BindFailed; bind_idx += 1; }
         if (tx_hash) |th| { if (c.sqlite3_bind_text(stmt, bind_idx, th.ptr, @intCast(th.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.BindFailed; bind_idx += 1; }
+        if (address) |ad| { if (c.sqlite3_bind_text(stmt, bind_idx, ad.ptr, @intCast(ad.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.BindFailed; bind_idx += 1; }
         if (c.sqlite3_bind_int64(stmt, bind_idx, @intCast(limit)) != c.SQLITE_OK) return error.BindFailed; bind_idx += 1;
         if (c.sqlite3_bind_int64(stmt, bind_idx, @intCast(offset)) != c.SQLITE_OK) return error.BindFailed;
         var result_buf: std.Io.Writer.Allocating = .init(self.alloc);
@@ -681,10 +684,13 @@ pub const Client = struct {
         block_from: ?u64,
         block_to: ?u64,
         tx_hash: ?[]const u8,
+        address: ?[]const u8,
         limit: u32,
         offset: u32,
         _: bool,
     ) ![]u8 {
+        // RocksDB 事件 key 不含地址列，地址过滤延后（见 task-3 遗留项）
+        _ = address;
         var prefix_buf: [256]u8 = undefined;
         const prefix = try std.fmt.bufPrint(&prefix_buf, "e:{s}:{s}:", .{ contract_name, event_name });
         var seek_buf: [256]u8 = undefined;
@@ -1816,6 +1822,7 @@ pub const Client = struct {
         block_from: ?u64,
         block_to: ?u64,
         tx_hash: ?[]const u8,
+        address: ?[]const u8,
         limit: u32,
         offset: u32,
         _: bool,
@@ -1828,6 +1835,7 @@ pub const Client = struct {
         if (block_from) |_| { try w.print(" AND block_number >= ${d}", .{param_idx}); param_idx += 1; }
         if (block_to) |_| { try w.print(" AND block_number <= ${d}", .{param_idx}); param_idx += 1; }
         if (tx_hash) |_| { try w.print(" AND tx_hash = ${d}", .{param_idx}); param_idx += 1; }
+        if (address) |_| { try w.print(" AND contract_address = ${d}", .{param_idx}); param_idx += 1; }
         try w.writeAll(" ORDER BY block_number DESC");
         try w.print(" LIMIT ${d} OFFSET ${d};", .{ param_idx, param_idx + 1 });
         var sql_list = sql_buf.toArrayList();
@@ -1844,6 +1852,7 @@ pub const Client = struct {
             try params.append(self.alloc, try std.fmt.bufPrint(&buf, "{}", .{bt}));
         }
         if (tx_hash) |th| try params.append(self.alloc, th);
+        if (address) |ad| try params.append(self.alloc, ad);
         {
             var buf: [21]u8 = undefined;
             try params.append(self.alloc, try std.fmt.bufPrint(&buf, "{}", .{limit}));
@@ -2570,26 +2579,53 @@ test "db event table insert and query" {
     try client.autoMigrateContract("test", &test_contract, &.{"Transfer"}, "0xtest");
     const fields = &.{ DecodedField{ .name = "from", .value = "0x1111" }, DecodedField{ .name = "to", .value = "0x2222" }, DecodedField{ .name = "value", .value = "0x64" } };
     try client.insertEventLog("test", "Transfer", fields, 100, "0xtxhash", 0, "0xtest");
-    const result = try client.queryEventLogs("test", "Transfer", 0, null, null, 10, 0, true);
+    const result = try client.queryEventLogs("test", "Transfer", 0, null, null, null, 10, 0, true);
     defer alloc.free(result);
     try std.testing.expect(std.mem.indexOf(u8, result, "0xtxhash") != null);
     const fields2 = &.{ DecodedField{ .name = "from", .value = "0xaaaa" }, DecodedField{ .name = "to", .value = "0xbbbb" }, DecodedField{ .name = "value", .value = "0x96" } };
     try client.insertEventLog("test", "Transfer", fields2, 200, "0xtxhash2", 1, "0xtest");
-    const r1 = try client.queryEventLogs("test", "Transfer", 150, null, null, 10, 0, true);
+    const r1 = try client.queryEventLogs("test", "Transfer", 150, null, null, null, 10, 0, true);
     defer alloc.free(r1);
     try std.testing.expect(std.mem.indexOf(u8, r1, "0xtxhash2") != null);
-    const r2 = try client.queryEventLogs("test", "Transfer", null, 150, null, 10, 0, true);
+    const r2 = try client.queryEventLogs("test", "Transfer", null, 150, null, null, 10, 0, true);
     defer alloc.free(r2);
     try std.testing.expect(std.mem.indexOf(u8, r2, "0xtxhash") != null);
-    const r3 = try client.queryEventLogs("test", "Transfer", null, null, "0xtxhash2", 10, 0, true);
+    const r3 = try client.queryEventLogs("test", "Transfer", null, null, "0xtxhash2", null, 10, 0, true);
     defer alloc.free(r3);
     try std.testing.expect(std.mem.indexOf(u8, r3, "0xtxhash2") != null);
-    const r4 = try client.queryEventLogs("test", "Transfer", null, null, null, 1, 0, true);
+    const r4 = try client.queryEventLogs("test", "Transfer", null, null, null, null, 1, 0, true);
     defer alloc.free(r4);
     try std.testing.expect(std.mem.indexOf(u8, r4, "},{") == null);
-    const r5 = try client.queryEventLogs("test", "Transfer", null, null, null, 10, 0, false);
+    const r5 = try client.queryEventLogs("test", "Transfer", null, null, null, null, 10, 0, false);
     defer alloc.free(r5);
     try std.testing.expect(std.mem.indexOf(u8, r5, "0xtxhash") != null);
+}
+
+test "db queryEventLogs 支持按地址过滤且返回 contract_address" {
+    const alloc = std.testing.allocator;
+    const cfg = DatabaseConfig{ .db_type = "sqlite", .db_name = ":memory:", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var client = try Client.init(alloc, &cfg);
+    defer client.deinit();
+    try client.migrate();
+    const evt = abi.AbiEvent{ .name = "Transfer", .inputs = &.{.{ .name = "value", .type = "uint256", .indexed = false }}, .signature = std.mem.zeroes([32]u8) };
+    var events = try alloc.alloc(abi.AbiEvent, 1);
+    events[0] = evt;
+    defer alloc.free(events);
+    const ac = abi.AbiContract{ .events = events, .functions = &.{} };
+    try client.autoMigrateContract("curve", &ac, &.{"Transfer"}, "");
+    const fields = [_]DecodedField{.{ .name = "value", .value = "7" }};
+    try client.insertEventLog("curve", "Transfer", &fields, 10, "0xt1", 0, "0xA");
+    try client.insertEventLog("curve", "Transfer", &fields, 11, "0xt2", 0, "0xB");
+
+    const all = try client.queryEventLogs("curve", "Transfer", null, null, null, null, 10, 0, true);
+    defer alloc.free(all);
+    try std.testing.expect(std.mem.indexOf(u8, all, "contract_address") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "0xA") != null);
+
+    const only_b = try client.queryEventLogs("curve", "Transfer", null, null, null, "0xB", 10, 0, true);
+    defer alloc.free(only_b);
+    try std.testing.expect(std.mem.indexOf(u8, only_b, "0xA") == null);
+    try std.testing.expect(std.mem.indexOf(u8, only_b, "0xB") != null);
 }
 
 test "db rollbackFromBlock" {
@@ -2666,7 +2702,7 @@ test "db deleteEventLogsInRange" {
     try client.insertEventLog("test", "Transfer", f, 200, "0xtx2", 1, "0xtest");
     try client.insertEventLog("test", "Transfer", f, 300, "0xtx3", 2, "0xtest");
     try client.deleteEventLogsInRange("test", "Transfer", 150, 250);
-    const r = try client.queryEventLogs("test", "Transfer", null, null, null, 10, 0, true);
+    const r = try client.queryEventLogs("test", "Transfer", null, null, null, null, 10, 0, true);
     defer alloc.free(r);
     try std.testing.expect(std.mem.indexOf(u8, r, "0xtx1") != null);
     try std.testing.expect(std.mem.indexOf(u8, r, "0xtx2") == null);
@@ -2702,7 +2738,7 @@ test "db rocksdb event insert and query" {
     const fields = &.{ DecodedField{ .name = "from", .value = "0x1111" }, DecodedField{ .name = "to", .value = "0x2222" }, DecodedField{ .name = "value", .value = "0x64" } };
     try client.insertEventLog("test", "Transfer", fields, 100, "0xtxhash", 0, "0xtest");
 
-    const result = try client.queryEventLogs("test", "Transfer", 0, null, null, 10, 0, true);
+    const result = try client.queryEventLogs("test", "Transfer", 0, null, null, null, 10, 0, true);
     defer alloc.free(result);
     try std.testing.expect(std.mem.indexOf(u8, result, "0xtxhash") != null);
 }
@@ -2918,7 +2954,7 @@ test "db 事件表 contract_address 列：PostgreSQL 同 tx 不同合约与唯�
     try std.testing.expectEqual(@as(i64, 2), after[0].values[0].integer);
 
     // 真实查询路径：地址列随 queryEventLogs 一起返回，两条都还在
-    const listed = try client.queryEventLogs("curve", "Transfer", null, null, "0xtx1", 10, 0, true);
+    const listed = try client.queryEventLogs("curve", "Transfer", null, null, "0xtx1", null, 10, 0, true);
     defer alloc.free(listed);
     try std.testing.expect(std.mem.indexOf(u8, listed, "0xCLONE_A") != null);
     try std.testing.expect(std.mem.indexOf(u8, listed, "0xCLONE_B") != null);

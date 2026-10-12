@@ -349,7 +349,7 @@ fn attachResolvers(schema_def: *zg.schema.Schema) void {
                 const block_from: ?u64 = if (args.get("blockFrom")) |bf| @intCast(@max(0, bf.data.int)) else null;
                 const block_to: ?u64 = if (args.get("blockTo")) |bt| @intCast(@max(0, bt.data.int)) else null;
 
-                const json_str = try c.database.queryEventLogs(contract_name, event_name, block_from, block_to, null, limit, offset, true);
+                const json_str = try c.database.queryEventLogs(contract_name, event_name, block_from, block_to, null, null, limit, offset, true);
                 defer alloc.free(json_str);
 
                 const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json_str, .{});

@@ -554,6 +554,7 @@ pub const Server = struct {
         const result = self.database.queryEventLogs(
             contract_name, event_name,
             block_from, block_to, tx_hash,
+            null,
             limit, offset, order_desc,
         ) catch |e| {
             log.warn("查询事件日志失败 {s}.{s}: {any}", .{ contract_name, event_name, e });
