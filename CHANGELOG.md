@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.4] - 2026-10-12
+
+### Fixed
+- **启动失败回卷时的段错误（`0xaaaaaaaaaaaaaaaa`）**：`main` 里索引器的清理 defer
+  （`stop` + join 线程）注册在 `script_eng` / `js_eng` / `event_bus` / `TemplateRegistry`
+  之前，而 defer 是 LIFO —— 回卷时先释放引擎与注册表，之后才 join 仍在回调的索引器
+  线程，线程读到填过 `0xaa` 的已释放内存。触发条件是 `start()` 之后的任何启动失败
+  （HTTP 端口被占用、`host` 非法导致 bind 报 `InvalidAddress`、
+  `validateThenStartIndexers` 中途失败）；与 `[[factories]]`/`[[templates]]` 无因果
+  关系，纯 `[[contracts]]` 配置在端口被占用时同样 3/3 崩溃。
+- **TOML 行内注释未被剥离**：`host = "127.0.0.1" # 备注` 会把注释并进值里（引号配对
+  失败当字面量）→ 解析出非法地址；`[[contracts]] # 注释` 会让节头失效、后续键值静默
+  归到上一个节；`events = [...] # 注释` 会让数组退化成单值。现在按引号感知剥离
+  （含 `"""` 多行字符串与转义），`trim` 同时兼顾 CRLF 的 `\r`。
+- **未闭合的数组字面量**（`events = ["Transfer"`、多行数组写法）此前静默降级成一个叫
+  `["Transfer` 的事件名 —— 永远匹配不到日志，而校验还报"正常"；现在报
+  `InvalidArraySyntax`。仓库自带的 `config-busd.toml` 多行 `filters` 即属此类（此前被
+  静默忽略，过滤器从未生效），已改为单行。
+- **解析中途出错的泄漏**：`loadFromString` 在解析中途返回错误时，"正在拼装"的
+  `current_contract` / `current_query` / `current_dashboard(+widgets)` /
+  `current_factory` / `current_template` 不在任何 `errdefer` 管辖内，整份泄漏；此外
+  `contracts` 的 `errdefer` 漏了 `filters`。现在按类型抽出 `deinit` 并复用，
+  五处 `errdefer` 与 `Config.deinit` 共用同一份释放逻辑。
+- `zponder check` 失败时退出码恒为 0 → 现在非 0（CI 才能把"校验没过"当成失败）。
+
+### Changed
+- ABI 文件缺失从"WARN 后继续"改为启动/校验期快速失败，错误信息带出问题的那条
+  `abi_path`。此前该合约既不建事件表、`processLog` 又会整条跳过它的所有日志（连
+  `raw_logs` 死信表都不写），而 `check` 仍报"ABI 解析正常"。
+- HTTP 服务启动失败打印 `host:port` 与处置建议，不再只留一行 `error: AddressInUse`
+  加 Zig 错误返回栈。
+- 非 UTF-8 的 JS handler 在加载前预检并给出转码提示（QuickJS 只会说
+  `invalid UTF-8 sequence`）；合法 UTF-8 中文注释不受影响。
+
 ## [0.8.3] - 2026-10-12
 
 ### Added
