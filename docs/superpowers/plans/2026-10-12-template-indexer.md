@@ -169,12 +169,15 @@ Expected: FAIL —— `insertEventLog` 参数数量不匹配（`member function 
 
 > 实施时保留原 prepare/bind 代码，仅把 `,?,?,?);` 改为 `,?,?,?,?);`，并在 `log_index` bind 之后补一段 `contract_address` 的 bind（常量用 `c.SQLITE_STATIC`）。
 
-- [ ] **Step 5: 同步三个调用点编译通过**
+- [ ] **Step 5: 各后端落地 + 调用点编译通过**
 
-- `src/indexer.zig:661-668`（`insertEventLog(...)` 调用）末尾补 `, self.contract.address`
-  （单合约模式即该合约地址；模板模式在 Task 7 改为 `lg.address`）
-- `src/db.zig` 内 `insertEventLogRocks` / `insertEventLogPG` 签名加第 7 个参数
-  （本任务先接收并忽略，Task 4 落地各后端的真实存储）
+- **SQLite**：如上（列 + 新唯一键 + bind）
+- **PostgreSQL**：`createEventTablePG` 同样加 `contract_address TEXT NOT NULL DEFAULT ''` 与
+  `UNIQUE(contract_address, tx_hash, log_index)`；`insertEventLogPG` 的 `$N` 占位与 `execParams`
+  参数表补地址（PG 允许 `ALTER TABLE` 改约束，本任务只需新表路径）
+- **RocksDB**：`insertEventLogRocks` 接收参数后显式忽略（`_ = contract_address;` + 注释
+  "RocksDB 无 SQL，不支持模板模式/地址列"）——**登记为延后项，不在本任务实现**
+- 调用点：`src/indexer.zig:661-668` 末尾补 `, self.contract.address`
 
 - [ ] **Step 6: 运行测试确认通过**
 
