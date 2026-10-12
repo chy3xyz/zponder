@@ -246,20 +246,172 @@ pub const Client = struct {
         contract_name: []const u8,
         abi_contract: *const abi.AbiContract,
         event_names: []const []const u8,
+        contract_address: []const u8,
     ) !void {
         if (self.backend_type == .rocksdb) return;
-        if (self.backend_type == .postgresql) return self.autoMigrateContractPG(contract_name, abi_contract, event_names);
+        if (self.backend_type == .postgresql) return self.autoMigrateContractPG(contract_name, abi_contract, event_names, contract_address);
         for (event_names) |evt_name| {
             const evt = abi_contract.findEventByName(evt_name) orelse continue;
-            try self.createEventTable(contract_name, evt);
+            // 老库（Task 1 之前建的表）缺 contract_address 列、唯一键也不含地址，先就地升级
+            try self.migrateEventTableAddress(contract_name, evt, contract_address);
+            try self.createEventTable(contract_name, evt); // 新建时是空操作（IF NOT EXISTS）
         }
     }
 
-    fn createEventTable(self: *Client, contract_name: []const u8, evt: *const abi.AbiEvent) !void {
-        var sql_buf: std.Io.Writer.Allocating = .init(self.alloc);
-        defer sql_buf.deinit();
-        const w = &sql_buf.writer;
-        try w.print("CREATE TABLE IF NOT EXISTS event_{s}_{s} (", .{ contract_name, evt.name });
+    /// 老库升级：确保事件表带 contract_address 列且唯一键含地址。
+    /// 幂等：列已存在且唯一键已更新时是空操作。SQLite 无法 ALTER 唯一约束，
+    /// 因此需要重建表并搬数据（回填 contract_address）。
+    pub fn migrateEventTableAddress(self: *Client, contract_name: []const u8, evt: *const abi.AbiEvent, contract_address: []const u8) !void {
+        if (self.backend_type == .rocksdb) return;
+        if (self.backend_type == .postgresql) return self.migrateEventTableAddressPG(contract_name, evt, contract_address);
+
+        const table = try std.fmt.allocPrint(self.alloc, "event_{s}_{s}", .{ contract_name, evt.name });
+        defer self.alloc.free(table);
+
+        // 1) 表不存在：按新结构建（IF NOT EXISTS，随后 createEventTable 是空操作）
+        if (!try self.sqliteTableExists(table)) return self.createEventTable(contract_name, evt);
+
+        // 2) 已有列 + 建表 DDL：两者都符合新结构时是空操作
+        var old_cols: std.ArrayList([]u8) = .empty;
+        defer {
+            for (old_cols.items) |col| self.alloc.free(col);
+            old_cols.deinit(self.alloc);
+        }
+        try self.sqliteTableColumns(table, &old_cols);
+        const has_address = columnIndex(old_cols.items, "contract_address") != null;
+        const ddl = try self.sqliteTableDdl(table);
+        defer if (ddl) |d| self.alloc.free(d);
+        const unique_ok = if (ddl) |d| blk: {
+            break :blk (try ddlHasAddressUnique(self.alloc, d)) and !(try ddlHasLegacyUnique(self.alloc, d));
+        } else false;
+        if (has_address and unique_ok) return;
+
+        // 3) 新结构列序（不含 contract_address：该列一律回填，不搬旧值）
+        var owned_cols: std.ArrayList([]u8) = .empty;
+        defer {
+            for (owned_cols.items) |col| self.alloc.free(col);
+            owned_cols.deinit(self.alloc);
+        }
+        var new_cols: std.ArrayList([]const u8) = .empty;
+        defer new_cols.deinit(self.alloc);
+        try new_cols.append(self.alloc, "id");
+        for (evt.inputs) |input| {
+            const col = try self.sanitizeColumnName(input.name);
+            try owned_cols.append(self.alloc, col);
+            try new_cols.append(self.alloc, col);
+        }
+        try new_cols.append(self.alloc, "block_number");
+        try new_cols.append(self.alloc, "tx_hash");
+        try new_cols.append(self.alloc, "log_index");
+        try new_cols.append(self.alloc, "created_at");
+
+        // 只搬新旧结构都有的列（老表可能有 ABI 已删掉的列，或少列）
+        var copy_cols: std.ArrayList([]const u8) = .empty;
+        defer copy_cols.deinit(self.alloc);
+        for (new_cols.items) |col| {
+            if (columnIndex(old_cols.items, col) != null) try copy_cols.append(self.alloc, col);
+        }
+
+        const new_table = try std.fmt.allocPrint(self.alloc, "event_{s}_{s}__new", .{ contract_name, evt.name });
+        defer self.alloc.free(new_table);
+
+        // 4) 重建整个过程包在一个事务里：中途失败不留半张表
+        try self.exec("BEGIN;");
+        errdefer { _ = c.sqlite3_exec(self.db, "ROLLBACK;", null, null, null); }
+
+        {
+            var ddl_buf: std.Io.Writer.Allocating = .init(self.alloc);
+            defer ddl_buf.deinit();
+            const w = &ddl_buf.writer;
+            // 上一次中断可能留下半张 __new 表；在事务内清掉，避免整个迁移卡死
+            try w.print("DROP TABLE IF EXISTS {s};\n", .{new_table});
+            try w.print("CREATE TABLE {s} (", .{new_table});
+            try self.writeEventTableBody(w, evt);
+            try w.writeAll(";");
+            var list = ddl_buf.toArrayList();
+            defer list.deinit(self.alloc);
+            try self.exec(list.items);
+        }
+
+        var moved: c_int = 0;
+        {
+            var ins_buf: std.Io.Writer.Allocating = .init(self.alloc);
+            defer ins_buf.deinit();
+            const w = &ins_buf.writer;
+            try w.print("INSERT INTO {s} (", .{new_table});
+            for (copy_cols.items) |col| try w.print("{s},", .{col});
+            try w.writeAll("contract_address) SELECT ");
+            for (copy_cols.items) |col| try w.print("{s},", .{col});
+            if (has_address) {
+                // 老表已有地址列：只回填空值，绝不覆盖已写入的真实地址
+                try w.writeAll("CASE WHEN contract_address IS NULL OR contract_address = '' THEN ? ELSE contract_address END");
+            } else {
+                try w.writeAll("?");
+            }
+            try w.print(" FROM {s};", .{table});
+            var list = ins_buf.toArrayList();
+            defer list.deinit(self.alloc);
+            var stmt: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, list.items.ptr, @intCast(list.items.len), &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+            defer _ = c.sqlite3_finalize(stmt);
+            if (c.sqlite3_bind_text(stmt, 1, contract_address.ptr, @intCast(contract_address.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.BindFailed;
+            if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.ExecFailed;
+            moved = c.sqlite3_changes(self.db);
+        }
+
+        {
+            var ddl_buf: std.Io.Writer.Allocating = .init(self.alloc);
+            defer ddl_buf.deinit();
+            const w = &ddl_buf.writer;
+            try w.print("DROP TABLE {s};\n", .{table});
+            try w.print("ALTER TABLE {s} RENAME TO {s};", .{ new_table, table });
+            try writeEventTableIndexes(w, contract_name, evt.name);
+            var list = ddl_buf.toArrayList();
+            defer list.deinit(self.alloc);
+            try self.exec(list.items);
+        }
+
+        try self.exec("COMMIT;");
+        log.info("事件表 {s} 已迁移：补 contract_address 列 + 地址唯一键（回填 {d} 行）", .{ table, moved });
+    }
+
+    fn sqliteTableExists(self: *Client, table: []const u8) !bool {
+        const sql = try std.fmt.allocPrint(self.alloc, "SELECT 1 FROM sqlite_master WHERE type='table' AND name='{s}';", .{table});
+        defer self.alloc.free(sql);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        return c.sqlite3_step(stmt) == c.SQLITE_ROW;
+    }
+
+    fn sqliteTableColumns(self: *Client, table: []const u8, out: *std.ArrayList([]u8)) !void {
+        const sql = try std.fmt.allocPrint(self.alloc, "PRAGMA table_info({s});", .{table});
+        defer self.alloc.free(sql);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            const name = std.mem.sliceTo(c.sqlite3_column_text(stmt, 1), 0);
+            const dup = try self.alloc.dupe(u8, name);
+            errdefer self.alloc.free(dup);
+            try out.append(self.alloc, dup);
+        }
+    }
+
+    fn sqliteTableDdl(self: *Client, table: []const u8) !?[]u8 {
+        const sql = try std.fmt.allocPrint(self.alloc, "SELECT sql FROM sqlite_master WHERE type='table' AND name='{s}';", .{table});
+        defer self.alloc.free(sql);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        if (c.sqlite3_column_type(stmt, 0) == c.SQLITE_NULL) return null;
+        return try self.alloc.dupe(u8, std.mem.sliceTo(c.sqlite3_column_text(stmt, 0), 0));
+    }
+
+    /// 事件表列定义 + 唯一键（CREATE TABLE 括号内部分）。
+    /// 新建表与老表重建共用，避免两处 DDL 漂移。
+    fn writeEventTableBody(self: *Client, w: *std.Io.Writer, evt: *const abi.AbiEvent) !void {
         try w.writeAll("\n  id INTEGER PRIMARY KEY AUTOINCREMENT,");
         for (evt.inputs) |input| {
             const col_name = try self.sanitizeColumnName(input.name);
@@ -272,10 +424,17 @@ pub const Client = struct {
         try w.writeAll("\n  log_index INTEGER NOT NULL,");
         try w.writeAll("\n  contract_address TEXT NOT NULL DEFAULT '',");
         try w.writeAll("\n  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,");
-        try w.print("\n  UNIQUE(contract_address, tx_hash, log_index)\n);", .{});
-        try w.print("\nCREATE INDEX IF NOT EXISTS idx_{s}_{s}_block ON event_{s}_{s}(block_number);", .{ contract_name, evt.name, contract_name, evt.name });
-        try w.print("\nCREATE INDEX IF NOT EXISTS idx_{s}_{s}_tx ON event_{s}_{s}(tx_hash);", .{ contract_name, evt.name, contract_name, evt.name });
-        try w.print("\nCREATE INDEX IF NOT EXISTS idx_{s}_{s}_addr_block ON event_{s}_{s}(contract_address, block_number);", .{ contract_name, evt.name, contract_name, evt.name });
+        try w.writeAll("\n  UNIQUE(contract_address, tx_hash, log_index)\n)");
+    }
+
+    fn createEventTable(self: *Client, contract_name: []const u8, evt: *const abi.AbiEvent) !void {
+        var sql_buf: std.Io.Writer.Allocating = .init(self.alloc);
+        defer sql_buf.deinit();
+        const w = &sql_buf.writer;
+        try w.print("CREATE TABLE IF NOT EXISTS event_{s}_{s} (", .{ contract_name, evt.name });
+        try self.writeEventTableBody(w, evt);
+        try w.writeAll(";");
+        try writeEventTableIndexes(w, contract_name, evt.name);
         var list = sql_buf.toArrayList();
         defer list.deinit(self.alloc);
         try self.exec(list.items);
@@ -1452,11 +1611,95 @@ pub const Client = struct {
         contract_name: []const u8,
         abi_contract: *const abi.AbiContract,
         event_names: []const []const u8,
+        contract_address: []const u8,
     ) !void {
         for (event_names) |evt_name| {
             const evt = abi_contract.findEventByName(evt_name) orelse continue;
+            // 老库先补列 + 换唯一键（PG 可直接改约束，无需重建表）
+            try self.migrateEventTableAddressPG(contract_name, evt, contract_address);
             try self.createEventTablePG(contract_name, evt);
         }
+    }
+
+    /// 老库升级（PG）：补 contract_address 列 + 回填 + 唯一键换成含地址的版本。
+    /// 幂等：列与唯一键都已就位时直接返回。
+    fn migrateEventTableAddressPG(self: *Client, contract_name: []const u8, evt: *const abi.AbiEvent, contract_address: []const u8) !void {
+        const table = try std.fmt.allocPrint(self.alloc, "event_{s}_{s}", .{ contract_name, evt.name });
+        defer self.alloc.free(table);
+
+        // 1) 表不存在：按新结构建（IF NOT EXISTS，随后 createEventTablePG 是空操作）
+        if (!try self.pgTableExists(table)) return self.createEventTablePG(contract_name, evt);
+
+        // 2) 是否已有地址列
+        const has_address = blk: {
+            const sql = "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema = current_schema() AND lower(table_name) = lower($1) AND column_name = 'contract_address';";
+            var res = try self.pgconn.?.execParams(sql, &.{table});
+            defer res.deinit();
+            break :blk res.rows() > 0 and !res.isNull(0, 0) and !std.mem.eql(u8, res.get(0, 0), "0");
+        };
+
+        // 3) 表上的唯一约束现状：目标是恰好一个含地址的唯一键
+        var stale_names: std.ArrayList([]u8) = .empty;
+        defer {
+            for (stale_names.items) |nm| self.alloc.free(nm);
+            stale_names.deinit(self.alloc);
+        }
+        var has_target = false;
+        {
+            const sql = "SELECT c.conname, pg_get_constraintdef(c.oid) FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid WHERE lower(t.relname) = lower($1) AND c.contype = 'u';";
+            var res = try self.pgconn.?.execParams(sql, &.{table});
+            defer res.deinit();
+            var i: c_int = 0;
+            while (i < res.rows()) : (i += 1) {
+                if (try ddlHasAddressUnique(self.alloc, res.get(i, 1))) {
+                    has_target = true;
+                } else {
+                    const nm = try self.alloc.dupe(u8, res.get(i, 0));
+                    errdefer self.alloc.free(nm);
+                    try stale_names.append(self.alloc, nm);
+                }
+            }
+        }
+        if (has_address and has_target and stale_names.items.len == 0) return;
+
+        try self.pgconn.?.exec("BEGIN;");
+        errdefer self.pgconn.?.exec("ROLLBACK;") catch {};
+
+        if (!has_address) {
+            const add_sql = try std.fmt.allocPrint(self.alloc, "ALTER TABLE {s} ADD COLUMN IF NOT EXISTS contract_address TEXT NOT NULL DEFAULT '';", .{table});
+            defer self.alloc.free(add_sql);
+            try self.pgconn.?.exec(add_sql);
+            // 老行地址为空串，用本合约地址回填（新行不会命中：插入时已带真实地址）
+            const upd_sql = try std.fmt.allocPrint(self.alloc, "UPDATE {s} SET contract_address = $1 WHERE contract_address = '';", .{table});
+            defer self.alloc.free(upd_sql);
+            var res = try self.pgconn.?.execParams(upd_sql, &.{contract_address});
+            res.deinit();
+        }
+
+        if (!has_target or stale_names.items.len > 0) {
+            var ddl_buf: std.Io.Writer.Allocating = .init(self.alloc);
+            defer ddl_buf.deinit();
+            const w = &ddl_buf.writer;
+            for (stale_names.items) |nm| {
+                try w.print("ALTER TABLE {s} DROP CONSTRAINT IF EXISTS \"{s}\";\n", .{ table, nm });
+            }
+            if (!has_target) {
+                try w.print("ALTER TABLE {s} ADD CONSTRAINT event_{s}_{s}_addr_uniq UNIQUE (contract_address, tx_hash, log_index);\n", .{ table, contract_name, evt.name });
+            }
+            var list = ddl_buf.toArrayList();
+            defer list.deinit(self.alloc);
+            try self.pgconn.?.exec(list.items);
+        }
+
+        try self.pgconn.?.exec("COMMIT;");
+        log.info("事件表 {s} 已迁移（PG）：补 contract_address 列 + 地址唯一键", .{table});
+    }
+
+    fn pgTableExists(self: *Client, table: []const u8) !bool {
+        const sql = "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = current_schema() AND lower(table_name) = lower($1);";
+        var res = try self.pgconn.?.execParams(sql, &.{table});
+        defer res.deinit();
+        return res.rows() > 0 and !res.isNull(0, 0) and !std.mem.eql(u8, res.get(0, 0), "0");
     }
 
     fn createEventTablePG(self: *Client, contract_name: []const u8, evt: *const abi.AbiEvent) !void {
@@ -2142,6 +2385,43 @@ pub const Client = struct {
     }
 };
 
+/// 事件表的三条索引；新建表与老表重建共用。
+fn writeEventTableIndexes(w: *std.Io.Writer, contract_name: []const u8, event_name: []const u8) !void {
+    try w.print("\nCREATE INDEX IF NOT EXISTS idx_{s}_{s}_block ON event_{s}_{s}(block_number);", .{ contract_name, event_name, contract_name, event_name });
+    try w.print("\nCREATE INDEX IF NOT EXISTS idx_{s}_{s}_tx ON event_{s}_{s}(tx_hash);", .{ contract_name, event_name, contract_name, event_name });
+    try w.print("\nCREATE INDEX IF NOT EXISTS idx_{s}_{s}_addr_block ON event_{s}_{s}(contract_address, block_number);", .{ contract_name, event_name, contract_name, event_name });
+}
+
+fn columnIndex(cols: []const []u8, name: []const u8) ?usize {
+    for (cols, 0..) |col, i| {
+        if (std.mem.eql(u8, col, name)) return i;
+    }
+    return null;
+}
+
+/// 建表 DDL / 约束定义里唯一键是否已含地址列。
+fn ddlHasAddressUnique(alloc: std.mem.Allocator, ddl: []const u8) !bool {
+    return ddlHasUniqueKey(alloc, ddl, "unique(contract_address,tx_hash,log_index)");
+}
+
+/// 建表 DDL / 约束定义里是否还带着 Task 1 之前的唯一键 `UNIQUE(tx_hash, log_index)`。
+/// 光有地址列还不够：旧键留着会把同 tx 不同合约的事件顶掉。
+fn ddlHasLegacyUnique(alloc: std.mem.Allocator, ddl: []const u8) !bool {
+    return ddlHasUniqueKey(alloc, ddl, "unique(tx_hash,log_index)");
+}
+
+/// 去空白 + 转小写后做子串匹配，兼容 `UNIQUE(a, b, c)` 与 `UNIQUE (a,b,c)`。
+fn ddlHasUniqueKey(alloc: std.mem.Allocator, ddl: []const u8, needle: []const u8) !bool {
+    var norm: std.ArrayList(u8) = .empty;
+    defer norm.deinit(alloc);
+    try norm.ensureTotalCapacity(alloc, ddl.len);
+    for (ddl) |ch| {
+        if (std.ascii.isWhitespace(ch)) continue;
+        try norm.append(alloc, std.ascii.toLower(ch));
+    }
+    return std.mem.indexOf(u8, norm.items, needle) != null;
+}
+
 // ============================================================================
 // 集成测试
 // ============================================================================
@@ -2257,7 +2537,7 @@ test "db event table insert and query" {
     events[0] = test_evt;
     defer alloc.free(events);
     const test_contract = abi.AbiContract{ .events = events, .functions = &.{} };
-    try client.autoMigrateContract("test", &test_contract, &.{"Transfer"});
+    try client.autoMigrateContract("test", &test_contract, &.{"Transfer"}, "0xtest");
     const fields = &.{ DecodedField{ .name = "from", .value = "0x1111" }, DecodedField{ .name = "to", .value = "0x2222" }, DecodedField{ .name = "value", .value = "0x64" } };
     try client.insertEventLog("test", "Transfer", fields, 100, "0xtxhash", 0, "0xtest");
     const result = try client.queryEventLogs("test", "Transfer", 0, null, null, 10, 0, true);
@@ -2293,7 +2573,7 @@ test "db rollbackFromBlock" {
     events[0] = test_evt;
     defer alloc.free(events);
     const test_contract = abi.AbiContract{ .events = events, .functions = &.{} };
-    try client.autoMigrateContract("test", &test_contract, &.{"Transfer"});
+    try client.autoMigrateContract("test", &test_contract, &.{"Transfer"}, "0xtest");
     try client.createSnapshot(.{ .contract_address = "0xabc", .block_number = 100, .snapshot_data = "{}" });
     try client.createSnapshot(.{ .contract_address = "0xabc", .block_number = 200, .snapshot_data = "{}" });
     try client.upsertBlockHash("0xabc", 100, "0xhash100");
@@ -2350,7 +2630,7 @@ test "db deleteEventLogsInRange" {
     events[0] = test_evt;
     defer alloc.free(events);
     const test_contract = abi.AbiContract{ .events = events, .functions = &.{} };
-    try client.autoMigrateContract("test", &test_contract, &.{"Transfer"});
+    try client.autoMigrateContract("test", &test_contract, &.{"Transfer"}, "0xtest");
     const f = &.{ DecodedField{ .name = "from", .value = "0x1111" }, DecodedField{ .name = "to", .value = "0x2222" }, DecodedField{ .name = "value", .value = "0x64" } };
     try client.insertEventLog("test", "Transfer", f, 100, "0xtx1", 0, "0xtest");
     try client.insertEventLog("test", "Transfer", f, 200, "0xtx2", 1, "0xtest");
@@ -2581,7 +2861,7 @@ test "db 事件表 contract_address 列：PostgreSQL 同 tx 不同合约与唯�
     events[0] = test_evt;
     defer alloc.free(events);
     const ac = abi.AbiContract{ .events = events, .functions = &.{} };
-    try client.autoMigrateContract("curve", &ac, &.{"Transfer"});
+    try client.autoMigrateContract("curve", &ac, &.{"Transfer"}, "0xCLONE_A");
 
     const fields = [_]DecodedField{
         .{ .name = "from", .value = "0xaaa" },
@@ -2651,7 +2931,7 @@ test "db 事件表 contract_address 列：同 tx 不同合约都能落库" {
     events[0] = test_evt;
     defer alloc.free(events);
     const ac = abi.AbiContract{ .events = events, .functions = &.{} };
-    try client.autoMigrateContract("curve", &ac, &.{"Transfer"});
+    try client.autoMigrateContract("curve", &ac, &.{"Transfer"}, "0xCLONE_A");
 
     const fields = [_]DecodedField{
         .{ .name = "from", .value = "0xaaa" },
@@ -2664,4 +2944,147 @@ test "db 事件表 contract_address 列：同 tx 不同合约都能落库" {
     const rows = try client.ponderQuery("SELECT contract_address, COUNT(*) AS n FROM event_curve_Transfer GROUP BY contract_address;", &.{});
     defer client.freeQueryRows(rows);
     try std.testing.expectEqual(@as(usize, 2), rows.len);
+}
+
+test "db 老事件表迁移：补地址列并回填，行数不变" {
+    const alloc = std.testing.allocator;
+    const cfg = DatabaseConfig{ .db_type = "sqlite", .db_name = ":memory:", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var client = try Client.init(alloc, &cfg);
+    defer client.deinit();
+    try client.migrate();
+
+    // 手工造"旧结构"表（无 contract_address、旧唯一键）
+    try client.exec(
+        \\CREATE TABLE event_dai_Transfer (
+        \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+        \\  evt_from TEXT, evt_value TEXT,
+        \\  block_number INTEGER NOT NULL, tx_hash TEXT NOT NULL, log_index INTEGER NOT NULL,
+        \\  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        \\  UNIQUE(tx_hash, log_index));
+    );
+    try client.exec("INSERT INTO event_dai_Transfer (evt_from, evt_value, block_number, tx_hash, log_index) VALUES ('0xa','1',10,'0xt',0);");
+
+    const test_evt = abi.AbiEvent{ .name = "Transfer", .inputs = &.{
+        .{ .name = "from", .type = "address", .indexed = true },
+        .{ .name = "value", .type = "uint256", .indexed = false },
+    }, .signature = std.mem.zeroes([32]u8) };
+    // 迁移两次：必须幂等
+    try client.migrateEventTableAddress("dai", &test_evt, "0xDAI");
+    try client.migrateEventTableAddress("dai", &test_evt, "0xDAI");
+
+    const rows = try client.ponderQuery("SELECT contract_address, evt_from, block_number FROM event_dai_Transfer;", &.{});
+    defer client.freeQueryRows(rows);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualStrings("0xDAI", rows[0].values[0].text);
+    try std.testing.expectEqualStrings("0xa", rows[0].values[1].text);
+
+    // 新唯一键已生效：迁移后插入不再报 no such column，且 (tx_hash, log_index) 相同
+    // 而地址不同的两条都留得住，真重复才被拒
+    const f = [_]DecodedField{.{ .name = "from", .value = "0xb" }};
+    try client.insertEventLog("dai", "Transfer", &f, 10, "0xt", 0, "0xOTHER");
+    const after = try client.ponderQuery("SELECT COUNT(*) AS n FROM event_dai_Transfer;", &.{});
+    defer client.freeQueryRows(after);
+    try std.testing.expectEqual(@as(i64, 2), after[0].values[0].integer);
+    try std.testing.expectError(error.ExecFailed, client.insertEventLog("dai", "Transfer", &f, 10, "0xt", 0, "0xOTHER"));
+}
+
+test "db 老事件表迁移（PostgreSQL）：补地址列并换唯一键" {
+    const alloc = std.testing.allocator;
+    // 无本地 PG 时跳过（CI 不装 PG）
+    const admin_cfg = DatabaseConfig{ .db_type = "postgresql", .db_name = "host=localhost port=5432 dbname=postgres", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var admin = Client.init(alloc, &admin_cfg) catch return error.SkipZigTest;
+    _ = admin.ponderExec("DROP DATABASE IF EXISTS zponder_mig_test;", &.{}) catch {};
+    _ = admin.ponderExec("CREATE DATABASE zponder_mig_test;", &.{}) catch {
+        admin.deinit();
+        return error.SkipZigTest;
+    };
+    admin.deinit();
+
+    const cfg = DatabaseConfig{ .db_type = "postgresql", .db_name = "host=localhost port=5432 dbname=zponder_mig_test", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var client = try Client.init(alloc, &cfg);
+    try client.migrate();
+
+    // 手工造"旧结构"表（无 contract_address、旧唯一键）
+    _ = try client.ponderExec(
+        \\CREATE TABLE event_dai_Transfer (
+        \\  id SERIAL PRIMARY KEY,
+        \\  evt_from TEXT, evt_value TEXT,
+        \\  block_number BIGINT NOT NULL, tx_hash TEXT NOT NULL, log_index BIGINT NOT NULL,
+        \\  created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+        \\  UNIQUE(tx_hash, log_index));
+    , &.{});
+    _ = try client.ponderExec("INSERT INTO event_dai_Transfer (evt_from, evt_value, block_number, tx_hash, log_index) VALUES ('0xa','1',10,'0xt',0);", &.{});
+
+    const test_evt = abi.AbiEvent{ .name = "Transfer", .inputs = &.{
+        .{ .name = "from", .type = "address", .indexed = true },
+        .{ .name = "value", .type = "uint256", .indexed = false },
+    }, .signature = std.mem.zeroes([32]u8) };
+    var events = try alloc.alloc(abi.AbiEvent, 1);
+    events[0] = test_evt;
+    defer alloc.free(events);
+    const ac = abi.AbiContract{ .events = events, .functions = &.{} };
+
+    // 迁移两次：必须幂等
+    try client.autoMigrateContract("dai", &ac, &.{"Transfer"}, "0xDAI");
+    try client.autoMigrateContract("dai", &ac, &.{"Transfer"}, "0xDAI");
+
+    const rows = try client.ponderQuery("SELECT contract_address, evt_from FROM event_dai_Transfer;", &.{});
+    defer client.freeQueryRows(rows);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualStrings("0xDAI", rows[0].values[0].text);
+    try std.testing.expectEqualStrings("0xa", rows[0].values[1].text);
+
+    // 唯一键已含地址：同 tx_hash/log_index 不同地址可共存，同地址重复被拒
+    const f = [_]DecodedField{.{ .name = "from", .value = "0xb" }};
+    try client.insertEventLog("dai", "Transfer", &f, 10, "0xt", 0, "0xOTHER");
+    const after = try client.ponderQuery("SELECT COUNT(*) AS n FROM event_dai_Transfer;", &.{});
+    defer client.freeQueryRows(after);
+    try std.testing.expectEqual(@as(i64, 2), after[0].values[0].integer);
+    try std.testing.expectError(error.ExecFailed, client.insertEventLog("dai", "Transfer", &f, 10, "0xt", 0, "0xOTHER"));
+
+    // 清理测试库
+    client.deinit();
+    var cleanup = Client.init(alloc, &admin_cfg) catch return;
+    _ = cleanup.ponderExec("DROP DATABASE IF EXISTS zponder_mig_test;", &.{}) catch {};
+    cleanup.deinit();
+}
+
+
+test "db 老事件表迁移：已有地址列时保留原地址，只换唯一键" {
+    const alloc = std.testing.allocator;
+    const cfg = DatabaseConfig{ .db_type = "sqlite", .db_name = ":memory:", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var client = try Client.init(alloc, &cfg);
+    defer client.deinit();
+    try client.migrate();
+
+    // 半迁移状态的表：已有地址列（且行上有真实地址），但唯一键还是旧的
+    try client.exec(
+        \\CREATE TABLE event_dai_Transfer (
+        \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+        \\  evt_from TEXT,
+        \\  block_number INTEGER NOT NULL, tx_hash TEXT NOT NULL, log_index INTEGER NOT NULL,
+        \\  contract_address TEXT NOT NULL DEFAULT '',
+        \\  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        \\  UNIQUE(tx_hash, log_index));
+    );
+    try client.exec("INSERT INTO event_dai_Transfer (evt_from, block_number, tx_hash, log_index, contract_address) VALUES ('0xa',10,'0xt1',0,'0xAAA'), ('0xb',10,'0xt2',0,'0xBBB');");
+
+    const test_evt = abi.AbiEvent{ .name = "Transfer", .inputs = &.{
+        .{ .name = "from", .type = "address", .indexed = true },
+    }, .signature = std.mem.zeroes([32]u8) };
+    try client.migrateEventTableAddress("dai", &test_evt, "0xDAI");
+
+    // 已有地址必须原样保留（不能被 0xDAI 覆盖），行数不变
+    const rows = try client.ponderQuery("SELECT contract_address, evt_from FROM event_dai_Transfer ORDER BY id;", &.{});
+    defer client.freeQueryRows(rows);
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqualStrings("0xAAA", rows[0].values[0].text);
+    try std.testing.expectEqualStrings("0xBBB", rows[1].values[0].text);
+
+    // 旧唯一键已被换掉：同 tx_hash/log_index 不同地址可共存
+    const f = [_]DecodedField{.{ .name = "from", .value = "0xc" }};
+    try client.insertEventLog("dai", "Transfer", &f, 20, "0xt1", 0, "0xCCC");
+    const after = try client.ponderQuery("SELECT COUNT(*) AS n FROM event_dai_Transfer;", &.{});
+    defer client.freeQueryRows(after);
+    try std.testing.expectEqual(@as(i64, 3), after[0].values[0].integer);
 }

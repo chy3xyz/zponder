@@ -89,7 +89,7 @@ pub const Indexer = struct {
 
         // 根据 ABI 自动创建事件表
         if (abi_contract) |*ac| {
-            database.autoMigrateContract(contract.name, ac, contract.events) catch |e| {
+            database.autoMigrateContract(contract.name, ac, contract.events, contract.address) catch |e| {
                 log.err("合约 {s} 自动迁移失败: {any}", .{ contract.name, e });
             };
             log.info("合约 {s} 事件表已创建/检查", .{contract.name});
