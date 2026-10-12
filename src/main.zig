@@ -86,12 +86,32 @@ fn enableTemplateRuntime(idx: *indexer.Indexer, template_name: []const u8) !void
 /// RocksDB 后端没有 template_addresses（Task 4：四个 CRUD 一律 UnsupportedOperation），
 /// 配了 [[templates]] 时必须在启动期失败，而不是等到发现第一个 clone（携转约束 2）。
 /// 该检查进不了 `config.validate()`——那里拿不到后端类型。
+///
+/// 两处调用，职责不同：`main` 里的一次在打开数据库**之前**给出清晰报错；
+/// `validateThenStartIndexers` 里的一次是**顺序保证**（让"校验 → 启动"的顺序由结构固定，
+/// 并被测试判别），不是冗余。
 fn checkTemplateBackendSupport(cfg: *const config.Config) !void {
     if (cfg.templates.len == 0) return;
     if (std.mem.eql(u8, cfg.database.db_type, "rocksdb")) {
         log.err("配置错误: database.type = \"rocksdb\" 不支持 [[templates]]（template_addresses 仅 SQLite/PostgreSQL 可用）", .{});
         return error.UnsupportedOperation;
     }
+}
+
+/// 启动序列：**先**做启动期校验，**再**启动索引器（携转约束 2 的唯一落点）。
+/// main 里没有任何其它 `Indexer.start()` 路径，所以"RocksDB + [[templates]] 必须在
+/// 第一个 start() 之前失败"由结构保证，而不是靠某一行代码的位置。
+/// `start_one` 是可注入的启动动作（生产传 `Indexer.start`），测试注入假实现记录调用序列，
+/// 从而能判别"校验是否真的早于第一个 start"。
+fn validateThenStartIndexers(
+    cfg: *const config.Config,
+    ctx: *anyopaque,
+    start_one: *const fn (ctx: *anyopaque, index: usize) anyerror!void,
+    indexer_count: usize,
+) !void {
+    try checkTemplateBackendSupport(cfg);
+    var i: usize = 0;
+    while (i < indexer_count) : (i += 1) try start_one(ctx, i);
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -396,8 +416,17 @@ pub fn main(init: std.process.Init) !void {
         if (js_eng.handlerCount() > 0) idx.setEventTimestampsEnabled(true);
     }
 
-    // 8. 启动
-    for (indexers.items) |*idx| try idx.start();
+    // 8. 启动（唯一入口：校验必先于任何 start()，携转约束 2）
+    const IndexerStarter = struct {
+        indexers: []indexer.Indexer,
+
+        fn startOne(ctx: *anyopaque, index: usize) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try self.indexers[index].start();
+        }
+    };
+    var starter = IndexerStarter{ .indexers = indexers.items };
+    try validateThenStartIndexers(&cfg, &starter, IndexerStarter.startOne, indexers.items.len);
 
     var server = http_server.Server.init(alloc, init.io, &cfg.http, &database, &query_cache, indexer_ptrs.items, cfg.queries, cfg.dashboards, &event_bus, js_eng);
     defer server.deinit();
@@ -959,4 +988,56 @@ test "启动校验: rocksdb + [[templates]] 快速失败（携转约束 2）" {
     );
     defer rocks_plain.deinit(alloc);
     try checkTemplateBackendSupport(&rocks_plain);
+}
+
+/// 假的"启动动作"：只记录被调用了多少次，用来判别启动序列里的校验顺序。
+const StartupProbe = struct {
+    starts: usize = 0,
+
+    fn startOne(ctx: *anyopaque, index: usize) anyerror!void {
+        _ = index;
+        const self: *StartupProbe = @ptrCast(@alignCast(ctx));
+        self.starts += 1;
+    }
+};
+
+test "启动顺序: RocksDB 校验早于任何索引器启动（携转约束 2 顺序判别）" {
+    const alloc = std.testing.allocator;
+    const skeleton =
+        \\[rpc]
+        \\url = "http://localhost:8545"
+        \\
+    ;
+    var rocks = try config.loadFromString(alloc, skeleton ++
+        \\[database]
+        \\type = "rocksdb"
+        \\db_name = "rdb"
+        \\[[templates]]
+        \\name = "curve"
+        \\
+    );
+    defer rocks.deinit(alloc);
+
+    // rocksdb + [[templates]] + 3 个待启动索引器：必须先报错，且一个都没启动。
+    // 把校验挪到启动循环之后 → starts 变成 3 → 本断言变红。
+    var probe = StartupProbe{};
+    try std.testing.expectError(
+        error.UnsupportedOperation,
+        validateThenStartIndexers(&rocks, &probe, StartupProbe.startOne, 3),
+    );
+    try std.testing.expectEqual(@as(usize, 0), probe.starts);
+
+    // 对照：sqlite + [[templates]] 通过校验后才逐个启动
+    var sqlite = try config.loadFromString(alloc, skeleton ++
+        \\[database]
+        \\type = "sqlite"
+        \\db_name = "t.db"
+        \\[[templates]]
+        \\name = "curve"
+        \\
+    );
+    defer sqlite.deinit(alloc);
+    var probe_ok = StartupProbe{};
+    try validateThenStartIndexers(&sqlite, &probe_ok, StartupProbe.startOne, 3);
+    try std.testing.expectEqual(@as(usize, 3), probe_ok.starts);
 }
