@@ -6,6 +6,13 @@ pub const EventFilter = struct {
     field: []const u8,
     op: []const u8,
     value: []const u8,
+
+    fn deinit(self: *const EventFilter, alloc: std.mem.Allocator) void {
+        alloc.free(self.event);
+        alloc.free(self.field);
+        alloc.free(self.op);
+        alloc.free(self.value);
+    }
 };
 
 pub const ContractConfig = struct {
@@ -19,6 +26,16 @@ pub const ContractConfig = struct {
     max_reorg_depth: ?u32,
     block_batch_size: ?u32,
     filters: []const EventFilter,
+
+    fn deinit(self: *const ContractConfig, alloc: std.mem.Allocator) void {
+        alloc.free(self.name);
+        alloc.free(self.address);
+        alloc.free(self.abi_path);
+        for (self.events) |e| alloc.free(e);
+        alloc.free(self.events);
+        for (self.filters) |*f| f.deinit(alloc);
+        alloc.free(self.filters);
+    }
 };
 
 pub const GlobalConfig = struct {
@@ -87,12 +104,28 @@ pub const WidgetConfig = struct {
     endpoint: []const u8,
     refresh: u32,
     columns: []const []const u8,
+
+    fn deinit(self: *const WidgetConfig, alloc: std.mem.Allocator) void {
+        alloc.free(self.id);
+        alloc.free(self.title);
+        alloc.free(self.widget_type);
+        alloc.free(self.endpoint);
+        for (self.columns) |c| alloc.free(c);
+        alloc.free(self.columns);
+    }
 };
 
 pub const DashboardConfig = struct {
     name: []const u8,
     title: []const u8,
     widgets: []WidgetConfig,
+
+    fn deinit(self: *const DashboardConfig, alloc: std.mem.Allocator) void {
+        alloc.free(self.name);
+        alloc.free(self.title);
+        for (self.widgets) |*w| w.deinit(alloc);
+        alloc.free(self.widgets);
+    }
 };
 
 pub const FactoryConfig = struct {
@@ -107,6 +140,18 @@ pub const FactoryConfig = struct {
     child_poll_interval_ms: ?u32,
     child_batch_size: ?u32,
     template_name: []const u8,
+
+    fn deinit(self: *const FactoryConfig, alloc: std.mem.Allocator) void {
+        alloc.free(self.name);
+        alloc.free(self.address);
+        alloc.free(self.abi_path);
+        alloc.free(self.creation_event);
+        alloc.free(self.child_address_field);
+        alloc.free(self.child_abi_path);
+        for (self.child_events) |e| alloc.free(e);
+        alloc.free(self.child_events);
+        alloc.free(self.template_name);
+    }
 };
 
 pub const TemplateConfig = struct {
@@ -123,12 +168,28 @@ pub const TemplateConfig = struct {
     /// 见 `Indexer.setMaxAddressesPerRequest`）。地址数达数千时必须分块，
     /// 否则一次请求必然超 RPC 上限。
     max_addresses_per_request: ?u32,
+
+    fn deinit(self: *const TemplateConfig, alloc: std.mem.Allocator) void {
+        alloc.free(self.name);
+        alloc.free(self.abi_path);
+        for (self.events) |e| alloc.free(e);
+        alloc.free(self.events);
+        alloc.free(self.factory_name);
+        alloc.free(self.discovery_event);
+        alloc.free(self.discovery_address_field);
+    }
 };
 
 pub const QueryParam = struct {
     name: []const u8,
     param_type: []const u8,
     default_value: []const u8,
+
+    fn deinit(self: *const QueryParam, alloc: std.mem.Allocator) void {
+        alloc.free(self.name);
+        alloc.free(self.param_type);
+        alloc.free(self.default_value);
+    }
 };
 
 pub const QueryConfig = struct {
@@ -137,6 +198,14 @@ pub const QueryConfig = struct {
     sql: []const u8,
     params: []const QueryParam,
     cache_ttl_blocks: u64,
+
+    fn deinit(self: *const QueryConfig, alloc: std.mem.Allocator) void {
+        alloc.free(self.name);
+        alloc.free(self.path);
+        alloc.free(self.sql);
+        for (self.params) |*p| p.deinit(alloc);
+        alloc.free(self.params);
+    }
 };
 
 pub const Config = struct {
@@ -175,68 +244,15 @@ pub const Config = struct {
         alloc.free(self.graphql.host);
         alloc.free(self.database.db_type);
         alloc.free(self.database.db_name);
-        for (self.contracts) |c| {
-            alloc.free(c.name);
-            alloc.free(c.address);
-            alloc.free(c.abi_path);
-            for (c.events) |e| alloc.free(e);
-            alloc.free(c.events);
-            for (c.filters) |f| {
-                alloc.free(f.event);
-                alloc.free(f.field);
-                alloc.free(f.op);
-                alloc.free(f.value);
-            }
-            alloc.free(c.filters);
-        }
+        for (self.contracts) |*c| c.deinit(alloc);
         alloc.free(self.contracts);
-        for (self.queries) |q| {
-            alloc.free(q.name);
-            alloc.free(q.path);
-            alloc.free(q.sql);
-            for (q.params) |p| {
-                alloc.free(p.name);
-                alloc.free(p.param_type);
-                alloc.free(p.default_value);
-            }
-            alloc.free(q.params);
-        }
+        for (self.queries) |*q| q.deinit(alloc);
         alloc.free(self.queries);
-        for (self.dashboards) |d| {
-            alloc.free(d.name);
-            alloc.free(d.title);
-            for (d.widgets) |w| {
-                alloc.free(w.id);
-                alloc.free(w.title);
-                alloc.free(w.widget_type);
-                alloc.free(w.endpoint);
-                for (w.columns) |c| alloc.free(c);
-                alloc.free(w.columns);
-            }
-            alloc.free(d.widgets);
-        }
+        for (self.dashboards) |*d| d.deinit(alloc);
         alloc.free(self.dashboards);
-        for (self.factories) |f| {
-            alloc.free(f.name);
-            alloc.free(f.address);
-            alloc.free(f.abi_path);
-            alloc.free(f.creation_event);
-            alloc.free(f.child_address_field);
-            alloc.free(f.child_abi_path);
-            for (f.child_events) |e| alloc.free(e);
-            alloc.free(f.child_events);
-            alloc.free(f.template_name);
-        }
+        for (self.factories) |*f| f.deinit(alloc);
         alloc.free(self.factories);
-        for (self.templates) |t| {
-            alloc.free(t.name);
-            alloc.free(t.abi_path);
-            for (t.events) |e| alloc.free(e);
-            alloc.free(t.events);
-            alloc.free(t.factory_name);
-            alloc.free(t.discovery_event);
-            alloc.free(t.discovery_address_field);
-        }
+        for (self.templates) |*t| t.deinit(alloc);
         alloc.free(self.templates);
     }
 };
@@ -533,77 +549,31 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
 
     var contracts: std.ArrayList(ContractConfig) = .empty;
     errdefer {
-        for (contracts.items) |c| {
-            alloc.free(c.name);
-            alloc.free(c.address);
-            alloc.free(c.abi_path);
-            for (c.events) |e| alloc.free(e);
-            alloc.free(c.events);
-        }
+        for (contracts.items) |*c| c.deinit(alloc);
         contracts.deinit(alloc);
     }
 
     var queries: std.ArrayList(QueryConfig) = .empty;
     errdefer {
-        for (queries.items) |q| {
-            alloc.free(q.name);
-            alloc.free(q.path);
-            alloc.free(q.sql);
-            for (q.params) |p| {
-                alloc.free(p.name);
-                alloc.free(p.param_type);
-                alloc.free(p.default_value);
-            }
-            alloc.free(q.params);
-        }
+        for (queries.items) |*q| q.deinit(alloc);
         queries.deinit(alloc);
     }
 
     var dashboards: std.ArrayList(DashboardConfig) = .empty;
     errdefer {
-        for (dashboards.items) |d| {
-            alloc.free(d.name);
-            alloc.free(d.title);
-            for (d.widgets) |w| {
-                alloc.free(w.id);
-                alloc.free(w.title);
-                alloc.free(w.widget_type);
-                alloc.free(w.endpoint);
-                for (w.columns) |c| alloc.free(c);
-                alloc.free(w.columns);
-            }
-            alloc.free(d.widgets);
-        }
+        for (dashboards.items) |*d| d.deinit(alloc);
         dashboards.deinit(alloc);
     }
 
     var factories: std.ArrayList(FactoryConfig) = .empty;
     errdefer {
-        for (factories.items) |f| {
-            alloc.free(f.name);
-            alloc.free(f.address);
-            alloc.free(f.abi_path);
-            alloc.free(f.creation_event);
-            alloc.free(f.child_address_field);
-            alloc.free(f.child_abi_path);
-            for (f.child_events) |e| alloc.free(e);
-            alloc.free(f.child_events);
-            alloc.free(f.template_name);
-        }
+        for (factories.items) |*f| f.deinit(alloc);
         factories.deinit(alloc);
     }
 
     var templates: std.ArrayList(TemplateConfig) = .empty;
     errdefer {
-        for (templates.items) |t| {
-            alloc.free(t.name);
-            alloc.free(t.abi_path);
-            for (t.events) |e| alloc.free(e);
-            alloc.free(t.events);
-            alloc.free(t.factory_name);
-            alloc.free(t.discovery_event);
-            alloc.free(t.discovery_address_field);
-        }
+        for (templates.items) |*t| t.deinit(alloc);
         templates.deinit(alloc);
     }
 
@@ -629,6 +599,20 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
     var current_widgets: std.ArrayList(WidgetConfig) = .empty;
     var current_factory: ?FactoryConfig = null;
     var current_template: ?TemplateConfig = null;
+
+    // 解析中途出错（数字非法、数组括号不配对……）时，"正在拼装"的这一节还没被
+    // append 进上面的列表，任何 errdefer 都够不着它——此前会整份泄漏。
+    // 释放时要**先元素、后容器**：current_widgets 里的元素归它自己，不在容器里。
+    errdefer {
+        if (current_contract) |*cc| cc.deinit(alloc);
+        if (current_query) |*cq| cq.deinit(alloc);
+        if (current_factory) |*cf| cf.deinit(alloc);
+        if (current_template) |*ct| ct.deinit(alloc);
+        if (current_widget) |*cw| cw.deinit(alloc);
+        for (current_widgets.items) |*cw| cw.deinit(alloc);
+        current_widgets.deinit(alloc);
+        if (current_dashboard) |*cd| cd.deinit(alloc);
+    }
 
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line_raw| {
@@ -1589,9 +1573,56 @@ test "config: 未闭合的数组字面量报错而非静默降级" {
     try std.testing.expectError(error.InvalidArraySyntax, parseFilters(alloc, "[\"Transfer:value:gt:1\""));
     try std.testing.expectError(error.InvalidArraySyntax, parseQueryParams(alloc, "[\"limit:u32:50\""));
 
-    // 注：这里刻意不走 loadFromString —— 解析中途报错会让"正在拼装"的那个 section
-    // （current_contract 等）脱离 errdefer 的管辖而泄漏。那是既有缺陷（`from_block = abc`
-    // 这类老错误同样触发），与本次数组严格化无关，单独修。
+    // 端到端：解析中途报错时，"正在拼装"的那一节 + 已 append 的合约 filters 都必须
+    // 被释放（回归：此前 current_* 不在任何 errdefer 管辖内，且 contracts 的 errdefer
+    // 漏了 filters）。
+    const toml =
+        \\[rpc]
+        \\url = "https://example.com"
+        \\
+        \\[[contracts]]
+        \\name = "dai"
+        \\address = "0x6b175474e89094c44da98b954eedeac495271d0f"
+        \\abi_path = "./abis/erc20.abi"
+        \\events = ["Transfer"]
+        \\filters = ["Transfer:value:gt:1"]
+        \\
+        \\[[contracts]]
+        \\name = "bad"
+        \\address = "0x1111111111111111111111111111111111111111"
+        \\abi_path = "./b.abi"
+        \\events = ["Transfer"
+    ;
+    try std.testing.expectError(error.InvalidArraySyntax, loadFromString(alloc, toml));
+}
+
+test "config: 解析中途出错时 dashboard/widget 也一并释放（回归）" {
+    const alloc = std.testing.allocator;
+    const toml =
+        \\[rpc]
+        \\url = "https://example.com"
+        \\
+        \\[[dashboards]]
+        \\name = "d"
+        \\title = "面板"
+        \\
+        \\[[dashboards.widgets]]
+        \\id = "w1"
+        \\title = "W1"
+        \\type = "stats"
+        \\endpoint = "/api/a"
+        \\columns = ["a"]
+        \\
+        \\[[dashboards.widgets]]
+        \\id = "w2"
+        \\title = "W2"
+        \\type = "stats"
+        \\endpoint = "/api/b"
+        \\columns = ["a"
+    ;
+    // 出错点在第 2 个 widget 内：current_widget（在拼）、current_widgets（已收 1 个）
+    // 与 current_dashboard 三者都必须被释放，否则 SafeAllocator 报泄漏
+    try std.testing.expectError(error.InvalidArraySyntax, loadFromString(alloc, toml));
 }
 
 test "config: 行内注释不污染值（回归：host/数组/bool/节头）" {
