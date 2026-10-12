@@ -186,6 +186,14 @@ pub fn build(b: *std.Build) void {
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
+    // 两个测试二进制都会跑 db.zig 的 PG 用例，而它们各自用固定名字的测试库
+    // （`zponder_*_test`）做 DROP/CREATE —— 并行执行时两边会互相 DROP 掉对方正在
+    // 用的库，CREATE 也会撞 "already exists"，表现为偶发的 `(1 skipped)`
+    // （那几处 `CREATE DATABASE ... catch { return error.SkipZigTest; }`）。
+    // 让 exe 测试等 module 测试跑完，把这两步串起来即可消除竞争（代价约 2-3 秒）。
+    // 若将来想让两步重新并行，得先给每个进程一套独立的 PG 测试库名。
+    run_exe_tests.step.dependOn(&run_mod_tests.step);
+
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
