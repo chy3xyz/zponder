@@ -738,10 +738,19 @@ git commit -m "feat: Indexer 模板模式（动态地址集合 + 补扫 + 模板
 ## Task 8: 工厂发现喂给模板 + main 装配
 
 **Files:**
-- Modify: `src/factory.zig`（`FactoryConfig` 增加 `template_name`；`onFactoryEvent` 分发）
-- Modify: `src/config.zig`（`[[factories]]` 解析 `template_name`）
-- Modify: `src/main.zig:162-271`（建模板索引器、注册分发表、装配回调）
-- Test: `src/config.zig`（解析）+ `src/factory.zig`（分发单测）
+- Modify: `src/factory.zig`（`onFactoryEvent` 分发到模板分发表）
+- Modify: `src/config.zig`（`validate()`：实体闸门纳入 `templates`；模板名唯一性；`factory_name` 必须存在）
+- Modify: `src/main.zig`（建模板索引器、注册分发表、装配回调、启动期 fail-fast）
+- Test: `src/config.zig`（校验）+ `src/factory.zig`（分发单测）+ `src/main.zig` 或集成层
+
+**来自前序任务评审的携转约束（必须满足）**：
+1. **调用顺序硬约束**：模板索引器必须 **先 `setTemplateMode(true)` 再 `try loadTemplateAddresses()`**——`loadTemplateAddresses` 在非模板模式下返回 `error.NotTemplateMode`（Task 7 已改），且此时启动期 fail-fast 才有意义
+2. **RocksDB 启动期快速失败**：若后端是 RocksDB 且配置了 `[[templates]]`，必须在**启动期**报错退出（`error.UnsupportedOperation` 来自 `template_addresses` 的 CRUD；不得等到"发现第一个 clone 才炸"）；加一条启动校验测试
+3. **`validate()` 实体闸门纳入 `templates`**：当前闸门是 `contracts.len == 0 and factories.len == 0`，"只配 `[[templates]]`"会被拒（Task 6 未动，因跨段校验归本任务）
+4. **模板名唯一性校验**：`TemplateConfig.name` 作分发表 key，重复名会静默覆盖；`validate()` 里拒绝重复
+5. **`template.factory_name` 必须存在于 `[[factories]]`**：不存在则 `error.InvalidConfig`（启动期报错，不要留到运行期）
+6. **模板的 `ContractConfig` 必须堆上长期存活**：模板索引器持有 `*const ContractConfig`，不可指向栈上临时量；`deinit` 时一并释放
+7. **同一发现事件不要同时配老 factory 子索引器与模板**：`[[factories]]` 同时有 `child_abi_path` 与 `template_name` 时，`validate()` 拒绝（避免同一批 clone 被两套索引器重复索引）
 
 **Interfaces:**
 - Consumes: Task 6 配置、Task 7 模板 Indexer
