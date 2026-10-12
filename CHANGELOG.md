@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.5] - 2026-10-12
+
+### Fixed
+- **`zponder install` / `zponder add-script` 失败时退出码恒为 0**：install 复制二进制
+  失败是 `log.err` + 裸 `return`；add-script 建不了 `handlers/` 目录时是完全静默的
+  `catch return`（连日志都没有）。现在都会报错并返回非 0 退出码，createFile /
+  写入模版文件失败同样处理（写入失败原来也没带文件名）。
+- CLI 子命令的失败退出统一走 `exitOnFailure()`：失败细节由子命令写进日志，这里只负责
+  置退出码，不让 `main` 返回 error —— 这类失败属于用户/环境问题，不需要 Zig 的错误
+  返回栈。`cmdCheck` 的内联 catch 也收敛到这里，语义只定义一处。
+
+### Changed
+- `install` 复制失败时错误信息补上**源**路径与 `zig build` 提示（原来只报目标路径，
+  二进制尚未编译时看不出是源缺失）。
+
 ## [0.8.4] - 2026-10-12
 
 ### Fixed
