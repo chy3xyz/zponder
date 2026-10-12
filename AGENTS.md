@@ -74,6 +74,14 @@
   `child_address_field`. `validate()` enforces the pairing: a factory's
   `template_name` must point back at the template whose `factory_name` names it,
   and duplicate factory addresses are rejected.
+- Discovery sources: a `[[factories]]` entry takes **either** `address` (a concrete
+  contract: the factory contract whose events announce children) **or**
+  `from_template = "<name>"` (a template's address set — for addresses only the
+  discovered contract knows, e.g. a clone emitting `Migrated(pair)`). The two are
+  mutually exclusive; `from_template` requires `template_name`, forbids
+  `child_abi_path` and cannot point at its own target. One source may carry
+  several rules (`Indexer.factory_idxs` is a list); the source indexer must have
+  the `creation_event` in its `events` list to decode it.
 - One `Indexer` holds a dynamic set of clone addresses; every clone's events go
   into one shared `event_{template}_{event}` table set. `LogFilter` accepts an
   **address array**, and the main sweep splits that array into chunks of at most

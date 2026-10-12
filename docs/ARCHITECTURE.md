@@ -234,6 +234,7 @@ config.toml ──► config.zig ──► main.zig
 **Query flow (GraphQL)**: HTTP → parse → validate → execute resolvers → DB/RPC queries → JSON response
 **Factory flow**: Indexer processes event → factory callback → extract child address → create child Indexer → start syncing
 **Template flow** (`[[templates]]`): factory discovery event → address added to the template's dynamic clone set → backfill from the discovery block → merged into the single sync loop → one shared `event_{template}_{event}` table set for all clones
+**Discovery sources** (`[[factories]]`): each entry names either `address` (a concrete contract whose events announce children) or `from_template` (a template's address set — for addresses only the discovered contract knows, e.g. `BondingCurve` emitting `LiquidityMigrated(pair)`). A source may carry several rules; `Indexer.factory_idxs` is a list, so dispatch feeds every matching rule to the `FactoryManager`.
 - `LogFilter` accepts an address array, so one `eth_getLogs` covers many addresses
 - Address set and backfill progress persist in `template_addresses`
 - Reorg rollback is template-level (`block_number >= fork`); `sync_state` / `block_hashes` use the synthetic key `template:<template_name>`
