@@ -33,6 +33,138 @@ pub const EventHookCallback = *const fn (
     block_timestamp: u64,
 ) void;
 
+/// 模板模式下一个待补扫的 clone：发现区块起，补扫到"探测时的游标"为止。
+pub const PendingBackfill = struct { address: []const u8, from_block: u64 };
+
+/// 模板模式的动态地址集合（去重 + 补扫队列），独立可测。
+///
+/// 语义：`add` 只把新地址放入 `pending`（补扫队列），补扫完成后由 `markBackfilled`
+/// 移入 `live`（纳入主 sweep 的地址过滤）。`all()` 只给主 sweep 用的 live 地址，
+/// `count()` 是已知总数（live + pending）。
+/// 本类型不做地址归一化——归一化唯一发生在 `Indexer.discoverAddress` 入口
+/// （携转约束 3：template_addresses 主键精确 TEXT 比较，大小写不同会各占一行）。
+pub const TemplateAddressSet = struct {
+    alloc: std.mem.Allocator,
+    live: std.ArrayList([]const u8) = .empty,
+    pending_list: std.ArrayList(PendingBackfill) = .empty,
+
+    pub fn init(alloc: std.mem.Allocator) TemplateAddressSet {
+        return .{ .alloc = alloc };
+    }
+
+    pub fn deinit(self: *TemplateAddressSet) void {
+        for (self.live.items) |a| self.alloc.free(a);
+        for (self.pending_list.items) |p| self.alloc.free(p.address);
+        self.live.deinit(self.alloc);
+        self.pending_list.deinit(self.alloc);
+    }
+
+    /// 已存在（live 或 pending）返回 false；新地址 dupe 进 pending，返回 true。
+    /// 分配失败返回 false（签名只有 bool，此时调用方不会落库，等同未发现）。
+    pub fn add(self: *TemplateAddressSet, address: []const u8, from_block: u64) bool {
+        for (self.live.items) |a| {
+            if (std.mem.eql(u8, a, address)) return false;
+        }
+        for (self.pending_list.items) |p| {
+            if (std.mem.eql(u8, p.address, address)) return false;
+        }
+        const copy = self.alloc.dupe(u8, address) catch return false;
+        self.pending_list.append(self.alloc, .{ .address = copy, .from_block = from_block }) catch {
+            self.alloc.free(copy);
+            return false;
+        };
+        return true;
+    }
+
+    /// 已知地址总数（live + 待补扫 pending）。
+    /// 注意与 `all()` 的区别：`all()` 只给主 sweep 用的 live 地址。
+    pub fn count(self: *TemplateAddressSet) usize {
+        return self.live.items.len + self.pending_list.items.len;
+    }
+
+    /// 主 sweep 使用的 live 地址集合。
+    pub fn all(self: *TemplateAddressSet) []const []const u8 {
+        return self.live.items;
+    }
+
+    /// 待补扫队列（按加入顺序，不依赖同块发现顺序）。
+    pub fn pending(self: *TemplateAddressSet) []const PendingBackfill {
+        return self.pending_list.items;
+    }
+
+    /// pending → live（补扫完成，或发现区块已被主 sweep 覆盖而无需补扫）。
+    /// 幂等：地址不在 pending 时不作任何事（不会重复并入 live）。
+    pub fn markBackfilled(self: *TemplateAddressSet, address: []const u8) void {
+        for (self.pending_list.items, 0..) |p, i| {
+            if (!std.mem.eql(u8, p.address, address)) continue;
+            const moved = self.pending_list.orderedRemove(i);
+            self.live.append(self.alloc, moved.address) catch {
+                // 并入 live 失败：已从 pending 摘除，释放避免泄漏（该地址本轮到不了 live）
+                self.alloc.free(moved.address);
+            };
+            return;
+        }
+    }
+};
+
+/// 补扫区间：发现区块 → 探测时的游标（半开区间 `[from, to)`）。
+/// 上界取游标（不含游标块）——`[0, cursor)` 都已同步，游标块及其后由主 sweep 覆盖，
+/// 因此既不漏块也不与主 sweep 重叠。`{0, 0}` 表示无需补扫（合法区间必有 to > from）。
+fn computeBackfillRange(discovered_at_block: u64, current_cursor: u64) [2]u64 {
+    if (discovered_at_block >= current_cursor) return .{ 0, 0 };
+    return .{ discovered_at_block, current_cursor };
+}
+
+/// 补扫分块推进：`from` 起、闭区间上界 `last`，返回本块闭区间 `[from, end]`。
+/// 返回 null 表示已越过末尾。`eth_getLogs` 的 toBlock 是闭区间，补扫的"半开上界 - 1"
+/// 由调用方换算成 `last`，本函数只负责按 batch_size 切连续的块。
+fn nextBackfillChunk(from: u64, batch_size: u64, last: u64) ?[2]u64 {
+    if (from > last) return null;
+    return .{ from, @min(from +| (batch_size - 1), last) };
+}
+
+/// 地址归一化（小写 hex）——模板模式的**唯一**归一化点。
+/// 合法地址必须是 `0x` + 40 hex；否则返回 null（调用方不得落库，避免主键分裂）。
+fn normalizeHexAddress(out: *[42]u8, address: []const u8) ?[]const u8 {
+    if (address.len != 42 or !std.mem.startsWith(u8, address, "0x")) return null;
+    return std.ascii.lowerString(out, address);
+}
+
+/// 构造一批 eth_getLogs / eth_subscribe 的地址过滤器。
+/// 地址集合为空时返回 null：空集合在 LogFilter 层序列化为 `"address":null`，
+/// 语义是"不过滤地址"，会拉回整段区块内全部合约的日志（放大面极大）——
+/// 构造层据此短路，绝不对空集合发起 RPC（携转约束 1）。
+fn makeLogFilter(
+    addresses: []const []const u8,
+    topics: ?[]const []const u8,
+    from_block: u64,
+    to_block: u64,
+) ?eth_rpc.LogFilter {
+    if (addresses.len == 0) return null;
+    return .{
+        .addresses = addresses,
+        .topics = topics,
+        .from_block = from_block,
+        .to_block = to_block,
+    };
+}
+
+/// 启动时从库恢复模板地址集合：`backfilled` 的立即并入 live，其余留在 pending 重新补扫。
+/// 读库错误（含 RocksDB 后端的 `error.UnsupportedOperation`）**原样上抛**，
+/// 由 Task 8 在启动期转成 fail-fast——绝不吞掉当成空集合继续跑（携转约束 2）。
+/// 仅启动期调用（start 之前），故内部不加锁。
+fn loadTemplateAddressesInto(set: *TemplateAddressSet, client: *db.Client, template: []const u8) !void {
+    const list = try client.listTemplateAddresses(template);
+    defer {
+        for (list) |item| client.alloc.free(item.address);
+        client.alloc.free(list);
+    }
+    for (list) |item| {
+        _ = set.add(item.address, item.from_block);
+        if (item.backfilled) set.markBackfilled(item.address);
+    }
+}
+
 /// 核心索引器
 pub const Indexer = struct {
     alloc: std.mem.Allocator,
@@ -62,6 +194,17 @@ pub const Indexer = struct {
     block_ts_cache: std.AutoHashMapUnmanaged(u64, u64) = .empty,
     /// Set while runLiveWs owns a Session (for stop() to unblock).
     ws_session: ?*ws_rpc.Session = null,
+    /// 模板模式：一个 Indexer 持有多个动态发现的 clone 地址，共用一套事件表。
+    template_mode: bool = false,
+    /// 动态地址集合（去重 + 补扫队列）。
+    template_set: TemplateAddressSet,
+    /// 保护 template_set：discoverAddress 可被工厂线程并发调用，runLoop 读 pending /
+    /// 写 live。持有期间不得发起 RPC。
+    template_mutex: std.atomic.Mutex = .unlocked,
+    /// 模板模式下 sync_state / block_hashes / snapshots 的合成 key：`template:<模板名>`
+    /// （模板模式下 contract.address 是空串，不能直接当 key；详见 setTemplateMode）。
+    template_state_key: [256]u8 = undefined,
+    template_state_key_len: usize = 0,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -95,7 +238,9 @@ pub const Indexer = struct {
             log.info("合约 {s} 事件表已创建/检查", .{contract.name});
         }
 
-        // 从数据库读取断点
+        // 从数据库读取断点。
+        // 注意：模板模式下 contract.address 是空串，这里读到的是非模板键；
+        // setTemplateMode(true) 会用合成键 `template:<名>` 重新载入断点。
         var start_block = contract.from_block;
         if (try database.getSyncState(contract.address)) |sync_state| {
             start_block = sync_state.last_synced_block;
@@ -128,6 +273,7 @@ pub const Indexer = struct {
             .factory_ctx = factory_ctx,
             .factory_callback = factory_callback,
             .factory_idx = factory_idx,
+            .template_set = TemplateAddressSet.init(alloc),
         };
     }
 
@@ -143,6 +289,93 @@ pub const Indexer = struct {
             self.block_ts_cache.deinit(self.alloc);
             self.block_ts_cache = .empty;
         }
+    }
+
+    /// 开启模板模式：一个 Indexer 承载一批动态发现的 clone 地址，共用一套事件表。
+    /// 必须在 `start()` 之前调用。开启后：
+    /// - 游标/hash/快照改用合成 key `template:<模板名>`（模板的 contract.address 是空串，
+    ///   直接用会与"无地址"发生碰撞；合成 key 与设计文档 §2.2.1 的约定一致）；
+    /// - 重新按该 key 载入断点（`init` 时还不知道模板模式，读的是空地址的键）。
+    pub fn setTemplateMode(self: *Indexer, enabled: bool) void {
+        self.template_mode = enabled;
+        if (!enabled) {
+            self.template_state_key_len = 0;
+            return;
+        }
+
+        const key = std.fmt.bufPrint(&self.template_state_key, "template:{s}", .{self.contract.name}) catch |e| {
+            // 名称长到放不下合成 key：退回空 key（保持旧行为）并显式报错，避免静默用错键。
+            log.err("模板 {s}: 生成状态 key 失败，回退为 contract.address: {any}", .{ self.contract.name, e });
+            self.template_state_key_len = 0;
+            return;
+        };
+        self.template_state_key_len = key.len;
+
+        if (self.database.getSyncState(key)) |state| {
+            self.current_block.store(state.last_synced_block, .monotonic);
+            self.last_tip.store(state.last_synced_block, .monotonic);
+            log.info("模板 {s} 从断点续传: 区块 {}", .{ self.contract.name, state.last_synced_block });
+            self.alloc.free(state.contract_address);
+            self.alloc.free(state.status);
+        } else |e| {
+            log.warn("模板 {s} 读取断点失败: {any}，从配置起始区块开始", .{ self.contract.name, e });
+        }
+    }
+
+    /// `sync_state` / `block_hashes` / `snapshots` 使用的 key。
+    /// 模板模式返回合成 key `template:<名>`；单合约模式返回合约地址（行为不变）。
+    fn stateKey(self: *Indexer) []const u8 {
+        if (self.template_mode and self.template_state_key_len > 0) {
+            return self.template_state_key[0..self.template_state_key_len];
+        }
+        return self.contract.address;
+    }
+
+    fn lockTemplateSet(self: *Indexer) void {
+        while (!self.template_mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn unlockTemplateSet(self: *Indexer) void {
+        self.template_mutex.unlock();
+    }
+
+    /// 登记一个新发现的 clone 地址（线程安全，可被工厂线程调用）。
+    /// 入口统一归一化为小写 hex（携转约束 3：template_addresses 主键精确 TEXT 比较）。
+    /// 新地址先入内存 pending，再落库；落库失败只告警、不阻断发现（内存集合仍可用）。
+    pub fn discoverAddress(self: *Indexer, address: []const u8, from_block: u64) void {
+        if (!self.template_mode) return;
+
+        var lower_buf: [42]u8 = undefined;
+        const normalized = normalizeHexAddress(&lower_buf, address) orelse {
+            log.warn("模板 {s}: 忽略非法 clone 地址: {s}", .{ self.contract.name, address });
+            return;
+        };
+
+        self.lockTemplateSet();
+        defer self.unlockTemplateSet();
+
+        if (!self.template_set.add(normalized, from_block)) return; // 已存在，幂等
+
+        // 持锁落库：保证补扫完成前的 markTemplateAddressBackfilled 不会作用于尚不存在的行。
+        self.database.addTemplateAddress(self.contract.name, normalized, from_block) catch |e| {
+            log.warn("模板 {s}: clone 地址落库失败 {s}: {any}（内存集合仍生效，重启后可能丢失）", .{ self.contract.name, normalized, e });
+        };
+    }
+
+    /// 当前已知的 clone 地址总数（live + 待补扫），用于状态/指标展示。
+    pub fn templateAddressCount(self: *Indexer) usize {
+        self.lockTemplateSet();
+        defer self.unlockTemplateSet();
+        return self.template_set.count();
+    }
+
+    /// 启动时从库恢复模板地址集合。必须在 `start()` 之前调用。
+    /// 读库错误（含 RocksDB 后端的 `error.UnsupportedOperation`）原样上抛，
+    /// 由 Task 8 在启动期转成 fail-fast——不会等到发现第一个 clone 才炸（携转约束 2）。
+    pub fn loadTemplateAddresses(self: *Indexer) !void {
+        if (!self.template_mode) return;
+        try loadTemplateAddressesInto(&self.template_set, self.database, self.contract.name);
+        log.info("模板 {s}: 从库恢复 {d} 个 clone 地址", .{ self.contract.name, self.template_set.count() });
     }
 
     /// 解析区块时间戳（惰性拉取 + 缓存）；失败或未开启返回 0。
@@ -172,6 +405,7 @@ pub const Indexer = struct {
             ac.deinit(self.alloc);
             self.abi_contract = null;
         }
+        self.template_set.deinit();
         self.block_ts_cache.deinit(self.alloc);
         self.block_ts_cache = .empty;
     }
@@ -241,9 +475,14 @@ pub const Indexer = struct {
             };
             self.last_tip.store(latest_block, .monotonic);
 
+            // 模板模式：先把新发现 clone 的历史区间补扫完（并入 live），再推进主游标。
+            // 放在 tip 判断之前：已追上 tip 时也要处理补扫。
+            if (self.template_mode) self.processPendingBackfills();
+
             const current = self.current_block.load(.monotonic);
             if (current >= latest_block) {
-                if (self.hasWsConfig()) {
+                // 模板模式的 WSS 订阅需要随地址集合变化重订阅（Task 8+），暂不启用。
+                if (!self.template_mode and self.hasWsConfig()) {
                     log.info("合约 {s} 已追上 tip (#{d})，切换到 WSS 订阅模式", .{ self.contract.name, latest_block });
                     self.runLiveWs();
                     // runLiveWs 仅在停止时返回
@@ -290,7 +529,7 @@ pub const Indexer = struct {
             if (self.rpc.getBlockHash(to_block)) |hash| {
                 defer if (hash) |h| self.alloc.free(h);
                 if (hash) |h| {
-                    self.database.upsertBlockHash(self.contract.address, to_block, h) catch |e| {
+                    self.database.upsertBlockHash(self.stateKey(), to_block, h) catch |e| {
                         log.warn("记录区块 hash 失败: {any}", .{e});
                     };
                 }
@@ -307,7 +546,7 @@ pub const Indexer = struct {
             self.current_block.store(to_block + 1, .monotonic);
 
             self.database.upsertSyncState(.{
-                .contract_address = self.contract.address,
+                .contract_address = self.stateKey(),
                 .last_synced_block = to_block,
                 .status = "running",
             }) catch |e| {
@@ -325,7 +564,7 @@ pub const Indexer = struct {
         }
 
         self.database.upsertSyncState(.{
-            .contract_address = self.contract.address,
+            .contract_address = self.stateKey(),
             .last_synced_block = self.current_block.load(.monotonic),
             .status = "stopped",
         }) catch |db_err| {
@@ -380,13 +619,13 @@ pub const Indexer = struct {
             if (self.rpc.getBlockHash(to_block)) |hash| {
                 defer if (hash) |h| self.alloc.free(h);
                 if (hash) |h| {
-                    self.database.upsertBlockHash(self.contract.address, to_block, h) catch {};
+                    self.database.upsertBlockHash(self.stateKey(), to_block, h) catch {};
                 }
             } else |_| {}
 
             self.current_block.store(to_block + 1, .monotonic);
             self.database.upsertSyncState(.{
-                .contract_address = self.contract.address,
+                .contract_address = self.stateKey(),
                 .last_synced_block = to_block,
                 .status = "running",
             }) catch {};
@@ -399,7 +638,7 @@ pub const Indexer = struct {
             self.current_block.store(block_number + 1, .monotonic);
         }
         self.database.upsertSyncState(.{
-            .contract_address = self.contract.address,
+            .contract_address = self.stateKey(),
             .last_synced_block = block_number,
             .status = "running",
         }) catch |e| {
@@ -409,7 +648,7 @@ pub const Indexer = struct {
         if (self.rpc.getBlockHash(block_number)) |hash| {
             defer if (hash) |h| self.alloc.free(h);
             if (hash) |h| {
-                self.database.upsertBlockHash(self.contract.address, block_number, h) catch {};
+                self.database.upsertBlockHash(self.stateKey(), block_number, h) catch {};
             }
         } else |_| {}
 
@@ -420,20 +659,33 @@ pub const Indexer = struct {
 
     fn handleRemovedLog(self: *Indexer, block_number: u64) void {
         log.warn("合约 {s} 收到 removed 日志 @ 区块 {d}，回滚", .{ self.contract.name, block_number });
-        self.database.rollbackFromBlock(
-            self.contract.address,
-            self.contract.name,
-            self.contract.events,
-            block_number,
-        ) catch |e| {
-            log.err("removed 日志回滚失败: {any}", .{e});
-        };
+        self.rollbackTo(block_number);
         self.current_block.store(block_number, .monotonic);
         self.database.upsertSyncState(.{
-            .contract_address = self.contract.address,
+            .contract_address = self.stateKey(),
             .last_synced_block = if (block_number > 0) block_number - 1 else 0,
             .status = "running",
         }) catch {};
+    }
+
+    /// 回滚到 `fork_block`（含）：事件表删 `block_number >= fork_block`，
+    /// 快照/区块 hash/sync_state 按 `stateKey()` 清理。
+    /// 模板模式额外删除 `from_block >= fork_block` 的 clone 记录——fork 之后创建的
+    /// clone 与它们的全部事件一致作废（模板内所有地址都是链级事实，无需地址谓词）。
+    fn rollbackTo(self: *Indexer, fork_block: u64) void {
+        self.database.rollbackFromBlock(
+            self.stateKey(),
+            self.contract.name,
+            self.contract.events,
+            fork_block,
+        ) catch |e| {
+            log.err("回滚数据失败: {any}", .{e});
+        };
+        if (self.template_mode) {
+            self.database.deleteTemplateAddressesFromBlock(self.contract.name, fork_block) catch |e| {
+                log.warn("清理克隆地址记录失败: {any}", .{e});
+            };
+        }
     }
 
     /// Tip 阶段：WSS eth_subscribe(logs)，断线后 HTTP bridge + 重连
@@ -574,17 +826,31 @@ pub const Indexer = struct {
         }
     }
 
-    /// 同步指定区块范围
+    /// 同步指定区块范围。
+    /// - 单合约模式：只过滤该合约地址
+    /// - 模板模式：过滤全部 live clone 地址（空集合不发请求，见 makeLogFilter）
     fn syncRange(self: *Indexer, from_block: u64, to_block: u64) !void {
+        if (self.template_mode) {
+            return self.syncRangeWithAddresses(self.template_set.all(), from_block, to_block);
+        }
+        const addrs = [_][]const u8{self.contract.address};
+        return self.syncRangeWithAddresses(&addrs, from_block, to_block);
+    }
+
+    /// 用给定地址集合拉取并处理 `[from_block, to_block]` 的日志。
+    /// 地址集合为空时**直接返回、不发起任何 RPC**——空集合等价于"不过滤地址"（携转约束 1）。
+    fn syncRangeWithAddresses(
+        self: *Indexer,
+        addresses: []const []const u8,
+        from_block: u64,
+        to_block: u64,
+    ) !void {
         const topics = try self.buildEventTopics();
         defer self.freeEventTopics(topics);
 
-        const addrs = [_][]const u8{self.contract.address};
-        const filter = eth_rpc.LogFilter{
-            .addresses = &addrs,
-            .topics = if (topics.len > 0) topics else null,
-            .from_block = from_block,
-            .to_block = to_block,
+        const filter = makeLogFilter(addresses, if (topics.len > 0) topics else null, from_block, to_block) orelse {
+            log.debug("模板 {s}: 地址集合为空，跳过区块 {}~{}（不发请求）", .{ self.contract.name, from_block, to_block });
+            return;
         };
 
         const logs = try self.rpc.getLogs(filter);
@@ -605,7 +871,7 @@ pub const Indexer = struct {
                 defer self.alloc.free(topics_json);
 
                 self.database.insertRawLog(
-                    self.contract.address,
+                    self.stateKey(),
                     lg.block_number,
                     lg.transaction_hash,
                     lg.log_index,
@@ -618,6 +884,88 @@ pub const Indexer = struct {
                 continue;
             };
         }
+    }
+
+    /// 模板模式：处理新发现 clone 的补扫队列。
+    /// 逐个 pending：区间 = `computeBackfillRange(发现块, 当前游标)`；补扫成功（或该区间已被
+    /// 主 sweep 覆盖、无需补扫）后标记 backfilled → 并入 live，由主 sweep 接管后续区块。
+    /// 失败则保持 pending、下一轮重试——重复写入由 `(contract_address, tx_hash, log_index)`
+    /// 唯一键兜底，因此补扫与主 sweep 的边界重叠不会产生重复行。
+    fn processPendingBackfills(self: *Indexer) void {
+        const pending = self.snapshotPending() catch |e| {
+            log.warn("模板 {s}: 补扫队列快照失败: {any}", .{ self.contract.name, e });
+            return;
+        };
+        defer {
+            for (pending) |p| self.alloc.free(p.address);
+            self.alloc.free(pending);
+        }
+        if (pending.len == 0) return;
+
+        for (pending) |p| {
+            const cursor = self.current_block.load(.monotonic);
+            const range = computeBackfillRange(p.from_block, cursor);
+            if (range[0] < range[1]) {
+                self.backfillRange(p.address, range[0], range[1]) catch |e| {
+                    if (e == error.RpcLimitExceeded) {
+                        const new_batch = @max(self.batch_size / 2, 100);
+                        log.warn("模板 {s}: 补扫触发 RPC limit，batch_size {} → {}", .{ self.contract.name, self.batch_size, new_batch });
+                        self.batch_size = new_batch;
+                    } else {
+                        log.warn("模板 {s}: 补扫 {s} 失败 ({d}~{d}): {any}，保持 pending 下轮重试", .{ self.contract.name, p.address, range[0], range[1], e });
+                    }
+                    continue; // 保持 pending
+                };
+                log.info("模板 {s}: 补扫完成 {s} ({d}~{d})", .{ self.contract.name, p.address, range[0], range[1] });
+            }
+            // 无需补扫（发现块已被主 sweep 覆盖）或补扫成功 → 并入 live
+            self.markAddressBackfilled(p.address);
+        }
+    }
+
+    /// 按 batch_size 分块补扫半开区间 `[from_block, to_block)`。
+    /// eth_getLogs 的 toBlock 是**闭区间**，故把上界换算为 `to_block - 1`——补扫恰好覆盖
+    /// "发现块 .. 游标-1"，与主 sweep（从游标块起，闭区间）无缝衔接且不重叠。
+    fn backfillRange(self: *Indexer, address: []const u8, from_block: u64, to_block: u64) !void {
+        // 调用方保证 to_block > from_block，故 last 不欠账
+        const last = to_block - 1;
+        const one = [_][]const u8{address};
+        var from = from_block;
+        while (nextBackfillChunk(from, self.batch_size, last)) |chunk| {
+            try self.syncRangeWithAddresses(&one, chunk[0], chunk[1]);
+            from = chunk[1] + 1;
+        }
+    }
+
+    /// 补扫完成：落库标记 + 内存 pending → live。
+    /// DB 标记失败只告警：内存已并入 live，重启后会按 backfilled=0 重新补扫（幂等）。
+    fn markAddressBackfilled(self: *Indexer, address: []const u8) void {
+        self.database.markTemplateAddressBackfilled(self.contract.name, address) catch |e| {
+            log.warn("模板 {s}: 标记补扫完成失败 {s}: {any}", .{ self.contract.name, address, e });
+        };
+        self.lockTemplateSet();
+        defer self.unlockTemplateSet();
+        self.template_set.markBackfilled(address);
+    }
+
+    /// 在锁内快照 pending 队列（`discoverAddress` 可能从工厂线程并发追加），
+    /// 释放锁后再做 RPC，避免阻塞发现路径。
+    fn snapshotPending(self: *Indexer) ![]PendingBackfill {
+        self.lockTemplateSet();
+        defer self.unlockTemplateSet();
+
+        const src = self.template_set.pending();
+        const out = try self.alloc.alloc(PendingBackfill, src.len);
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |p| self.alloc.free(p.address);
+            self.alloc.free(out);
+        }
+        for (src, 0..) |p, i| {
+            out[i] = .{ .address = try self.alloc.dupe(u8, p.address), .from_block = p.from_block };
+            filled = i + 1;
+        }
+        return out;
     }
 
     /// 解析字符串为 u256（支持十进制和 0x 十六进制）
@@ -701,11 +1049,13 @@ pub const Indexer = struct {
                         lg.block_number,
                         lg.transaction_hash,
                         lg.log_index,
-                        self.contract.address,
+                        // 日志来源地址：模板模式下即该事件所属的 clone；
+                        // 单合约模式下 getLogs 只过滤单地址，lg.address == contract.address。
+                        lg.address,
                     );
 
                     if (std.mem.eql(u8, evt.name, "Transfer")) {
-                        self.trackTokenTransferState(db_fields.items, lg.block_number);
+                        self.trackTokenTransferState(lg.address, db_fields.items, lg.block_number);
                     }
 
                     log.debug("已写入 {s}.{s} @ 区块 {}", .{ self.contract.name, evt.name, lg.block_number });
@@ -728,8 +1078,9 @@ pub const Indexer = struct {
         return error.AbiMismatch;
     }
 
-    /// 自动追踪 ERC-20 / Token 的 Transfer 事件，更新 account_states 表余额
-    fn trackTokenTransferState(self: *Indexer, fields: []const db.DecodedField, block_number: u64) void {
+    /// 自动追踪 ERC-20 / Token 的 Transfer 事件，更新 account_states 表余额。
+    /// `contract_address` 是日志来源地址（模板模式下区分各 clone 的余额）。
+    fn trackTokenTransferState(self: *Indexer, contract_address: []const u8, fields: []const db.DecodedField, block_number: u64) void {
         var from_addr: ?[]const u8 = null;
         var to_addr: ?[]const u8 = null;
         var val_str: ?[]const u8 = null;
@@ -749,14 +1100,14 @@ pub const Indexer = struct {
 
         if (from_addr) |fa| {
             if (!std.mem.eql(u8, fa, zero_addr) and fa.len > 0) {
-                const current_bal_str = (self.database.getAccountBalance(self.contract.address, fa) catch null) orelse "0";
+                const current_bal_str = (self.database.getAccountBalance(contract_address, fa) catch null) orelse "0";
                 defer if (current_bal_str.ptr != "0".ptr) self.alloc.free(current_bal_str);
                 const current_bal = parseU256(current_bal_str) catch 0;
                 const new_bal = if (current_bal > transfer_val) current_bal - transfer_val else 0;
                 var buf: [128]u8 = undefined;
                 const new_bal_str = std.fmt.bufPrint(&buf, "{d}", .{new_bal}) catch return;
                 self.database.upsertAccountState(.{
-                    .contract_address = self.contract.address,
+                    .contract_address = contract_address,
                     .account_address = fa,
                     .balance = new_bal_str,
                     .last_updated_block = block_number,
@@ -768,14 +1119,14 @@ pub const Indexer = struct {
 
         if (to_addr) |ta| {
             if (!std.mem.eql(u8, ta, zero_addr) and ta.len > 0) {
-                const current_bal_str = (self.database.getAccountBalance(self.contract.address, ta) catch null) orelse "0";
+                const current_bal_str = (self.database.getAccountBalance(contract_address, ta) catch null) orelse "0";
                 defer if (current_bal_str.ptr != "0".ptr) self.alloc.free(current_bal_str);
                 const current_bal = parseU256(current_bal_str) catch 0;
                 const new_bal = current_bal + transfer_val;
                 var buf: [128]u8 = undefined;
                 const new_bal_str = std.fmt.bufPrint(&buf, "{d}", .{new_bal}) catch return;
                 self.database.upsertAccountState(.{
-                    .contract_address = self.contract.address,
+                    .contract_address = contract_address,
                     .account_address = ta,
                     .balance = new_bal_str,
                     .last_updated_block = block_number,
@@ -826,7 +1177,7 @@ pub const Indexer = struct {
         var snap_buf = std.ArrayList(u8).empty;
         snap_buf.print(self.alloc,
             "{{\"block_number\":{d},\"timestamp\":{d},\"contract_address\":\"{s}\",\"contract_name\":\"{s}\"}}",
-            .{ current - 1, now, self.contract.address, self.contract.name },
+            .{ current - 1, now, self.stateKey(), self.contract.name },
         ) catch |e| {
             log.warn("快照 JSON 构建失败: {any}", .{e});
             snap_buf.deinit(self.alloc);
@@ -835,7 +1186,7 @@ pub const Indexer = struct {
         defer snap_buf.deinit(self.alloc);
 
         try self.database.createSnapshot(.{
-            .contract_address = self.contract.address,
+            .contract_address = self.stateKey(),
             .block_number = current - 1,
             .snapshot_data = snap_buf.items,
         });
@@ -893,7 +1244,7 @@ pub const Indexer = struct {
         if (rpc_hash == null) return block_number;
 
         // 获取本地存储的 hash
-        const local_hash = self.database.getBlockHash(self.contract.address, block_number) catch |e| {
+        const local_hash = self.database.getBlockHash(self.stateKey(), block_number) catch |e| {
             log.warn("读取区块 {d} hash 失败: {any}", .{ block_number, e });
             return block_number;
         };
@@ -913,7 +1264,7 @@ pub const Indexer = struct {
             defer if (scan_rpc) |h| self.alloc.free(h);
             if (scan_rpc == null) continue;
 
-            const scan_local = self.database.getBlockHash(self.contract.address, scan_block) catch continue;
+            const scan_local = self.database.getBlockHash(self.stateKey(), scan_block) catch continue;
             defer if (scan_local) |h| self.alloc.free(h);
             if (scan_local == null) continue;
 
@@ -921,14 +1272,7 @@ pub const Indexer = struct {
                 // 找到匹配点，fork_point = scan_block + 1
                 const fork_point = scan_block + 1;
                 log.warn("找到分叉点 @ 区块 {d}，回滚到 {d}", .{ scan_block, fork_point });
-                self.database.rollbackFromBlock(
-                    self.contract.address,
-                    self.contract.name,
-                    self.contract.events,
-                    fork_point,
-                ) catch |e| {
-                    log.err("回滚数据失败: {any}", .{e});
-                };
+                self.rollbackTo(fork_point);
                 return fork_point;
             }
         }
@@ -936,14 +1280,7 @@ pub const Indexer = struct {
         // 在 safe_depth 内未找到匹配点，回滚到 safe_depth 之前
         const safe_block = min_block;
         log.warn("在 safe_depth({d}) 内未找到匹配点，回滚到 {d}", .{ reorg_depth, safe_block });
-        self.database.rollbackFromBlock(
-            self.contract.address,
-            self.contract.name,
-            self.contract.events,
-            safe_block,
-        ) catch |e| {
-            log.err("回滚数据失败: {any}", .{e});
-        };
+        self.rollbackTo(safe_block);
         return safe_block;
     }
 };
@@ -1023,6 +1360,7 @@ test "shouldRecordEvent filtering" {
         .factory_ctx = null,
         .factory_callback = null,
         .factory_idx = 0,
+        .template_set = TemplateAddressSet.init(alloc),
     };
 
     // value = 0x3e8 (1000) > 500 → 通过
@@ -1099,6 +1437,7 @@ test "indexer getStatus and getCurrentBlock" {
         .factory_ctx = null,
         .factory_callback = null,
         .factory_idx = 0,
+        .template_set = TemplateAddressSet.init(alloc),
     };
 
     try std.testing.expectEqual(IndexerState.stopped, idx.getStatus());
@@ -1109,4 +1448,144 @@ test "indexer getStatus and getCurrentBlock" {
 
     idx.current_block.store(200, .monotonic);
     try std.testing.expectEqual(@as(u64, 200), idx.getCurrentBlock());
+}
+
+// ============================================================================
+// 模板模式单测（Task 7）
+// 不构造 Indexer 字面量：其 `rpc = undefined`，误触 deinit 会踩未定义指针。
+// 地址集合逻辑落在 TemplateAddressSet 上，区间/构造逻辑用纯函数测。
+// ============================================================================
+
+test "template computeBackfillRange 无缺口无重叠" {
+    // 发现于 100，当前游标 250 → 补 [100, 250)
+    try std.testing.expectEqual([2]u64{ 100, 250 }, computeBackfillRange(100, 250));
+    // 同一批内发现（发现区块 == 游标）→ 主 sweep 会覆盖，无需补扫
+    try std.testing.expectEqual([2]u64{ 0, 0 }, computeBackfillRange(250, 250));
+    // 发现区块晚于游标 → 空区间
+    try std.testing.expectEqual([2]u64{ 0, 0 }, computeBackfillRange(300, 250));
+    // 创世块发现：{0,N} 是合法区间，与空区间哨兵 {0,0} 不冲突（合法区间必 range[1] > 0）
+    try std.testing.expectEqual([2]u64{ 0, 1 }, computeBackfillRange(0, 1));
+}
+
+test "template 补扫分块连续无重叠（闭区间换算）" {
+    // 半开区间 [5, 25) → eth_getLogs 闭区间 [5, 24]；batch=10 → [5,14] [15,24]
+    const last: u64 = 24;
+    var from: u64 = 5;
+    var chunks: [8][2]u64 = undefined;
+    var n: usize = 0;
+    while (nextBackfillChunk(from, 10, last)) |c| {
+        chunks[n] = c;
+        n += 1;
+        from = c[1] + 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual([2]u64{ 5, 14 }, chunks[0]);
+    try std.testing.expectEqual([2]u64{ 15, 24 }, chunks[1]);
+
+    // 单块（batch 足够大）；越过末尾返回 null
+    try std.testing.expectEqual([2]u64{ 100, 249 }, nextBackfillChunk(100, 500, 249).?);
+    try std.testing.expect(nextBackfillChunk(250, 500, 249) == null);
+}
+
+test "template 地址集合去重/补扫流转" {
+    const alloc = std.testing.allocator;
+    var set = TemplateAddressSet.init(alloc);
+    defer set.deinit();
+
+    try std.testing.expect(set.add("0xA", 10)); // 新地址 → true
+    try std.testing.expect(!set.add("0xA", 10)); // 重复 → false
+    try std.testing.expectEqual(@as(usize, 1), set.count());
+    try std.testing.expectEqual(@as(usize, 1), set.pending().len);
+    try std.testing.expectEqual(@as(usize, 0), set.all().len); // 尚未并入 live
+    try std.testing.expectEqual(@as(u64, 10), set.pending()[0].from_block);
+
+    set.markBackfilled("0xA");
+    try std.testing.expectEqual(@as(usize, 0), set.pending().len);
+    try std.testing.expectEqualStrings("0xA", set.all()[0]);
+    // live 中的地址再发现 → false，且不会退回 pending
+    try std.testing.expect(!set.add("0xA", 10));
+    try std.testing.expectEqual(@as(usize, 0), set.pending().len);
+    // 未知地址 markBackfilled 幂等无操作
+    set.markBackfilled("0xdead");
+    try std.testing.expectEqual(@as(usize, 1), set.count());
+}
+
+test "template 同块发现的多个 clone 独立补扫（不依赖发现顺序）" {
+    const alloc = std.testing.allocator;
+    var set = TemplateAddressSet.init(alloc);
+    defer set.deinit();
+
+    try std.testing.expect(set.add("0xaaa", 10));
+    try std.testing.expect(set.add("0xbbb", 10)); // 同 from_block
+    try std.testing.expectEqual(@as(usize, 2), set.pending().len);
+
+    // 后加入的先完成：不影响另一个仍处于 pending（不依赖同块排序）
+    set.markBackfilled("0xbbb");
+    try std.testing.expectEqual(@as(usize, 1), set.pending().len);
+    try std.testing.expectEqualStrings("0xaaa", set.pending()[0].address);
+    try std.testing.expectEqual(@as(usize, 1), set.all().len);
+
+    set.markBackfilled("0xaaa");
+    try std.testing.expectEqual(@as(usize, 0), set.pending().len);
+    try std.testing.expectEqual(@as(usize, 2), set.all().len);
+}
+
+test "template 空地址集合不得发起 getLogs（携转约束 1）" {
+    // 空集合在 LogFilter 层序列化为 "address":null，语义是"不过滤地址"，
+    // 会拉回整段区块内全部合约日志（放大面极大）→ 构造层必须短路。
+    try std.testing.expect(makeLogFilter(&.{}, null, 1, 2) == null);
+
+    const one = makeLogFilter(&.{"0xaa"}, null, 1, 2) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), one.addresses.?.len);
+    try std.testing.expectEqualStrings("0xaa", one.addresses.?[0]);
+    try std.testing.expectEqual(@as(?u64, 1), one.from_block);
+    try std.testing.expectEqual(@as(?u64, 2), one.to_block);
+    try std.testing.expect(one.topics == null);
+
+    // 与真实集合串起来：空集 → 不查询；加入并回填后 → 可查询
+    var set = TemplateAddressSet.init(std.testing.allocator);
+    defer set.deinit();
+    try std.testing.expect(makeLogFilter(set.all(), null, 1, 2) == null);
+    _ = set.add("0xaa", 1);
+    try std.testing.expect(makeLogFilter(set.all(), null, 1, 2) == null); // 仅 pending，仍未 live
+    set.markBackfilled("0xaa");
+    try std.testing.expect(makeLogFilter(set.all(), null, 1, 2) != null);
+}
+
+test "template 地址归一化（唯一入口，小写 hex）" {
+    const mixed = "0xAbCdEf0123456789AbCdEf0123456789AbCdEf01";
+    try std.testing.expectEqual(@as(usize, 42), mixed.len);
+    var buf: [42]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "0xabcdef0123456789abcdef0123456789abcdef01",
+        normalizeHexAddress(&buf, mixed).?,
+    );
+    // 非 42 字符 / 缺 0x 前缀 → 拒绝（不落库，避免主键因大小写或畸形分裂）
+    try std.testing.expect(normalizeHexAddress(&buf, "0xA") == null);
+    try std.testing.expect(normalizeHexAddress(&buf, "AbCdEf0123456789AbCdEf0123456789AbCdEf01") == null);
+    try std.testing.expect(normalizeHexAddress(&buf, "") == null);
+}
+
+test "template loadTemplateAddresses 上抛读库错误（携转约束 2：不吞掉）" {
+    const alloc = std.testing.allocator;
+    const cfg = db.DatabaseConfig{
+        .db_type = "sqlite",
+        .db_name = ":memory:",
+        .wal_mode = true,
+        .busy_timeout_ms = 5000,
+        .max_connections = 10,
+    };
+    var client = try db.Client.init(alloc, &cfg);
+    defer client.deinit();
+
+    var set = TemplateAddressSet.init(alloc);
+    defer set.deinit();
+
+    // 未 migrate：表不存在。RocksDB 后端则是 error.UnsupportedOperation。
+    // 两种情况都必须原样上抛，由 Task 8 在启动期转成 fail-fast——
+    // 绝不能吞掉当成"空地址集合"继续跑（那会在第一个 clone 才发现时炸，或静默漏索引）。
+    if (loadTemplateAddressesInto(&set, &client, "curve")) |_| {
+        return error.TestUnexpectedResult;
+    } else |_| {}
+    try std.testing.expectEqual(@as(usize, 0), set.count());
 }
