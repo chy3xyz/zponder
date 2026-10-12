@@ -1001,9 +1001,13 @@ pub const Indexer = struct {
     ///
     /// 地址集合按 `max_addresses_per_request` 分块（模板模式地址数可达数千，一次请求必然
     /// 超 RPC 上限）：块与块恰好铺满整个集合，每块对**同一个** `[from_block, to_block]`
-    /// 独立 `getLogs`。因此区间内不遗漏（分块铺满、每块都处理），也不重复（地址互斥，
-    /// getLogs 按地址过滤）；跨块的重复写入再由 `(contract_address, tx_hash, log_index)`
-    /// 唯一键兜底。
+    /// 独立 `getLogs`。因此区间内不遗漏（分块铺满、每块都处理），正常路径也不重复（地址互斥，
+    /// getLogs 按地址过滤）。
+    ///
+    /// 但若前几块已落库、后面的块失败，整轮 `try` 中断后下一轮会重取整段，重复日志仍会到达
+    /// `processLog`。此时靠 `insertEventLog` 返回 false 把重复**静默跳过**：行不重复写，
+    /// 且跳过时**不**执行余额追踪、**不**触发 factory/event 回调与投影——所以既不会污染
+    /// raw_logs 死信表，也不会二次累加。
     fn syncRangeWithAddresses(
         self: *Indexer,
         addresses: []const []const u8,
@@ -1072,8 +1076,8 @@ pub const Indexer = struct {
     /// 模板模式：处理新发现 clone 的补扫队列。
     /// 逐个 pending：区间 = `computeBackfillRange(发现块, 当前游标)`；补扫成功（或该区间已被
     /// 主 sweep 覆盖、无需补扫）后标记 backfilled → 并入 live，由主 sweep 接管后续区块。
-    /// 失败则保持 pending、下一轮重试——重复写入由 `(contract_address, tx_hash, log_index)`
-    /// 唯一键兜底，因此补扫与主 sweep 的边界重叠不会产生重复行。
+    /// 失败则保持 pending、下一轮重试——边界重叠产生的重复日志由 `insertEventLog` 返回
+    /// false 静默跳过（不落第二行、不跑回调），因此补扫与主 sweep 不会重复投影。
     fn processPendingBackfills(self: *Indexer) void {
         const pending = self.snapshotPending() catch |e| {
             log.warn("模板 {s}: 补扫队列快照失败: {any}", .{ self.contract.name, e });
@@ -1218,7 +1222,11 @@ pub const Indexer = struct {
                         return;
                     }
 
-                    try self.database.insertEventLog(
+                    // 去重判定：`insertEventLog` 返回 false 表示该
+                    // `(contract_address, tx_hash, log_index)` 已存在（分块 getLogs 局部失败后
+                    // 重取整段时必然出现）。此时必须**整体早退**：不写 raw_logs（它不是"未静默
+                    // 丢弃的日志"）、不跑余额追踪、不触发 factory/event 回调——否则投影会二次累加。
+                    const inserted = try self.database.insertEventLog(
                         self.contract.name,
                         evt.name,
                         db_fields.items,
@@ -1230,6 +1238,10 @@ pub const Indexer = struct {
                         // 单地址，lg.address == contract.address。
                         source_address,
                     );
+                    if (!inserted) {
+                        log.debug("跳过重复日志 {s}.{s} @ 区块 {}（tx: {s}, log_index: {}）", .{ self.contract.name, evt.name, lg.block_number, lg.transaction_hash, lg.log_index });
+                        return;
+                    }
 
                     if (std.mem.eql(u8, evt.name, "Transfer")) {
                         self.trackTokenTransferState(source_address, db_fields.items, lg.block_number);
@@ -2079,16 +2091,19 @@ test "事件回调携带日志来源地址（真实 processLog 路径）" {
 
     var seen_addr: ?[]const u8 = null;
     var seen_event: ?[]const u8 = null;
+    var cb_count: u32 = 0;
     const Ctx = struct {
         addr: *?[]const u8,
         event: *?[]const u8,
+        count: *u32,
         fn cb(ctx: ?*anyopaque, _: []const u8, event_name: []const u8, _: []const db.DecodedField, _: u64, _: u64, contract_address: []const u8) void {
             const self_ptr: *@This() = @ptrCast(@alignCast(ctx.?));
             self_ptr.addr.* = contract_address;
             self_ptr.event.* = event_name;
+            self_ptr.count.* += 1;
         }
     };
-    var ctx = Ctx{ .addr = &seen_addr, .event = &seen_event };
+    var ctx = Ctx{ .addr = &seen_addr, .event = &seen_event, .count = &cb_count };
     idx.setEventCallback(&ctx, Ctx.cb);
 
     // topic0 = 全零签名（与上面 events[0].signature 匹配）；data 一个 uint256 word
@@ -2103,17 +2118,37 @@ test "事件回调携带日志来源地址（真实 processLog 路径）" {
     data_buf[65] = '7';
 
     var topics = [_][]const u8{&topic0_buf};
-    try idx.processLog(.{
+    const lg: eth_rpc.Log = .{
         .address = "0xSINGLE",
         .topics = &topics,
         .data = &data_buf,
         .block_number = 7,
         .transaction_hash = "0xtx",
         .log_index = 0,
-    });
+    };
+
+    try idx.processLog(lg);
 
     try std.testing.expectEqualStrings("CurveCreated", seen_event.?);
     try std.testing.expectEqualStrings("0xSINGLE", seen_addr.?);
+    try std.testing.expectEqual(@as(u32, 1), cb_count);
+
+    // 集成级去重（分块 getLogs 局部失败后重取整段会复现）：同一条 Log 再处理一次，
+    // 必须整体静默 no-op——不重复落库、不再触发回调（否则投影/K 线二次累加），
+    // 也不产生任何 raw_logs 死信行。
+    try idx.processLog(lg);
+
+    try std.testing.expectEqual(@as(u32, 1), cb_count);
+    try std.testing.expectEqualStrings("CurveCreated", seen_event.?);
+    try std.testing.expectEqualStrings("0xSINGLE", seen_addr.?);
+
+    const evt_rows = try database.ponderQuery("SELECT COUNT(*) AS n FROM event_curve_CurveCreated;", &.{});
+    defer database.freeQueryRows(evt_rows);
+    try std.testing.expectEqual(@as(i64, 1), evt_rows[0].values[0].integer);
+
+    const raw_rows = try database.ponderQuery("SELECT COUNT(*) AS n FROM raw_logs;", &.{});
+    defer database.freeQueryRows(raw_rows);
+    try std.testing.expectEqual(@as(i64, 0), raw_rows[0].values[0].integer);
 }
 
 // 同一形态不变量（Task 12）：事件行 / 回调里的来源地址与 discoverAddress 落
@@ -2273,7 +2308,8 @@ test "rollbackTo 把仍存活的 clone 地址幂等补回（被回滚吞掉的�
     try std.testing.expectEqual(@as(u64, 100), list[0].from_block);
     // 补回走的是 `addTemplateAddress`（INSERT ... DO NOTHING），新行的 backfilled 是默认 0：
     // 本进程内存里它已是 live，不受影响；重启后它会重新进 pending 补扫一次——与
-    // `markAddressBackfilled` 落库失败时的既有降级一致（幂等，重复行由唯一键兜底）。
+    // `markAddressBackfilled` 落库失败时的既有降级一致（幂等，重复日志由 insertEventLog
+    // 返回 false 静默跳过）。
     try std.testing.expect(!list[0].backfilled);
     // 内存集合与 DB 一致
     try std.testing.expectEqual(@as(usize, 1), idx.templateAddressCount());

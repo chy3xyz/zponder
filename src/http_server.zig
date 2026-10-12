@@ -1413,8 +1413,8 @@ test "?address= 解析结果透传到 queryEventLogs" {
     const ac = abi.AbiContract{ .events = events, .functions = &.{} };
     try client.autoMigrateContract("curve", &ac, &.{"Transfer"}, "");
     const fields = [_]db.DecodedField{.{ .name = "value", .value = "7" }};
-    try client.insertEventLog("curve", "Transfer", &fields, 10, "0xt1", 0, "0xA");
-    try client.insertEventLog("curve", "Transfer", &fields, 11, "0xt2", 0, "0xB");
+    _ = try client.insertEventLog("curve", "Transfer", &fields, 10, "0xt1", 0, "0xA");
+    _ = try client.insertEventLog("curve", "Transfer", &fields, 11, "0xt2", 0, "0xB");
 
     // 真实请求形态：/events/curve/Transfer?address=0xB&limit=50
     var p = try parseEventQueryParams(alloc, "address=0xB&limit=50");

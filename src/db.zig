@@ -502,6 +502,11 @@ pub const Client = struct {
     // ========================================================================
     // insertEventLog
     // ========================================================================
+    /// 写入一条事件日志，返回**是否真的新插入了行**。
+    ///
+    /// `false` 表示 `(contract_address, tx_hash, log_index)` 已存在，本次是重复日志的
+    /// 静默 no-op（不是错误）。调用方必须据此跳过后续状态更新与回调——否则同一批日志
+    /// 在分块 getLogs 局部失败后重取时会二次执行投影。
     pub fn insertEventLog(
         self: *Client,
         contract_name: []const u8,
@@ -511,14 +516,16 @@ pub const Client = struct {
         tx_hash: []const u8,
         log_index: u64,
         contract_address: []const u8,
-    ) !void {
+    ) !bool {
         if (self.backend_type == .rocksdb) return self.insertEventLogRocks(contract_name, event_name, fields, block_number, tx_hash, log_index, contract_address);
         if (self.backend_type == .postgresql) return self.insertEventLogPG(contract_name, event_name, fields, block_number, tx_hash, log_index, contract_address);
 
         var sql_buf: std.Io.Writer.Allocating = .init(self.alloc);
         defer sql_buf.deinit();
         const w = &sql_buf.writer;
-        try w.print("INSERT INTO event_{s}_{s} (", .{ contract_name, event_name });
+        // OR IGNORE：命中 UNIQUE(contract_address, tx_hash, log_index) 时不报错、不写行，
+        // 由下方 sqlite3_changes 判定是否新插入。
+        try w.print("INSERT OR IGNORE INTO event_{s}_{s} (", .{ contract_name, event_name });
         for (fields, 0..) |f, i| {
             if (i > 0) try w.writeByte(',');
             const col = try self.sanitizeColumnName(f.name);
@@ -551,6 +558,7 @@ pub const Client = struct {
         if (c.sqlite3_bind_text(stmt, col_idx, contract_address.ptr, @intCast(contract_address.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.BindFailed;
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.ExecFailed;
         if (self.cache) |cc| cc.invalidate(contract_name, event_name);
+        return c.sqlite3_changes(self.db) > 0;
     }
 
     fn insertEventLogRocks(
@@ -562,7 +570,7 @@ pub const Client = struct {
         tx_hash: []const u8,
         log_index: u64,
         contract_address: []const u8,
-    ) !void {
+    ) !bool {
         // RocksDB 无 SQL，不支持模板模式/地址列（延后项，见 docs/superpowers/specs/2026-10-12-template-indexer-design.md）
         _ = contract_address;
         var key_buf: [512]u8 = undefined;
@@ -586,6 +594,9 @@ pub const Client = struct {
         defer vl.deinit(self.alloc);
         try self.rocks.?.put(key, vl.items);
         if (self.cache) |cc| cc.invalidate(contract_name, event_name);
+        // 该后端按 key 覆盖写，不做"是否重复"判定：恒返回 true（沿用既有语义，
+        // 调用方不因本后端跳过状态更新）。
+        return true;
     }
 
     // ========================================================================
@@ -1894,7 +1905,7 @@ pub const Client = struct {
         tx_hash: []const u8,
         log_index: u64,
         contract_address: []const u8,
-    ) !void {
+    ) !bool {
         var sql_buf: std.Io.Writer.Allocating = .init(self.alloc);
         defer sql_buf.deinit();
         const w = &sql_buf.writer;
@@ -1910,7 +1921,7 @@ pub const Client = struct {
             if (i > 0) try w.writeByte(',');
             try w.print("${d}", .{i + 1});
         }
-        try w.print(",${d},${d},${d},${d});", .{ fields.len + 1, fields.len + 2, fields.len + 3, fields.len + 4 });
+        try w.print(",${d},${d},${d},${d}) ON CONFLICT (contract_address, tx_hash, log_index) DO NOTHING;", .{ fields.len + 1, fields.len + 2, fields.len + 3, fields.len + 4 });
         var sql_list = sql_buf.toArrayList();
         defer sql_list.deinit(self.alloc);
 
@@ -1929,6 +1940,9 @@ pub const Client = struct {
         var result = try self.pgconn.?.execParams(sql_list.items, params.items);
         defer result.deinit();
         if (self.cache) |cc| cc.invalidate(contract_name, event_name);
+        // DO NOTHING 命中唯一键时命令标签是 "INSERT 0 0"，受影响行数为 0。
+        const tuples = std.mem.trim(u8, result.cmdTuples(), " \t\r\n");
+        return (std.fmt.parseInt(usize, tuples, 10) catch 0) > 0;
     }
 
     fn insertRawLogPG(
@@ -2913,12 +2927,12 @@ test "db event table insert and query" {
     const test_contract = abi.AbiContract{ .events = events, .functions = &.{} };
     try client.autoMigrateContract("test", &test_contract, &.{"Transfer"}, "0xtest");
     const fields = &.{ DecodedField{ .name = "from", .value = "0x1111" }, DecodedField{ .name = "to", .value = "0x2222" }, DecodedField{ .name = "value", .value = "0x64" } };
-    try client.insertEventLog("test", "Transfer", fields, 100, "0xtxhash", 0, "0xtest");
+    _ = try client.insertEventLog("test", "Transfer", fields, 100, "0xtxhash", 0, "0xtest");
     const result = try client.queryEventLogs("test", "Transfer", 0, null, null, null, 10, 0, true);
     defer alloc.free(result);
     try std.testing.expect(std.mem.indexOf(u8, result, "0xtxhash") != null);
     const fields2 = &.{ DecodedField{ .name = "from", .value = "0xaaaa" }, DecodedField{ .name = "to", .value = "0xbbbb" }, DecodedField{ .name = "value", .value = "0x96" } };
-    try client.insertEventLog("test", "Transfer", fields2, 200, "0xtxhash2", 1, "0xtest");
+    _ = try client.insertEventLog("test", "Transfer", fields2, 200, "0xtxhash2", 1, "0xtest");
     const r1 = try client.queryEventLogs("test", "Transfer", 150, null, null, null, 10, 0, true);
     defer alloc.free(r1);
     try std.testing.expect(std.mem.indexOf(u8, r1, "0xtxhash2") != null);
@@ -2949,8 +2963,8 @@ test "db queryEventLogs 支持按地址过滤且返回 contract_address" {
     const ac = abi.AbiContract{ .events = events, .functions = &.{} };
     try client.autoMigrateContract("curve", &ac, &.{"Transfer"}, "");
     const fields = [_]DecodedField{.{ .name = "value", .value = "7" }};
-    try client.insertEventLog("curve", "Transfer", &fields, 10, "0xt1", 0, "0xA");
-    try client.insertEventLog("curve", "Transfer", &fields, 11, "0xt2", 0, "0xB");
+    _ = try client.insertEventLog("curve", "Transfer", &fields, 10, "0xt1", 0, "0xA");
+    _ = try client.insertEventLog("curve", "Transfer", &fields, 11, "0xt2", 0, "0xB");
 
     const all = try client.queryEventLogs("curve", "Transfer", null, null, null, null, 10, 0, true);
     defer alloc.free(all);
@@ -3033,9 +3047,9 @@ test "db deleteEventLogsInRange" {
     const test_contract = abi.AbiContract{ .events = events, .functions = &.{} };
     try client.autoMigrateContract("test", &test_contract, &.{"Transfer"}, "0xtest");
     const f = &.{ DecodedField{ .name = "from", .value = "0x1111" }, DecodedField{ .name = "to", .value = "0x2222" }, DecodedField{ .name = "value", .value = "0x64" } };
-    try client.insertEventLog("test", "Transfer", f, 100, "0xtx1", 0, "0xtest");
-    try client.insertEventLog("test", "Transfer", f, 200, "0xtx2", 1, "0xtest");
-    try client.insertEventLog("test", "Transfer", f, 300, "0xtx3", 2, "0xtest");
+    _ = try client.insertEventLog("test", "Transfer", f, 100, "0xtx1", 0, "0xtest");
+    _ = try client.insertEventLog("test", "Transfer", f, 200, "0xtx2", 1, "0xtest");
+    _ = try client.insertEventLog("test", "Transfer", f, 300, "0xtx3", 2, "0xtest");
     try client.deleteEventLogsInRange("test", "Transfer", 150, 250);
     const r = try client.queryEventLogs("test", "Transfer", null, null, null, null, 10, 0, true);
     defer alloc.free(r);
@@ -3071,7 +3085,7 @@ test "db rocksdb event insert and query" {
     defer client.deinit();
 
     const fields = &.{ DecodedField{ .name = "from", .value = "0x1111" }, DecodedField{ .name = "to", .value = "0x2222" }, DecodedField{ .name = "value", .value = "0x64" } };
-    try client.insertEventLog("test", "Transfer", fields, 100, "0xtxhash", 0, "0xtest");
+    _ = try client.insertEventLog("test", "Transfer", fields, 100, "0xtxhash", 0, "0xtest");
 
     const result = try client.queryEventLogs("test", "Transfer", 0, null, null, null, 10, 0, true);
     defer alloc.free(result);
@@ -3085,9 +3099,9 @@ test "db rocksdb count and delete" {
     defer client.deinit();
 
     const f = &.{ DecodedField{ .name = "from", .value = "0xaa" }, DecodedField{ .name = "to", .value = "0xbb" } };
-    try client.insertEventLog("t", "Evt", f, 100, "0x1", 0, "0xt");
-    try client.insertEventLog("t", "Evt", f, 200, "0x2", 1, "0xt");
-    try client.insertEventLog("t", "Evt", f, 300, "0x3", 2, "0xt");
+    _ = try client.insertEventLog("t", "Evt", f, 100, "0x1", 0, "0xt");
+    _ = try client.insertEventLog("t", "Evt", f, 200, "0x2", 1, "0xt");
+    _ = try client.insertEventLog("t", "Evt", f, 300, "0x3", 2, "0xt");
 
     const count = try client.countEventRows("t", "Evt");
     try std.testing.expectEqual(@as(u64, 3), count);
@@ -3269,8 +3283,8 @@ test "db 事件表 contract_address 列：PostgreSQL 同 tx 不同合约与唯�
         .{ .name = "value", .value = "1" },
     };
     // 同一 tx_hash/log_index，两个不同 clone：都必须存在（旧唯一键会把第二条顶掉）
-    try client.insertEventLog("curve", "Transfer", &fields, 100, "0xtx1", 0, "0xCLONE_A");
-    try client.insertEventLog("curve", "Transfer", &fields, 100, "0xtx1", 0, "0xCLONE_B");
+    _ = try client.insertEventLog("curve", "Transfer", &fields, 100, "0xtx1", 0, "0xCLONE_A");
+    _ = try client.insertEventLog("curve", "Transfer", &fields, 100, "0xtx1", 0, "0xCLONE_B");
 
     const rows = try client.ponderQuery("SELECT contract_address, COUNT(*) AS n FROM event_curve_Transfer GROUP BY contract_address ORDER BY contract_address;", &.{});
     defer client.freeQueryRows(rows);
@@ -3280,8 +3294,8 @@ test "db 事件表 contract_address 列：PostgreSQL 同 tx 不同合约与唯�
     try std.testing.expectEqualStrings("0xCLONE_B", rows[1].values[0].text);
     try std.testing.expectEqual(@as(i64, 1), rows[1].values[1].integer);
 
-    // 同一地址重复插入被唯一键拒绝：libpq 返回 duplicate key，pg.zig 归一为 ExecFailed
-    try std.testing.expectError(error.ExecFailed, client.insertEventLog("curve", "Transfer", &fields, 100, "0xtx1", 0, "0xCLONE_A"));
+    // 同一地址重复插入：唯一键命中，静默 no-op（返回 false），不再报错
+    try std.testing.expect(!(try client.insertEventLog("curve", "Transfer", &fields, 100, "0xtx1", 0, "0xCLONE_A")));
 
     // 被拒后库里仍是两条（每地址一行），确认是唯一键拦下而非行被覆盖
     const after = try client.ponderQuery("SELECT COUNT(*) AS n FROM event_curve_Transfer;", &.{});
@@ -3299,6 +3313,54 @@ test "db 事件表 contract_address 列：PostgreSQL 同 tx 不同合约与唯�
     client.deinit();
     var cleanup = Client.init(alloc, &admin_cfg) catch return;
     _ = cleanup.ponderExec("DROP DATABASE IF EXISTS zponder_addr_test;", &.{}) catch {};
+    cleanup.deinit();
+}
+
+// 同上语义的 PostgreSQL 分支：`ON CONFLICT (contract_address, tx_hash, log_index) DO NOTHING`
+// + `PQcmdTuples` 判定是否新插入。
+test "insertEventLog 重复插入返回 false 且行数不变（PostgreSQL）" {
+    const alloc = std.testing.allocator;
+    // 无本地 PG 时跳过（CI 不装 PG）
+    const admin_cfg = DatabaseConfig{ .db_type = "postgresql", .db_name = "host=localhost port=5432 dbname=postgres", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var admin = Client.init(alloc, &admin_cfg) catch return error.SkipZigTest;
+    // 独立测试库，避免污染 postgres 库
+    _ = admin.ponderExec("DROP DATABASE IF EXISTS zponder_dedup_test;", &.{}) catch {};
+    _ = admin.ponderExec("CREATE DATABASE zponder_dedup_test;", &.{}) catch {
+        admin.deinit();
+        return error.SkipZigTest;
+    };
+    admin.deinit();
+
+    const cfg = DatabaseConfig{ .db_type = "postgresql", .db_name = "host=localhost port=5432 dbname=zponder_dedup_test", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var client = try Client.init(alloc, &cfg);
+    try client.migrate();
+
+    const test_evt = abi.AbiEvent{ .name = "Transfer", .inputs = &.{
+        .{ .name = "from", .type = "address", .indexed = true },
+        .{ .name = "value", .type = "uint256", .indexed = false },
+    }, .signature = std.mem.zeroes([32]u8) };
+    var events = try alloc.alloc(abi.AbiEvent, 1);
+    events[0] = test_evt;
+    defer alloc.free(events);
+    const ac = abi.AbiContract{ .events = events, .functions = &.{} };
+    try client.autoMigrateContract("curve", &ac, &.{"Transfer"}, "0xAAA");
+
+    const fields = [_]DecodedField{
+        .{ .name = "from", .value = "0xbbb" },
+        .{ .name = "value", .value = "5" },
+    };
+
+    try std.testing.expect(try client.insertEventLog("curve", "Transfer", &fields, 100, "0xtxdup", 3, "0xAAA"));
+    try std.testing.expect(!(try client.insertEventLog("curve", "Transfer", &fields, 100, "0xtxdup", 3, "0xAAA")));
+
+    const rows = try client.ponderQuery("SELECT COUNT(*) AS n FROM event_curve_Transfer;", &.{});
+    defer client.freeQueryRows(rows);
+    try std.testing.expectEqual(@as(i64, 1), rows[0].values[0].integer);
+
+    // 清理测试库
+    client.deinit();
+    var cleanup = Client.init(alloc, &admin_cfg) catch return;
+    _ = cleanup.ponderExec("DROP DATABASE IF EXISTS zponder_dedup_test;", &.{}) catch {};
     cleanup.deinit();
 }
 
@@ -3339,12 +3401,50 @@ test "db 事件表 contract_address 列：同 tx 不同合约都能落库" {
         .{ .name = "value", .value = "1" },
     };
     // 同一 tx_hash/log_index，两个不同 clone：都必须存在（旧唯一键会把第二条顶掉）
-    try client.insertEventLog("curve", "Transfer", &fields, 100, "0xtx1", 0, "0xCLONE_A");
-    try client.insertEventLog("curve", "Transfer", &fields, 100, "0xtx1", 0, "0xCLONE_B");
+    _ = try client.insertEventLog("curve", "Transfer", &fields, 100, "0xtx1", 0, "0xCLONE_A");
+    _ = try client.insertEventLog("curve", "Transfer", &fields, 100, "0xtx1", 0, "0xCLONE_B");
 
     const rows = try client.ponderQuery("SELECT contract_address, COUNT(*) AS n FROM event_curve_Transfer GROUP BY contract_address;", &.{});
     defer client.freeQueryRows(rows);
     try std.testing.expectEqual(@as(usize, 2), rows.len);
+}
+
+// 分块 getLogs 局部失败 → 下一轮重取整段 → 同一批日志二次到达 processLog。语义必须是
+// 「静默 no-op」：返回 false（不是错误），行不重复写，调用方据此跳过后继副作用。
+test "insertEventLog 重复插入返回 false 且行数不变（SQLite）" {
+    const alloc = std.testing.allocator;
+    const cfg = DatabaseConfig{ .db_type = "sqlite", .db_name = ":memory:", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var client = try Client.init(alloc, &cfg);
+    defer client.deinit();
+    try client.migrate();
+
+    const test_evt = abi.AbiEvent{ .name = "Transfer", .inputs = &.{
+        .{ .name = "from", .type = "address", .indexed = true },
+        .{ .name = "value", .type = "uint256", .indexed = false },
+    }, .signature = std.mem.zeroes([32]u8) };
+    var events = try alloc.alloc(abi.AbiEvent, 1);
+    events[0] = test_evt;
+    defer alloc.free(events);
+    const ac = abi.AbiContract{ .events = events, .functions = &.{} };
+    try client.autoMigrateContract("curve", &ac, &.{"Transfer"}, "0xAAA");
+
+    const fields = [_]DecodedField{
+        .{ .name = "from", .value = "0xbbb" },
+        .{ .name = "value", .value = "5" },
+    };
+
+    // 第一次：新行
+    try std.testing.expect(try client.insertEventLog("curve", "Transfer", &fields, 100, "0xtxdup", 3, "0xAAA"));
+    // 同一 (contract_address, tx_hash, log_index) 再插：静默 no-op，返回 false 而非报错
+    try std.testing.expect(!(try client.insertEventLog("curve", "Transfer", &fields, 100, "0xtxdup", 3, "0xAAA")));
+
+    // 行数仍为 1（没报错，也没重复写）
+    const rows = try client.ponderQuery("SELECT COUNT(*) AS n FROM event_curve_Transfer;", &.{});
+    defer client.freeQueryRows(rows);
+    try std.testing.expectEqual(@as(i64, 1), rows[0].values[0].integer);
+
+    // 唯一键含地址：同 tx/log_index 换地址仍是新行
+    try std.testing.expect(try client.insertEventLog("curve", "Transfer", &fields, 100, "0xtxdup", 3, "0xBBB"));
 }
 
 test "db 老事件表迁移：补地址列并回填，行数不变" {
@@ -3380,13 +3480,13 @@ test "db 老事件表迁移：补地址列并回填，行数不变" {
     try std.testing.expectEqualStrings("0xa", rows[0].values[1].text);
 
     // 新唯一键已生效：迁移后插入不再报 no such column，且 (tx_hash, log_index) 相同
-    // 而地址不同的两条都留得住，真重复才被拒
+    // 而地址不同的两条都留得住，同地址重复则被静默跳过（返回 false）
     const f = [_]DecodedField{.{ .name = "from", .value = "0xb" }};
-    try client.insertEventLog("dai", "Transfer", &f, 10, "0xt", 0, "0xOTHER");
+    _ = try client.insertEventLog("dai", "Transfer", &f, 10, "0xt", 0, "0xOTHER");
     const after = try client.ponderQuery("SELECT COUNT(*) AS n FROM event_dai_Transfer;", &.{});
     defer client.freeQueryRows(after);
     try std.testing.expectEqual(@as(i64, 2), after[0].values[0].integer);
-    try std.testing.expectError(error.ExecFailed, client.insertEventLog("dai", "Transfer", &f, 10, "0xt", 0, "0xOTHER"));
+    try std.testing.expect(!(try client.insertEventLog("dai", "Transfer", &f, 10, "0xt", 0, "0xOTHER")));
 }
 
 test "db 老事件表迁移（PostgreSQL）：补地址列并换唯一键" {
@@ -3436,13 +3536,13 @@ test "db 老事件表迁移（PostgreSQL）：补地址列并换唯一键" {
     try std.testing.expectEqualStrings("0xDAI", rows[0].values[0].text);
     try std.testing.expectEqualStrings("0xa", rows[0].values[1].text);
 
-    // 唯一键已含地址：同 tx_hash/log_index 不同地址可共存，同地址重复被拒
+    // 唯一键已含地址：同 tx_hash/log_index 不同地址可共存，同地址重复被静默跳过
     const f = [_]DecodedField{.{ .name = "from", .value = "0xb" }};
-    try client.insertEventLog("dai", "Transfer", &f, 10, "0xt", 0, "0xOTHER");
+    _ = try client.insertEventLog("dai", "Transfer", &f, 10, "0xt", 0, "0xOTHER");
     const after = try client.ponderQuery("SELECT COUNT(*) AS n FROM event_dai_Transfer;", &.{});
     defer client.freeQueryRows(after);
     try std.testing.expectEqual(@as(i64, 2), after[0].values[0].integer);
-    try std.testing.expectError(error.ExecFailed, client.insertEventLog("dai", "Transfer", &f, 10, "0xt", 0, "0xOTHER"));
+    try std.testing.expect(!(try client.insertEventLog("dai", "Transfer", &f, 10, "0xt", 0, "0xOTHER")));
 
     // 约束收尾状态：只把旧键换成含地址的键，用户自加的 UNIQUE(evt_value) 必须留着
     const cons = try client.ponderQuery("SELECT pg_get_constraintdef(c.oid) AS def FROM pg_constraint c WHERE c.conrelid = 'event_dai_Transfer'::regclass AND c.contype = 'u' ORDER BY 1;", &.{});
@@ -3492,7 +3592,7 @@ test "db 老事件表迁移：已有地址列时保留原地址，只换唯一�
 
     // 旧唯一键已被换掉：同 tx_hash/log_index 不同地址可共存
     const f = [_]DecodedField{.{ .name = "from", .value = "0xc" }};
-    try client.insertEventLog("dai", "Transfer", &f, 20, "0xt1", 0, "0xCCC");
+    _ = try client.insertEventLog("dai", "Transfer", &f, 20, "0xt1", 0, "0xCCC");
     const after = try client.ponderQuery("SELECT COUNT(*) AS n FROM event_dai_Transfer;", &.{});
     defer client.freeQueryRows(after);
     try std.testing.expectEqual(@as(i64, 3), after[0].values[0].integer);
@@ -3563,10 +3663,10 @@ test "db 老事件表迁移（PostgreSQL）：别 schema 同名表不得干扰�
     try std.testing.expectEqual(@as(usize, 1), rows.len);
     try std.testing.expectEqualStrings("0xDAI", rows[0].values[0].text);
 
-    // 唯一键真的在起作用：同 (tx_hash, log_index) 不同地址可共存，真重复被拒
+    // 唯一键真的在起作用：同 (tx_hash, log_index) 不同地址可共存，真重复被静默跳过
     const f = [_]DecodedField{.{ .name = "from", .value = "0xb" }};
-    try client.insertEventLog("dai", "Transfer", &f, 10, "0xt", 0, "0xOTHER");
-    try std.testing.expectError(error.ExecFailed, client.insertEventLog("dai", "Transfer", &f, 10, "0xt", 0, "0xOTHER"));
+    _ = try client.insertEventLog("dai", "Transfer", &f, 10, "0xt", 0, "0xOTHER");
+    try std.testing.expect(!(try client.insertEventLog("dai", "Transfer", &f, 10, "0xt", 0, "0xOTHER")));
 
     // 别 schema 的同名表必须原封不动：列数、唯一约束、数据都不变
     const other_cols_after = try client.ponderQuery("SELECT COUNT(*) AS n FROM information_schema.columns WHERE table_schema = 'other' AND table_name = 'event_dai_transfer';", &.{});
@@ -3625,9 +3725,9 @@ test "db queryEventLogs PostgreSQL 区块区间过滤（回归：参数悬垂切
         .{ .name = "from", .value = "0xaaa" },
         .{ .name = "value", .value = "1" },
     };
-    try client.insertEventLog("qlog", "Transfer", &fields, 100, "0xtx1", 0, "0xADDR");
-    try client.insertEventLog("qlog", "Transfer", &fields, 200, "0xtx2", 0, "0xADDR");
-    try client.insertEventLog("qlog", "Transfer", &fields, 300, "0xtx3", 0, "0xADDR");
+    _ = try client.insertEventLog("qlog", "Transfer", &fields, 100, "0xtx1", 0, "0xADDR");
+    _ = try client.insertEventLog("qlog", "Transfer", &fields, 200, "0xtx2", 0, "0xADDR");
+    _ = try client.insertEventLog("qlog", "Transfer", &fields, 300, "0xtx3", 0, "0xADDR");
 
     // 无区间过滤：三行都要在（顺带覆盖 limit/offset 参数本身）
     const all = try client.queryEventLogs("qlog", "Transfer", null, null, null, null, 10, 0, true);
@@ -3664,8 +3764,8 @@ test "db rocksdb queryEventLogs 带地址过滤不得静默返回全量" {
     defer client.deinit();
 
     const fields = &.{DecodedField{ .name = "from", .value = "0x1111" }};
-    try client.insertEventLog("t", "Transfer", fields, 100, "0xaddrfiltertx1", 0, "0xAAA");
-    try client.insertEventLog("t", "Transfer", fields, 200, "0xaddrfiltertx2", 0, "0xBBB");
+    _ = try client.insertEventLog("t", "Transfer", fields, 100, "0xaddrfiltertx1", 0, "0xAAA");
+    _ = try client.insertEventLog("t", "Transfer", fields, 200, "0xaddrfiltertx2", 0, "0xBBB");
 
     // 不带地址过滤：行为不变（两条都返回）
     const all = try client.queryEventLogs("t", "Transfer", null, null, null, null, 10, 0, true);

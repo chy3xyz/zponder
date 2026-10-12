@@ -591,8 +591,8 @@ test "graphql: latestEvents address 参数落到数据库过滤并填充 contrac
     const ac = abi.AbiContract{ .events = events, .functions = &.{} };
     try client.autoMigrateContract("curve", &ac, &.{"Transfer"}, "");
     const fields = [_]db.DecodedField{.{ .name = "value", .value = "7" }};
-    try client.insertEventLog("curve", "Transfer", &fields, 10, "0xt1", 0, "0xA");
-    try client.insertEventLog("curve", "Transfer", &fields, 11, "0xt2", 0, "0xB");
+    _ = try client.insertEventLog("curve", "Transfer", &fields, 10, "0xt1", 0, "0xA");
+    _ = try client.insertEventLog("curve", "Transfer", &fields, 11, "0xt2", 0, "0xB");
 
     var schema_def = try Builder.init(alloc);
     defer schema_def.deinit();
