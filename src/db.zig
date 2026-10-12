@@ -2494,14 +2494,31 @@ pub const Client = struct {
             errdefer self.alloc.free(names);
             const values = try self.alloc.alloc(SqlValue, ncols);
             errdefer self.alloc.free(values);
+
+            // 部分填充清理（与 ponderQuerySqlite 镜像）：数组本身由上面的 errdefer 释放，
+            // 这里释放"当前行已 dupe 出来的列名与值"。缺了它，行内填充中途 OOM 时已入数组的
+            // 字符串/字节会泄漏（ponderQuery 是 JS 投影查询的公共路径）。
+            var names_filled: usize = 0;
+            var values_filled: usize = 0;
+            errdefer {
+                for (names[0..names_filled]) |nm| self.alloc.free(nm);
+                for (values[0..values_filled]) |v| switch (v) {
+                    .text => |t| self.alloc.free(t),
+                    .blob => |b| self.alloc.free(b),
+                    else => {},
+                };
+            }
+
             for (0..ncols) |col| {
                 const ci: c_int = @intCast(col);
                 names[col] = try self.alloc.dupe(u8, res.colName(ci));
+                names_filled = col + 1;
                 if (res.isNull(@intCast(r), ci)) {
                     values[col] = .null;
                 } else {
                     values[col] = try pgValueFromText(self.alloc, res.colType(ci), res.get(@intCast(r), ci));
                 }
+                values_filled = col + 1;
             }
             rows[r] = .{ .names = names, .values = values };
             filled = r + 1;
@@ -3710,4 +3727,59 @@ test "db queryEventLogsPG 参数构建不得依赖调用方的栈帧" {
     for (expected2, 0..) |want, i| {
         try std.testing.expectEqualStrings(want, only_from.items[i]);
     }
+}
+
+test "db ponderQuery PostgreSQL 行内部分填充失败路径不泄漏" {
+    // 与 sqlite 版同型：ponderQueryPG 逐列填充时 names[col]/values[col] 的 dupe 已入数组，
+    // 但内层 errdefer 只释放 names/values 数组本身、外层 errdefer 只处理已填满的行 →
+    // "当前行填到一半"失败会泄漏本行已 dupe 的列名与值（.text 与 .blob 都要释放）。
+    const alloc = std.testing.allocator;
+    // 无本地 PG 时跳过（CI 不装 PG）
+    const admin_cfg = DatabaseConfig{ .db_type = "postgresql", .db_name = "host=localhost port=5432 dbname=postgres", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var admin = Client.init(alloc, &admin_cfg) catch return error.SkipZigTest;
+    // 独立测试库，避免污染 postgres 库
+    _ = admin.ponderExec("DROP DATABASE IF EXISTS zponder_pgfill_test;", &.{}) catch {};
+    _ = admin.ponderExec("CREATE DATABASE zponder_pgfill_test;", &.{}) catch {
+        admin.deinit();
+        return error.SkipZigTest;
+    };
+    admin.deinit();
+
+    const cfg = DatabaseConfig{ .db_type = "postgresql", .db_name = "host=localhost port=5432 dbname=zponder_pgfill_test", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var client = try Client.init(alloc, &cfg);
+    try client.migrate();
+
+    // 第一列 TEXT、末列 BYTEA：两者都会在 pgValueFromText 里分配（INTEGER 不分配），
+    // 于是"第 col>0 列失败"时既有列名也有已分配的值需要清理
+    _ = try client.ponderExec("CREATE TABLE proj_pg_fill (v TEXT, n BIGINT, b BYTEA);", &.{});
+    _ = try client.ponderExec("INSERT INTO proj_pg_fill (v, n, b) VALUES ('v1', 1, '\\x01'::bytea), ('v2', 2, '\\x0203'::bytea);", &.{});
+
+    const sql = "SELECT v, n, b FROM proj_pg_fill ORDER BY v;";
+
+    // 先数出一次成功调用的分配点数（注：pg.Client 自身的分配不走 client.alloc）
+    var counter = std.testing.FailingAllocator.init(alloc, .{});
+    client.alloc = counter.allocator();
+    {
+        const rows = try client.ponderQuery(sql, &.{});
+        client.freeQueryRows(rows);
+    }
+    try std.testing.expectEqual(counter.allocated_bytes, counter.freed_bytes);
+    const total = counter.alloc_index;
+    try std.testing.expect(total > 10);
+
+    // 对每个分配点逐个注入失败：必须报 OutOfMemory，且分配/释放字节数相等
+    for (0..total) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
+        client.alloc = failing.allocator();
+        try std.testing.expectError(error.OutOfMemory, client.ponderQuery(sql, &.{}));
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+
+    client.alloc = alloc;
+
+    // 清理测试库
+    client.deinit();
+    var cleanup = Client.init(alloc, &admin_cfg) catch return;
+    _ = cleanup.ponderExec("DROP DATABASE IF EXISTS zponder_pgfill_test;", &.{}) catch {};
+    cleanup.deinit();
 }
