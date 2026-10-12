@@ -705,8 +705,10 @@ pub const Client = struct {
         offset: u32,
         _: bool,
     ) ![]u8 {
-        // RocksDB 事件 key 不含地址列，地址过滤延后（见 task-3 遗留项）
-        _ = address;
+        // RocksDB 事件 key 不含地址列（见 task-3 遗留项）。带地址过滤时无法只返回
+        // 该地址的行——静默返回全量会给出错误答案，故与模板模式的 RocksDB 行为一致
+        // 直接报不支持；地址为 null 时行为不变。
+        if (address != null) return error.UnsupportedOperation;
         var prefix_buf: [256]u8 = undefined;
         const prefix = try std.fmt.bufPrint(&prefix_buf, "e:{s}:{s}:", .{ contract_name, event_name });
         var seek_buf: [256]u8 = undefined;
@@ -1920,6 +1922,30 @@ pub const Client = struct {
         defer result.deinit();
     }
 
+    /// 构建 queryEventLogsPG 的文本参数（顺序与 SQL 占位符一致）。
+    ///
+    /// `arena` 必须比 `params` 活得久：格式化结果在 arena 上，切片在函数返回后仍有效。
+    /// 修复前这里是块作用域里的栈上 `[21]u8` —— 函数一返回切片即失效（调用方读到的
+    /// 是已回收的栈帧内容，块号/分页条件静默错乱）。
+    fn buildEventLogsPgParams(
+        self: *Client,
+        arena: std.mem.Allocator,
+        block_from: ?u64,
+        block_to: ?u64,
+        tx_hash: ?[]const u8,
+        address: ?[]const u8,
+        limit: u32,
+        offset: u32,
+        params: *std.ArrayList([]const u8),
+    ) !void {
+        if (block_from) |bf| try params.append(self.alloc, try std.fmt.allocPrint(arena, "{}", .{bf}));
+        if (block_to) |bt| try params.append(self.alloc, try std.fmt.allocPrint(arena, "{}", .{bt}));
+        if (tx_hash) |th| try params.append(self.alloc, th);
+        if (address) |ad| try params.append(self.alloc, ad);
+        try params.append(self.alloc, try std.fmt.allocPrint(arena, "{}", .{limit}));
+        try params.append(self.alloc, try std.fmt.allocPrint(arena, "{}", .{offset}));
+    }
+
     fn queryEventLogsPG(
         self: *Client,
         contract_name: []const u8,
@@ -1946,26 +1972,12 @@ pub const Client = struct {
         var sql_list = sql_buf.toArrayList();
         defer sql_list.deinit(self.alloc);
 
+        // 参数的格式化结果必须活到 execParams 调用为止（见 buildEventLogsPgParams）。
+        var param_arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer param_arena.deinit();
         var params = std.ArrayList([]const u8).empty;
         defer params.deinit(self.alloc);
-        if (block_from) |bf| {
-            var buf: [21]u8 = undefined;
-            try params.append(self.alloc, try std.fmt.bufPrint(&buf, "{}", .{bf}));
-        }
-        if (block_to) |bt| {
-            var buf: [21]u8 = undefined;
-            try params.append(self.alloc, try std.fmt.bufPrint(&buf, "{}", .{bt}));
-        }
-        if (tx_hash) |th| try params.append(self.alloc, th);
-        if (address) |ad| try params.append(self.alloc, ad);
-        {
-            var buf: [21]u8 = undefined;
-            try params.append(self.alloc, try std.fmt.bufPrint(&buf, "{}", .{limit}));
-        }
-        {
-            var buf: [21]u8 = undefined;
-            try params.append(self.alloc, try std.fmt.bufPrint(&buf, "{}", .{offset}));
-        }
+        try self.buildEventLogsPgParams(param_arena.allocator(), block_from, block_to, tx_hash, address, limit, offset, &params);
 
         var result = try self.pgconn.?.execParams(sql_list.items, params.items);
         defer result.deinit();
@@ -2367,9 +2379,24 @@ pub const Client = struct {
             const values = try self.alloc.alloc(SqlValue, ncols);
             errdefer self.alloc.free(values);
 
+            // 部分填充清理：names/values 数组本身由上面的 errdefer 释放，这里释放
+            // "当前行已 dupe 出来的列名与值"。缺了它，行内元素 dupe 中途 OOM 时已入数组的
+            // 字符串会泄漏（ponderQuery 是 JS 投影查询的公共路径）。
+            var names_filled: usize = 0;
+            var values_filled: usize = 0;
+            errdefer {
+                for (names[0..names_filled]) |nm| self.alloc.free(nm);
+                for (values[0..values_filled]) |v| switch (v) {
+                    .text => |t| self.alloc.free(t),
+                    .blob => |b| self.alloc.free(b),
+                    else => {},
+                };
+            }
+
             for (0..ncols) |i| {
                 const ci: c_int = @intCast(i);
                 names[i] = try self.alloc.dupe(u8, std.mem.sliceTo(c.sqlite3_column_name(stmt, ci), 0));
+                names_filled = i + 1;
                 values[i] = switch (c.sqlite3_column_type(stmt, ci)) {
                     c.SQLITE_INTEGER => .{ .integer = c.sqlite3_column_int64(stmt, ci) },
                     c.SQLITE_FLOAT => .{ .float = c.sqlite3_column_double(stmt, ci) },
@@ -2382,6 +2409,7 @@ pub const Client = struct {
                     },
                     else => .{ .text = try self.alloc.dupe(u8, std.mem.sliceTo(c.sqlite3_column_text(stmt, ci), 0)) },
                 };
+                values_filled = i + 1;
             }
             try rows.append(self.alloc, .{ .names = names, .values = values });
         }
@@ -3510,4 +3538,176 @@ test "db 老事件表迁移（PostgreSQL）：别 schema 同名表不得干扰�
     var cleanup = Client.init(alloc, &admin_cfg) catch return;
     _ = cleanup.ponderExec("DROP DATABASE IF EXISTS zponder_mig_schema_test;", &.{}) catch {};
     cleanup.deinit();
+}
+
+test "db queryEventLogs PostgreSQL 区块区间过滤（回归：参数悬垂切片）" {
+    // 修复前：queryEventLogsPG 把块号/分页参数格式化进块作用域里的栈上 [21]u8，
+    // 切片入 params 时其生存期已结束；四段 buf 共用栈槽，后面的写入覆盖前面的值，
+    // 于是 `block_from=150, block_to=250, limit=10, offset=0` 实际过滤成 0~0 行。
+    const alloc = std.testing.allocator;
+    // 无本地 PG 时跳过（CI 不装 PG）
+    const admin_cfg = DatabaseConfig{ .db_type = "postgresql", .db_name = "host=localhost port=5432 dbname=postgres", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var admin = Client.init(alloc, &admin_cfg) catch return error.SkipZigTest;
+    // 独立测试库，避免污染 postgres 库
+    _ = admin.ponderExec("DROP DATABASE IF EXISTS zponder_qlog_pg_test;", &.{}) catch {};
+    _ = admin.ponderExec("CREATE DATABASE zponder_qlog_pg_test;", &.{}) catch {
+        admin.deinit();
+        return error.SkipZigTest;
+    };
+    admin.deinit();
+
+    const cfg = DatabaseConfig{ .db_type = "postgresql", .db_name = "host=localhost port=5432 dbname=zponder_qlog_pg_test", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var client = try Client.init(alloc, &cfg);
+    try client.migrate();
+
+    const test_evt = abi.AbiEvent{ .name = "Transfer", .inputs = &.{
+        .{ .name = "from", .type = "address", .indexed = true },
+        .{ .name = "value", .type = "uint256", .indexed = false },
+    }, .signature = std.mem.zeroes([32]u8) };
+    var events = try alloc.alloc(abi.AbiEvent, 1);
+    events[0] = test_evt;
+    defer alloc.free(events);
+    const ac = abi.AbiContract{ .events = events, .functions = &.{} };
+    try client.autoMigrateContract("qlog", &ac, &.{"Transfer"}, "0xADDR");
+
+    const fields = [_]DecodedField{
+        .{ .name = "from", .value = "0xaaa" },
+        .{ .name = "value", .value = "1" },
+    };
+    try client.insertEventLog("qlog", "Transfer", &fields, 100, "0xtx1", 0, "0xADDR");
+    try client.insertEventLog("qlog", "Transfer", &fields, 200, "0xtx2", 0, "0xADDR");
+    try client.insertEventLog("qlog", "Transfer", &fields, 300, "0xtx3", 0, "0xADDR");
+
+    // 无区间过滤：三行都要在（顺带覆盖 limit/offset 参数本身）
+    const all = try client.queryEventLogs("qlog", "Transfer", null, null, null, null, 10, 0, true);
+    defer alloc.free(all);
+    try std.testing.expect(std.mem.indexOf(u8, all, "0xtx1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "0xtx2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "0xtx3") != null);
+
+    // 区间 150~250：只剩 block 200 那行；参数被覆盖时这里会变成 0 行或报错
+    const ranged = try client.queryEventLogs("qlog", "Transfer", 150, 250, null, null, 10, 0, true);
+    defer alloc.free(ranged);
+    try std.testing.expect(std.mem.indexOf(u8, ranged, "0xtx2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ranged, "0xtx1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, ranged, "0xtx3") == null);
+
+    // 只给 block_from：同样要带上正确的参数值
+    const from_only = try client.queryEventLogs("qlog", "Transfer", 250, null, null, null, 10, 0, true);
+    defer alloc.free(from_only);
+    try std.testing.expect(std.mem.indexOf(u8, from_only, "0xtx3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, from_only, "0xtx1") == null);
+    try std.testing.expect(std.mem.indexOf(u8, from_only, "0xtx2") == null);
+
+    // 清理测试库
+    client.deinit();
+    var cleanup = Client.init(alloc, &admin_cfg) catch return;
+    _ = cleanup.ponderExec("DROP DATABASE IF EXISTS zponder_qlog_pg_test;", &.{}) catch {};
+    cleanup.deinit();
+}
+
+test "db rocksdb queryEventLogs 带地址过滤不得静默返回全量" {
+    const alloc = std.testing.allocator;
+    const cfg = DatabaseConfig{ .db_type = "rocksdb", .db_name = "/tmp/zponder_test_rocksdb_addr_filter", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var client = try Client.init(alloc, &cfg);
+    defer client.deinit();
+
+    const fields = &.{DecodedField{ .name = "from", .value = "0x1111" }};
+    try client.insertEventLog("t", "Transfer", fields, 100, "0xaddrfiltertx1", 0, "0xAAA");
+    try client.insertEventLog("t", "Transfer", fields, 200, "0xaddrfiltertx2", 0, "0xBBB");
+
+    // 不带地址过滤：行为不变（两条都返回）
+    const all = try client.queryEventLogs("t", "Transfer", null, null, null, null, 10, 0, true);
+    defer alloc.free(all);
+    try std.testing.expect(std.mem.indexOf(u8, all, "0xaddrfiltertx1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, all, "0xaddrfiltertx2") != null);
+
+    // 带地址过滤：RocksDB 事件 key 不含地址列，只能报不支持。
+    // 修复前这里静默返回上面两条（错答）而不是报错。
+    try std.testing.expectError(
+        error.UnsupportedOperation,
+        client.queryEventLogs("t", "Transfer", null, null, null, "0xAAA", 10, 0, true),
+    );
+    try std.testing.expectError(
+        error.UnsupportedOperation,
+        client.queryEventLogs("t", "Transfer", 0, null, null, "0xBBB", 10, 0, true),
+    );
+}
+
+test "db ponderQuery 行内部分填充失败路径不泄漏" {
+    // 修复前：ponderQuerySqlite 逐列填充时，names[i]/values[i] 的 dupe 已入数组，
+    // 但内层 errdefer 只释放数组本身、外层 errdefer 只处理已 append 的完整行 →
+    // "当前行填到一半"失败会泄漏本行已填充的列名与值。
+    const alloc = std.testing.allocator;
+    const cfg = DatabaseConfig{ .db_type = "sqlite", .db_name = ":memory:", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var client = try Client.init(alloc, &cfg);
+    defer client.deinit();
+    try client.migrate();
+
+    _ = try client.ponderExec("CREATE TABLE proj_fill (a TEXT, b TEXT, c TEXT);", &.{});
+    _ = try client.ponderExec("INSERT INTO proj_fill (a, b, c) VALUES ('a1','b1','c1'), ('a2','b2','c2'), ('a3','b3','c3');", &.{});
+
+    const sql = "SELECT a, b, c FROM proj_fill ORDER BY a;";
+
+    // 先数出一次成功调用的分配点数
+    var counter = std.testing.FailingAllocator.init(alloc, .{});
+    client.alloc = counter.allocator();
+    {
+        const rows = try client.ponderQuery(sql, &.{});
+        client.freeQueryRows(rows);
+    }
+    try std.testing.expectEqual(counter.allocated_bytes, counter.freed_bytes);
+    const total = counter.alloc_index;
+    try std.testing.expect(total > 8);
+
+    // 对每个分配点逐个注入失败：必须报 OutOfMemory，且分配/释放字节数相等
+    for (0..total) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
+        client.alloc = failing.allocator();
+        try std.testing.expectError(error.OutOfMemory, client.ponderQuery(sql, &.{}));
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+
+    client.alloc = alloc;
+}
+
+/// 用同深度的兄弟调用覆写「刚返回的函数用过的栈区」——悬垂栈切片的标准暴露方式
+/// （调用方与它调用的函数共用同一片栈地址，兄弟调用会覆盖其内容）。
+noinline fn clobberStackRegion() void {
+    var junk: [512]u8 = undefined;
+    @memset(&junk, 0xaa);
+    std.mem.doNotOptimizeAway(&junk);
+}
+
+test "db queryEventLogsPG 参数构建不得依赖调用方的栈帧" {
+    // 修复前：块号/分页参数被格式化进 buildEventLogsPgParams 里块作用域的栈上 [21]u8，
+    // 函数返回后切片失效 → 调用方读到的内容已被后续（同深度）调用覆写。
+    const alloc = std.testing.allocator;
+    const cfg = DatabaseConfig{ .db_type = "sqlite", .db_name = ":memory:", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var client = try Client.init(alloc, &cfg);
+    defer client.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var params: std.ArrayList([]const u8) = .empty;
+    defer params.deinit(alloc);
+
+    try client.buildEventLogsPgParams(arena.allocator(), 150, 250, "0xtx", "0xAAA", 10, 0, &params);
+    clobberStackRegion();
+
+    try std.testing.expectEqual(@as(usize, 6), params.items.len);
+    const expected = [_][]const u8{ "150", "250", "0xtx", "0xAAA", "10", "0" };
+    for (expected, 0..) |want, i| {
+        try std.testing.expectEqualStrings(want, params.items[i]);
+    }
+
+    // 只给 block_from（其余为 null）也要正确
+    var only_from: std.ArrayList([]const u8) = .empty;
+    defer only_from.deinit(alloc);
+    try client.buildEventLogsPgParams(arena.allocator(), 42, null, null, null, 5, 7, &only_from);
+    clobberStackRegion();
+    const expected2 = [_][]const u8{ "42", "5", "7" };
+    for (expected2, 0..) |want, i| {
+        try std.testing.expectEqualStrings(want, only_from.items[i]);
+    }
 }

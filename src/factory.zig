@@ -221,7 +221,7 @@ pub const FactoryManager = struct {
             child_events[i] = try self.alloc.dupe(u8, evt);
         }
 
-        // Build the ContractConfig (stack allocated, then Indexer copies what it needs)
+        // Build the ContractConfig
         const child_config = config.ContractConfig{
             .name = child_name,
             .address = child_addr_owned,
@@ -235,29 +235,26 @@ pub const FactoryManager = struct {
             .filters = &.{},
         };
 
-        // Create and start the child indexer
-        var child_idx = try indexer.Indexer.init(
+        // 子索引器必须直接建在堆上：`Indexer.start()` 以自身地址起同步线程，且
+        // `runLoop` 长期读 `self.contract.name` / `self.contract.events`。若先建栈局部
+        // 再拷贝进 ChildIndexer，线程与 `idx.contract` 都指向本函数返回后失效的栈帧
+        // （表名/事件错乱或崩溃）。`child.contract_config` 就在堆上，地址稳定。
+        const child = try self.alloc.create(ChildIndexer);
+        errdefer self.alloc.destroy(child);
+        child.name = child_name;
+        child.address = child_addr_owned;
+        child.abi_path = child_abi;
+        child.events = child_events;
+        child.contract_config = child_config;
+        child.idx = try indexer.Indexer.init(
             self.alloc, self.io, self.rpc, self.database,
-            &child_config, self.snapshot_interval,
+            &child.contract_config, self.snapshot_interval,
             self.track_blocks, self.chain,
             null, null, 0,
         );
-        errdefer child_idx.deinit();
+        errdefer child.idx.deinit();
 
-        // Heap-allocate the ChildIndexer wrapper
-        const child = try self.alloc.create(ChildIndexer);
-        errdefer self.alloc.destroy(child);
-
-        child.* = .{
-            .name = child_name,
-            .address = child_addr_owned,
-            .abi_path = child_abi,
-            .events = child_events,
-            .contract_config = child_config,
-            .idx = child_idx,
-        };
-
-        try child_idx.start();
+        try child.idx.start();
         try self.children.append(self.alloc, child);
 
         log.info("工厂 {s}: 发现新子合约 {s} (地址={s}, 起始区块={d})", .{ fc.name, child_name, child_addr, block_number });
@@ -317,7 +314,7 @@ const FactoryTestEnv = struct {
     database: db.Client,
     rpc: eth_rpc.Client,
 
-    fn init(alloc: std.mem.Allocator, rpc_cfg: *const config.RpcConfig) !FactoryTestEnv {
+    fn init(alloc: std.mem.Allocator, io: std.Io, rpc_cfg: *const config.RpcConfig) !FactoryTestEnv {
         const db_cfg = db.DatabaseConfig{
             .db_type = "sqlite",
             .db_name = ":memory:",
@@ -328,7 +325,7 @@ const FactoryTestEnv = struct {
         var database = try db.Client.init(alloc, &db_cfg);
         errdefer database.deinit();
         try database.migrate();
-        return .{ .database = database, .rpc = eth_rpc.Client.init(alloc, undefined, rpc_cfg) };
+        return .{ .database = database, .rpc = eth_rpc.Client.init(alloc, io, rpc_cfg) };
     }
 
     fn deinit(self: *FactoryTestEnv) void {
@@ -340,7 +337,7 @@ const FactoryTestEnv = struct {
 test "factory 有 template_name 时走 hook 而非建子索引器" {
     const alloc = std.testing.allocator;
     const rpc_cfg = config.RpcConfig{ .url = "", .retry_count = 0, .retry_delay_ms = 0, .request_timeout_ms = 0, .max_concurrent = 0 };
-    var env = try FactoryTestEnv.init(alloc, &rpc_cfg);
+    var env = try FactoryTestEnv.init(alloc, undefined, &rpc_cfg);
     defer env.deinit();
 
     const factories = [_]config.FactoryConfig{testFactoryConfig("curve")};
@@ -377,7 +374,7 @@ test "factory 有 template_name 时走 hook 而非建子索引器" {
 test "factory 无 template_name 时仍走老路径（不查模板分发表）" {
     const alloc = std.testing.allocator;
     const rpc_cfg = config.RpcConfig{ .url = "", .retry_count = 0, .retry_delay_ms = 0, .request_timeout_ms = 0, .max_concurrent = 0 };
-    var env = try FactoryTestEnv.init(alloc, &rpc_cfg);
+    var env = try FactoryTestEnv.init(alloc, undefined, &rpc_cfg);
     defer env.deinit();
 
     // max_children = 0：老路径在"建子索引器"之前就返回（测试里不能真的起线程）
@@ -395,4 +392,52 @@ test "factory 无 template_name 时仍走老路径（不查模板分发表）" {
 
     try std.testing.expectEqual(@as(usize, 0), hook.calls);
     try std.testing.expectEqual(@as(usize, 0), fm.children.items.len);
+}
+
+test "factory 老路径发现子合约：子索引器的 contract 指向堆上稳定存储" {
+    const alloc = std.testing.allocator;
+    const rpc_cfg = config.RpcConfig{ .url = "", .retry_count = 0, .retry_delay_ms = 0, .request_timeout_ms = 0, .max_concurrent = 0 };
+    // max_children >= 1 会真的起子索引器线程，io 必须可用（url 为空 → 首轮 RPC 就失败，
+    // 不做网络等待）。日志模块在测试里未 init，故这些失败不产生输出。
+    var backend = std.Io.Threaded.init(alloc, .{});
+    defer backend.deinit();
+    const io = backend.io();
+    var env = try FactoryTestEnv.init(alloc, io, &rpc_cfg);
+    defer env.deinit();
+
+    // max_children = 1：走"建并启动子索引器"这条路径（这条路径此前只被 max_children = 0 绕开）
+    var fc = testFactoryConfig("");
+    fc.max_children = 1;
+    fc.child_events = &.{"Transfer"};
+    fc.child_poll_interval_ms = 1;
+    const factories = [_]config.FactoryConfig{fc};
+    var fm = try FactoryManager.init(alloc, io, &env.rpc, &env.database, &factories, 0, "bsc", false);
+    defer fm.deinit();
+
+    const addr = "0xAbCdEf0123456789AbCdEf0123456789AbCdEf01";
+    const expected_name = try std.fmt.allocPrint(alloc, "launchpad_factory_{s}", .{addr[addr.len - 6 ..]});
+    defer alloc.free(expected_name);
+
+    const fields = [_]db.DecodedField{.{ .name = "curve", .value = addr }};
+    fm.onFactoryEvent(0, "CurveCreated", &fields, 777);
+    fm.stopChildren();
+
+    try std.testing.expectEqual(@as(usize, 1), fm.children.items.len);
+    const child = fm.children.items[0];
+
+    // 修复前 child.idx.contract 指向 onFactoryEventInner 的栈局部 child_config：
+    // 函数返回后读 name/events 就是读失效栈帧（表名/事件错乱或崩溃）。
+    try std.testing.expect(child.idx.contract == &child.contract_config);
+    try std.testing.expectEqualStrings(expected_name, child.idx.contract.name);
+    try std.testing.expectEqual(@as(usize, 1), child.idx.contract.events.len);
+    try std.testing.expectEqualStrings("Transfer", child.idx.contract.events[0]);
+    try std.testing.expectEqualStrings(addr, child.idx.contract.address);
+    try std.testing.expectEqual(@as(u64, 777), child.idx.contract.from_block);
+    // 同步线程也必须挂在这个堆上对象上（修复前 start() 起在栈副本上）
+    try std.testing.expect(child.idx.thread != null);
+    // 工厂快照拿到的是同一个稳定地址
+    const snapshot = try fm.getCurrentChildren(alloc);
+    defer alloc.free(snapshot);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.len);
+    try std.testing.expect(snapshot[0] == &child.idx);
 }
