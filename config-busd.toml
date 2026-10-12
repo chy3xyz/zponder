@@ -43,7 +43,5 @@ max_reorg_depth = 50
 # 事件过滤：格式为 "event:field:op:value"
 # op 支持 gt/gte/lt/lte/eq
 # value 支持十进制或 0x 十六进制
-filters = [
-    "Transfer:value:gt:500000000000000000000",
-    "Approval:value:gt:1000000000000000000000",
-]
+# 注意：必须写在一行内（解析器按行读取，多行数组会被判为括号不配对）
+filters = ["Transfer:value:gt:500000000000000000000", "Approval:value:gt:1000000000000000000000"]

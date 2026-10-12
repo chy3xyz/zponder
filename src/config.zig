@@ -241,20 +241,57 @@ pub const Config = struct {
     }
 };
 
+/// 去掉首尾空白。'\r' 也算空白：CRLF 配置里它会留在行尾，
+/// 让 `[[contracts]]\r` 匹配不上节头、`"127.0.0.1"\r` 匹配不上引号。
 fn trim(s: []const u8) []const u8 {
     var start: usize = 0;
-    while (start < s.len and (s[start] == ' ' or s[start] == '\t')) start += 1;
+    while (start < s.len and (s[start] == ' ' or s[start] == '\t' or s[start] == '\r')) start += 1;
     var end: usize = s.len;
-    while (end > start and (s[end - 1] == ' ' or s[end - 1] == '\t')) end -= 1;
+    while (end > start and (s[end - 1] == ' ' or s[end - 1] == '\t' or s[end - 1] == '\r')) end -= 1;
     return s[start..end];
 }
 
+/// 剥离 TOML 行内注释：只有字符串之外的 `#` 才是注释起点。
+/// 不区分引号会把 `host = "a#b"` 截成 `"a`，也会误删 `"""..."""` 多行字符串
+/// （本项目 sql 值常用该写法）里的 `#`。
 fn stripInlineComment(s: []const u8) []const u8 {
-    const t = trim(s);
-    if (std.mem.indexOfScalar(u8, t, '#')) |hash_idx| {
-        return trim(t[0..hash_idx]);
+    var i: usize = 0;
+    var in_string = false;
+    var in_triple = false;
+    while (i < s.len) {
+        const c = s[i];
+        if (in_triple) {
+            if (c == '\\') {
+                i += 2;
+            } else if (c == '"' and i + 2 < s.len and s[i + 1] == '"' and s[i + 2] == '"') {
+                in_triple = false;
+                i += 3;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if (in_string) {
+            if (c == '\\') {
+                i += 2;
+                continue;
+            }
+            if (c == '"') in_string = false;
+            i += 1;
+            continue;
+        }
+        if (c == '#') return trim(s[0..i]);
+        if (c == '"') {
+            if (i + 2 < s.len and s[i + 1] == '"' and s[i + 2] == '"') {
+                in_triple = true;
+                i += 3;
+                continue;
+            }
+            in_string = true;
+        }
+        i += 1;
     }
-    return t;
+    return trim(s);
 }
 
 fn parseU64(s: []const u8) !u64 {
@@ -274,7 +311,7 @@ fn isWsScheme(url: []const u8) bool {
 }
 
 fn parseBool(s: []const u8) bool {
-    const t = trim(s);
+    const t = stripInlineComment(s);
     return std.mem.eql(u8, t, "true");
 }
 
@@ -320,7 +357,17 @@ fn splitKeyValue(line: []const u8) ?struct { key: []const u8, value: []const u8 
     return .{ .key = trim(line[0..eq]), .value = trim(line[eq + 1 ..]) };
 }
 
+/// 数组字面量的括号必须成对。解析器按行读取，多行数组（`events = [` 换行续写）
+/// 一律解析不出来——此前的后果是静默退化成单个字面量（`events = ["Transfer"`
+/// 会变成一个叫 `["Transfer"` 的事件名，永远匹配不到任何日志），所以直接报错。
+fn checkArraySyntax(value: []const u8) !void {
+    const t = trim(value);
+    if (t.len == 0) return;
+    if ((t[0] == '[') != (t[t.len - 1] == ']')) return error.InvalidArraySyntax;
+}
+
 fn parseEvents(alloc: std.mem.Allocator, value: []const u8) ![]const []const u8 {
+    try checkArraySyntax(value);
     const t = trim(value);
     if (t.len >= 2 and t[0] == '[' and t[t.len - 1] == ']') {
         const inner = t[1 .. t.len - 1];
@@ -344,6 +391,7 @@ fn parseEvents(alloc: std.mem.Allocator, value: []const u8) ![]const []const u8 
 }
 
 fn parseFilters(alloc: std.mem.Allocator, value: []const u8) ![]const EventFilter {
+    try checkArraySyntax(value);
     const t = trim(value);
     if (t.len >= 2 and t[0] == '[' and t[t.len - 1] == ']') {
         const inner = t[1 .. t.len - 1];
@@ -381,6 +429,7 @@ fn parseFilters(alloc: std.mem.Allocator, value: []const u8) ![]const EventFilte
 }
 
 fn parseQueryParams(alloc: std.mem.Allocator, value: []const u8) ![]const QueryParam {
+    try checkArraySyntax(value);
     const t = trim(value);
     if (t.len >= 2 and t[0] == '[' and t[t.len - 1] == ']') {
         const inner = t[1 .. t.len - 1];
@@ -583,7 +632,10 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
 
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line_raw| {
-        const line = trim(line_raw);
+        // 行内注释必须在这里就剥掉：否则 `host = "127.0.0.1" # 反代` 会把注释并进
+        // 值里（引号配对失败 → 整串当字面量），`[[contracts]] # 注释` 更是连节头
+        // 都识别不出来——后面的键值会被静默归到上一个节。
+        const line = stripInlineComment(line_raw);
         if (line.len == 0) continue;
         if (std.mem.startsWith(u8, line, "#")) continue;
 
@@ -1498,6 +1550,95 @@ test "config helper functions" {
         defer alloc.free(filters);
         try std.testing.expectEqual(@as(usize, 0), filters.len);
     }
+}
+
+test "stripInlineComment：字符串之外的 # 才是注释" {
+    // 引号外的 # 及其后内容属于注释
+    try std.testing.expectEqualStrings("\"127.0.0.1\"", stripInlineComment("  \"127.0.0.1\"   # 只监听本地 "));
+    try std.testing.expectEqualStrings("42", stripInlineComment("42 # 注释"));
+    try std.testing.expectEqualStrings("true", stripInlineComment("true\t# 开关"));
+    try std.testing.expectEqualStrings("", stripInlineComment("   # 整行注释"));
+    try std.testing.expectEqualStrings("[[contracts]]", stripInlineComment("[[contracts]] # 合约"));
+    // 引号内的 # 是值的一部分
+    try std.testing.expectEqualStrings("\"a#b\"", stripInlineComment("\"a#b\""));
+    try std.testing.expectEqualStrings("\"a#b\"", stripInlineComment("\"a#b\" # 注释"));
+    // 转义引号不结束字符串，其后的 # 仍属值
+    try std.testing.expectEqualStrings("\"say \\\"#\\\"\"", stripInlineComment("\"say \\\"#\\\"\" # 注释"));
+    // 多行字符串（sql 值常用该写法）整段保留，只有其后的注释被剥掉
+    const sql = "sql = \"\"\"SELECT 1 FROM t WHERE n = '#'\"\"\"";
+    try std.testing.expectEqualStrings(sql, stripInlineComment(sql));
+    try std.testing.expectEqualStrings("sql = \"\"\"SELECT 1\"\"\"", stripInlineComment("sql = \"\"\"SELECT 1\"\"\" # 查询"));
+    // CRLF 行尾
+    try std.testing.expectEqualStrings("host = \"127.0.0.1\"", stripInlineComment("host = \"127.0.0.1\"\r"));
+}
+
+test "config: 未闭合的数组字面量报错而非静默降级" {
+    const alloc = std.testing.allocator;
+
+    // 正常形态不受影响
+    try checkArraySyntax("\"Transfer\"");
+    try checkArraySyntax("[]");
+    try checkArraySyntax("[\"Transfer\", \"Approval\"]");
+    try checkArraySyntax("[\"A\",]"); // TOML 允许尾逗号
+    try checkArraySyntax("[::1]"); // 裸字面量里出现方括号
+
+    // 括号不配对（含多行数组写法）→ 明确报错
+    try std.testing.expectError(error.InvalidArraySyntax, checkArraySyntax("[\"Transfer\""));
+    try std.testing.expectError(error.InvalidArraySyntax, checkArraySyntax("Transfer]"));
+    try std.testing.expectError(error.InvalidArraySyntax, parseEvents(alloc, "[\"Transfer\""));
+    try std.testing.expectError(error.InvalidArraySyntax, parseFilters(alloc, "[\"Transfer:value:gt:1\""));
+    try std.testing.expectError(error.InvalidArraySyntax, parseQueryParams(alloc, "[\"limit:u32:50\""));
+
+    // 注：这里刻意不走 loadFromString —— 解析中途报错会让"正在拼装"的那个 section
+    // （current_contract 等）脱离 errdefer 的管辖而泄漏。那是既有缺陷（`from_block = abc`
+    // 这类老错误同样触发），与本次数组严格化无关，单独修。
+}
+
+test "config: 行内注释不污染值（回归：host/数组/bool/节头）" {
+    const alloc = std.testing.allocator;
+    const toml =
+        \\[global] # 全局
+        \\log_level = "info" # 日志级别
+        \\track_blocks = true # 需要事件时间戳
+        \\
+        \\[rpc] # RPC
+        \\url = "https://example.com" # 主节点
+        \\timeout = 5000
+        \\
+        \\[database]
+        \\type = "sqlite"
+        \\db_name = "commented#1.db" # 引号内的 # 不是注释
+        \\
+        \\[http]
+        \\port = 9090 # 端口
+        \\host = "127.0.0.1" # 只监听本地，前面由 Nginx/Caddy 反代
+        \\
+        \\[[contracts]] # 合约
+        \\name = "dai" # 名字
+        \\address = "0x6b175474e89094c44da98b954eedeac495271d0f"
+        \\abi_path = "./abis/erc20.abi" # ABI 路径
+        \\from_block = 20000000
+        \\events = ["Transfer", "Approval"] # 只索引这两个
+        \\max_reorg_depth = 20 # 重组深度
+    ;
+    var cfg = try loadFromString(alloc, toml);
+    defer cfg.deinit(alloc);
+    try validate(&cfg);
+
+    try std.testing.expectEqualStrings("info", cfg.global.log_level);
+    try std.testing.expect(cfg.global.track_blocks);
+    try std.testing.expectEqualStrings("https://example.com", cfg.rpc.url);
+    try std.testing.expectEqual(@as(u32, 5000), cfg.rpc.request_timeout_ms);
+    try std.testing.expectEqualStrings("commented#1.db", cfg.database.db_name);
+    try std.testing.expectEqual(@as(u16, 9090), cfg.http.port);
+    try std.testing.expectEqualStrings("127.0.0.1", cfg.http.host);
+    try std.testing.expectEqual(@as(usize, 1), cfg.contracts.len);
+    try std.testing.expectEqualStrings("dai", cfg.contracts[0].name);
+    try std.testing.expectEqual(@as(u64, 20000000), cfg.contracts[0].from_block);
+    try std.testing.expectEqual(@as(?u32, 20), cfg.contracts[0].max_reorg_depth);
+    try std.testing.expectEqual(@as(usize, 2), cfg.contracts[0].events.len);
+    try std.testing.expectEqualStrings("Transfer", cfg.contracts[0].events[0]);
+    try std.testing.expectEqualStrings("Approval", cfg.contracts[0].events[1]);
 }
 
 test "config load empty string" {
