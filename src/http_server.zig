@@ -496,6 +496,8 @@ pub const Server = struct {
         var block_to: ?u64 = null;
         var tx_hash: ?[]const u8 = null;
         var tx_hash_owned = false;
+        var address: ?[]const u8 = null;
+        var address_owned = false;
         var limit: u32 = 100;
         var offset: u32 = 0;
         var order_desc: bool = true;
@@ -520,6 +522,9 @@ pub const Server = struct {
                 } else if (std.mem.eql(u8, key, "tx_hash")) {
                     tx_hash = try self.alloc.dupe(u8, decoded);
                     tx_hash_owned = true;
+                } else if (std.mem.eql(u8, key, "address")) {
+                    address = try self.alloc.dupe(u8, decoded);
+                    address_owned = true;
                 } else if (std.mem.eql(u8, key, "limit")) {
                     limit = std.fmt.parseInt(u32, decoded, 10) catch 100;
                     if (limit > 1000) limit = 1000;
@@ -531,6 +536,7 @@ pub const Server = struct {
             }
         }
         defer if (tx_hash_owned) self.alloc.free(tx_hash.?);
+        defer if (address_owned) self.alloc.free(address.?);
 
         // 计算当前同步区块
         var current_sync_block: u64 = 0;
@@ -541,8 +547,8 @@ pub const Server = struct {
             }
         }
 
-        const cache_key = try std.fmt.allocPrint(self.alloc, "{s}:{s}:bf={?d}:bt={?d}:tx={s}:l={d}:o={d}:od={}", .{
-            contract_name, event_name, block_from, block_to, tx_hash orelse "", limit, offset, order_desc,
+        const cache_key = try std.fmt.allocPrint(self.alloc, "{s}:{s}:bf={?d}:bt={?d}:tx={s}:ad={s}:adset={d}:l={d}:o={d}:od={}", .{
+            contract_name, event_name, block_from, block_to, tx_hash orelse "", address orelse "", @intFromBool(address != null), limit, offset, order_desc,
         });
         defer self.alloc.free(cache_key);
 
@@ -554,7 +560,7 @@ pub const Server = struct {
         const result = self.database.queryEventLogs(
             contract_name, event_name,
             block_from, block_to, tx_hash,
-            null,
+            address,
             limit, offset, order_desc,
         ) catch |e| {
             log.warn("查询事件日志失败 {s}.{s}: {any}", .{ contract_name, event_name, e });

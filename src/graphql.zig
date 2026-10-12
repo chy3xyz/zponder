@@ -38,6 +38,7 @@ const Builder = zg.SchemaBuilder(.{
                 .offset = .{ .type = "Int", .default_value = "0" },
                 .blockFrom = .{ .type = "Int" },
                 .blockTo = .{ .type = "Int" },
+                .address = .{ .type = "String" },
             },
         },
         .contractCall = .{
@@ -73,6 +74,7 @@ const Builder = zg.SchemaBuilder(.{
         .blockNumber = .{ .type = "Int!" },
         .transactionHash = .{ .type = "String!" },
         .eventName = .{ .type = "String!" },
+        .contractAddress = .{ .type = "String!" },
         .fields = .{ .type = "[EventField!]!" },
     },
     .EventField = .{
@@ -348,8 +350,10 @@ fn attachResolvers(schema_def: *zg.schema.Schema) void {
                 const offset: u32 = if (args.get("offset")) |ov| @intCast(@max(0, @min(ov.data.int, 1_000_000_000))) else 0;
                 const block_from: ?u64 = if (args.get("blockFrom")) |bf| @intCast(@max(0, bf.data.int)) else null;
                 const block_to: ?u64 = if (args.get("blockTo")) |bt| @intCast(@max(0, bt.data.int)) else null;
+                // address 过滤：非字符串值视为未提供（空串是合法地址，模板索引器行即以 "" 出现）
+                const address: ?[]const u8 = if (args.get("address")) |av| (if (av.data == .string) av.data.string else null) else null;
 
-                const json_str = try c.database.queryEventLogs(contract_name, event_name, block_from, block_to, null, null, limit, offset, true);
+                const json_str = try c.database.queryEventLogs(contract_name, event_name, block_from, block_to, null, address, limit, offset, true);
                 defer alloc.free(json_str);
 
                 const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json_str, .{});
@@ -380,6 +384,9 @@ fn attachResolvers(schema_def: *zg.schema.Schema) void {
                         }
 
                         try obj.data.object.put(try alloc.dupe(u8, "eventName"), zg.Value.fromString(alloc, try alloc.dupe(u8, event_name)));
+
+                        const ca = if (row.object.get("contract_address")) |v| (if (v == .string) v.string else "") else "";
+                        try obj.data.object.put(try alloc.dupe(u8, "contractAddress"), zg.Value.fromString(alloc, try alloc.dupe(u8, ca)));
 
                         var fields = zg.Value.initList(alloc);
                         var iter = row.object.iterator();
@@ -555,6 +562,71 @@ test "graphql: schema 构建与 resolver 挂载" {
     const sub_type = schema_def.subscription_type orelse return error.GraphQLSubscriptionTypeMissing;
     const new_blocks = sub_type.kind.object.fields.get("newBlocks") orelse return error.GraphQLSubscriptionFieldMissing;
     try std.testing.expect(new_blocks.subscribe != null);
+}
+
+test "graphql latestEvents 暴露 contractAddress 与 address 参数" {
+    const alloc = std.testing.allocator;
+    var schema_def = try Builder.init(alloc);
+    defer schema_def.deinit();
+    attachResolvers(&schema_def);
+
+    const le = schema_def.query_type.kind.object.fields.getPtr("latestEvents") orelse return error.MissingLatestEvents;
+    try std.testing.expect(le.arguments.get("address") != null); // 新增参数
+    const ev = schema_def.types.get("Event") orelse return error.MissingEventType;
+    try std.testing.expect(ev.kind.object.fields.get("contractAddress") != null);
+}
+
+test "graphql: latestEvents address 参数落到数据库过滤并填充 contractAddress" {
+    const alloc = std.testing.allocator;
+
+    const cfg = db.DatabaseConfig{ .db_type = "sqlite", .db_name = ":memory:", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var client = try db.Client.init(alloc, &cfg);
+    defer client.deinit();
+    try client.migrate();
+
+    const evt = abi.AbiEvent{ .name = "Transfer", .inputs = &.{.{ .name = "value", .type = "uint256", .indexed = false }}, .signature = std.mem.zeroes([32]u8) };
+    var events = try alloc.alloc(abi.AbiEvent, 1);
+    events[0] = evt;
+    defer alloc.free(events);
+    const ac = abi.AbiContract{ .events = events, .functions = &.{} };
+    try client.autoMigrateContract("curve", &ac, &.{"Transfer"}, "");
+    const fields = [_]db.DecodedField{.{ .name = "value", .value = "7" }};
+    try client.insertEventLog("curve", "Transfer", &fields, 10, "0xt1", 0, "0xA");
+    try client.insertEventLog("curve", "Transfer", &fields, 11, "0xt2", 0, "0xB");
+
+    var schema_def = try Builder.init(alloc);
+    defer schema_def.deinit();
+    attachResolvers(&schema_def);
+
+    var shutdown = std.atomic.Value(bool).init(false);
+    const ctx = Context{
+        .database = &client,
+        .indexers = &.{},
+        .chain = "bsc",
+        .shutdown_flag = &shutdown,
+        .rpc = undefined,
+    };
+
+    var backend = std.Io.Threaded.init(alloc, .{});
+    defer backend.deinit();
+    const io = backend.io();
+
+    var parser = try zg.Parser.init(alloc, "{ latestEvents(contract: \"curve\", event: \"Transfer\", address: \"0xB\") { blockNumber contractAddress eventName } }");
+    defer parser.deinit();
+    var doc = try parser.parseDocument();
+    defer doc.deinit();
+
+    var executor = zg.Executor.init(alloc, &schema_def, io);
+    defer executor.deinit();
+    executor.setUserData(@constCast(@ptrCast(&ctx)));
+    var result = try executor.execute(&doc);
+    defer result.deinit(alloc);
+
+    const json_str = try result.toJson(alloc);
+    defer alloc.free(json_str);
+
+    try std.testing.expect(std.mem.indexOf(u8, json_str, "\"contractAddress\":\"0xB\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json_str, "0xA") == null);
 }
 
 test "graphql: 端到端执行（zgraphql v0.4.0）" {
