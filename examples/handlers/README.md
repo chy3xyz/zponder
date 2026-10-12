@@ -145,6 +145,84 @@ API：
 
 ---
 
+## 五、模板模式（几千 clone）
+
+工厂批量部署的 clone（每个实例独立地址、共用同一套 ABI）**不要逐个写 `[[contracts]]`**：用 `[[templates]]` 声明一次，地址集合由工厂的发现事件喂入。所有 clone **共用一套表**——表名是 `event_{模板名}_{事件}`（与 clone 地址无关），靠每行的 `contract_address` 列区分这条事件属于哪个 clone。
+
+可运行示例：`examples/local-demo/launchpad-demo/`（anvil + 1 个工厂 + 3 个 clone 的端到端验收）：
+
+```bash
+bash examples/local-demo/launchpad-demo/run.sh
+```
+
+```toml
+# 工厂本身仍是一个普通合约：索引发现事件，用来触发 discovery
+[[contracts]]
+name = "launchpad"
+address = "0xLaunchpad..."
+abi_path = "./abis/Launchpad.abi"
+events = ["CurveCreated"]
+
+[[factories]]
+name = "launchpad_factory"
+address = "0xLaunchpad..."         # 与上面的 [[contracts]] 同址
+abi_path = "./abis/Launchpad.abi"
+creation_event = "CurveCreated"    # 发现事件
+child_address_field = "curve"      # 事件里哪个字段是 clone 地址
+template_name = "curve"            # 关键：喂模板，而不是给每个 clone 建子索引器
+# 注意：template_name 与 child_abi_path 互斥，同时配会被 validate 拒绝
+
+[[templates]]
+name = "curve"                     # 表名前缀 → event_curve_Buy
+abi_path = "./abis/Curve.abi"
+events = ["Buy"]
+factory_name = "launchpad_factory"
+discovery_event = "CurveCreated"
+discovery_address_field = "curve"
+from_block = 0                     # 补扫历史事件的起点
+poll_interval_ms = 200
+block_batch_size = 500
+```
+
+要点：
+
+- **发现 → 补扫 → 并入主 sweep**：工厂索引器扫到 `CurveCreated`，就把 `curve` 字段的地址写进 `template_addresses`（一个 clone 一行，含发现区块与 `backfilled` 标记），并从发现区块起回补该 clone 的历史事件；补扫完成后该地址并入主 sweep 继续跟 tip。重启时从 `template_addresses` 恢复，不必重新发现。
+- **一套表多地址**：所有 clone 的 `Buy` 都进 `event_curve_Buy`，`contract_address` 列上有 `(contract_address, block_number)` 索引。
+- **按地址查询**：`GET /events/curve/Buy?address=0xCLONE` 只返回该 clone 的行；不带 `address` 就是全部 clone。重复写多个 `address` 键时只有**最后一个**生效，多地址请分次查询。
+- **路径里的合约名是模板名**（`/events/curve/Buy`，不是 clone 地址）。
+- **`/contracts` 里模板的 `address` 是空串**（地址是动态集合，没有固定值），`name` 是模板名。
+- **RocksDB 后端不支持模板**：`template_addresses` 仅 SQLite / PostgreSQL 有，配了 `[database] type = "rocksdb"` + `[[templates]]` 会在启动期直接报错退出。
+
+### handler 里区分 clone：`event.contractAddress`
+
+```javascript
+ponder.db.exec(`
+  CREATE TABLE IF NOT EXISTS proj_curve_flow (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    block_number     INTEGER NOT NULL,
+    contract_address TEXT NOT NULL,
+    ts               INTEGER NOT NULL,
+    buyer            TEXT NOT NULL,
+    amount           TEXT NOT NULL
+  );
+`);
+
+// 模板名就是合约名：注册 "curve:Buy"（或简写 "Buy"）
+ponder.on("curve:Buy", (event) => {
+  const { buyer, amount } = event.args;
+
+  ponder.db.exec(
+    "INSERT INTO proj_curve_flow (block_number, contract_address, ts, buyer, amount) VALUES (?, ?, ?, ?, ?);",
+    event.block.number, event.contractAddress, event.block.timestamp,
+    buyer, String(BigInt(amount || "0x0")),
+  );
+});
+```
+
+`event.contractAddress` 是这类事件所在 clone 的地址（模板模式与单合约模式都可用；单合约模式下它等于配置里的 `address`）。除此之外事件对象只有 `args`、`block.number`、`block.timestamp`——没有 `txHash` / `logIndex`，需要交易维度时用 REST/GraphQL 查库。
+
+---
+
 ## 说明
 
 - 索引数据查询用内置 **REST**（`/events/:contract/:event`）或 **GraphQL**（`/graphql`）；`ponder.http` 适合自定义轻量接口

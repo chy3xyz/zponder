@@ -1,0 +1,62 @@
+# zponder Launchpad Demo — template indexing (one table, many clones)
+#
+# One factory (`Launchpad`) creates N clones (`Curve`). The factory's
+# discovery event feeds addresses into the `curve` template, so every clone
+# shares a single set of tables (`event_curve_Buy`).
+#
+# run.sh substitutes the deployed Launchpad address for the placeholder below.
+
+[global]
+log_level = "info"
+log_file = ""
+snapshot_interval = 0
+chain = "anvil"
+track_blocks = true
+
+[rpc]
+url = "http://localhost:8590"
+timeout = 10000
+retry_count = 3
+
+[database]
+type = "sqlite"
+db_name = "demo.db"
+
+[http]
+port = 8591
+host = "127.0.0.1"
+cors = false
+
+# ── the factory itself: indexes CurveCreated so the factory hook can fire ──
+[[contracts]]
+name = "launchpad"
+address = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+abi_path = "./examples/local-demo/launchpad-demo/Launchpad.abi"
+from_block = 0
+events = ["CurveCreated"]
+poll_interval_ms = 200
+
+# ── discovery: CurveCreated.curve → "curve" template ──────────────────────
+# template_name means "feed the template's address set" instead of spinning up
+# a child indexer per clone (child_abi_path is therefore not set — the two are
+# mutually exclusive).
+[[factories]]
+name = "launchpad_factory"
+address = "0x5FbDB2315678afecb367f032d93F642f64180aa3"
+abi_path = "./examples/local-demo/launchpad-demo/Launchpad.abi"
+creation_event = "CurveCreated"
+child_address_field = "curve"
+template_name = "curve"
+max_children = 100000
+
+# ── the template: one indexer serving every discovered clone ──────────────
+[[templates]]
+name = "curve"
+abi_path = "./examples/local-demo/launchpad-demo/Curve.abi"
+events = ["Buy"]
+factory_name = "launchpad_factory"
+discovery_event = "CurveCreated"
+discovery_address_field = "curve"
+from_block = 0
+poll_interval_ms = 200
+block_batch_size = 500
