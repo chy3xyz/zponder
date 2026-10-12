@@ -58,7 +58,7 @@ event: connected
 data: {"status":"connected","service":"zponder SSE real-time stream"}
 
 event: log
-data: {"contract":"PancakePair","event":"Swap","block_number":20123456,"fields":{"amount0In":"100000","amount1Out":"500"}}
+data: {"contract":"PancakePair","contract_address":"0xabc...","event":"Swap","block_number":20123456,"fields":{"amount0In":"100000","amount1Out":"500"}}
 ```
 
 ---
@@ -131,6 +131,7 @@ Query event logs with optional filters.
 | `block_from` | integer | — | Start block (inclusive) |
 | `block_to` | integer | — | End block (inclusive) |
 | `tx_hash` | string | — | Filter by transaction hash |
+| `address` | string | — | Filter by contract address (the row's `contract_address`) |
 | `limit` | integer | 100 | Max results (max 1000) |
 | `offset` | integer | 0 | Pagination offset |
 | `order` | string | `desc` | Sort order: `asc` or `desc` |
@@ -142,6 +143,7 @@ Query event logs with optional filters.
     "block_number": 20000001,
     "transaction_hash": "0xabc...",
     "log_index": 0,
+    "contract_address": "0x6b175474e89094c44da98b954eedeac495271d0f",
     "from": "0x1111...",
     "to": "0x2222...",
     "value": "1000000000000000000"
@@ -152,6 +154,8 @@ Query event logs with optional filters.
 **Notes:**
 - Results are cached in memory (LRU). Cache is invalidated on new block insert.
 - Only configured `contract` + `event` pairs are allowed (whitelist check).
+- `address` matches `contract_address` exactly; on the RocksDB backend this filter
+  is unsupported and returns an error.
 
 ---
 
@@ -361,6 +365,7 @@ Paginated event log queries with optional block-range filters.
 | `offset`     | Int      | 0       | Pagination offset                    |
 | `blockFrom`  | Int      | null    | Start block filter (inclusive)       |
 | `blockTo`    | Int      | null    | End block filter (inclusive)         |
+| `address`    | String   | null    | Filter by contract address           |
 
 **Example:**
 
@@ -369,6 +374,7 @@ query {
   latestEvents(contract: "dai", event: "Transfer", limit: 5, blockFrom: 20000000) {
     blockNumber
     transactionHash
+    contractAddress
     eventName
     fields {
       key
@@ -386,6 +392,7 @@ query {
       {
         "blockNumber": 20000001,
         "transactionHash": "0xabc123...",
+        "contractAddress": "0x6b175474e89094c44da98b954eedeac495271d0f",
         "eventName": "Transfer",
         "fields": [
           { "key": "from", "value": "0x1111..." },
@@ -400,6 +407,8 @@ query {
 
 **Notes:**
 - The `fields` array contains all event parameters as key-value string pairs.
+- `contractAddress` is the address of the contract that emitted the event (the
+  specific clone in template mode); `address` filters on it.
 - Contract name and event name are validated against alphanumeric + underscore characters (SQL injection prevention).
 - Returns `null` (and errors in `errors[]`) on database query failure.
 - Validator enforces argument types before resolver execution.
@@ -465,7 +474,8 @@ type Query {
     limit: Int = 10,
     offset: Int = 0,
     blockFrom: Int,
-    blockTo: Int
+    blockTo: Int,
+    address: String
   ): [Event!]
   contractCall(
     contract: String!,
@@ -499,6 +509,7 @@ type SyncState {
 type Event {
   blockNumber: Int!
   transactionHash: String!
+  contractAddress: String!
   eventName: String!
   fields: [EventField!]!
 }
@@ -628,6 +639,7 @@ HTTP status: `429 Too Many Requests`.
 | `block_from` | 整数 | — | 起始区块（含） |
 | `block_to` | 整数 | — | 结束区块（含） |
 | `tx_hash` | 字符串 | — | 按交易哈希过滤 |
+| `address` | 字符串 | — | 按合约地址过滤（对应行内 `contract_address`） |
 | `limit` | 整数 | 100 | 最大返回条数（上限 1000） |
 | `offset` | 整数 | 0 | 分页偏移 |
 | `order` | 字符串 | `desc` | 排序方向：`asc` 或 `desc` |
@@ -639,6 +651,7 @@ HTTP status: `429 Too Many Requests`.
     "block_number": 20000001,
     "transaction_hash": "0xabc...",
     "log_index": 0,
+    "contract_address": "0x6b175474e89094c44da98b954eedeac495271d0f",
     "from": "0x1111...",
     "to": "0x2222...",
     "value": "1000000000000000000"
@@ -649,6 +662,7 @@ HTTP status: `429 Too Many Requests`.
 **说明：**
 - 结果缓存在内存（LRU），新块写入时自动失效。
 - 只允许查询已配置的 `contract` + `event` 组合（白名单校验）。
+- `address` 精确匹配 `contract_address`；RocksDB 后端不支持该过滤，返回错误。
 
 ---
 

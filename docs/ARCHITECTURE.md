@@ -175,12 +175,21 @@ zponder is a layered Ethereum event indexer. Each layer has a single responsibil
 | `block_hashes`   | `UNIQUE(contract, block)`    | Per-contract block hashes (reorg detect) |
 | `blocks`         | `UNIQUE(chain, block_number)`| Chain-wide block metadata               |
 | `call_cache`     | `UNIQUE(cache_key)`          | eth_call result cache                    |
+| `template_addresses` | `PRIMARY KEY (template, address)` | Template-mode clone address set + backfill progress |
 
 **Event Tables** (created by `autoMigrateContract()`):
 - Named `event_{contract_name}_{event_name}`
-- Columns from ABI inputs + `block_number`, `tx_hash`, `log_index`, `created_at`
-- `UNIQUE(tx_hash, log_index)` for idempotent inserts
-- Indexes on `block_number` and `tx_hash`
+- Columns from ABI inputs + `block_number`, `tx_hash`, `log_index`,
+  `contract_address`, `created_at`
+- `UNIQUE(contract_address, tx_hash, log_index)` for idempotent inserts — the same
+  `tx_hash`/`log_index` pair may exist under different contracts
+- Indexes on `block_number`, `tx_hash`, and `(contract_address, block_number)`
+- **Legacy migration** upgrades an older table in place and is idempotent: SQLite
+  rebuilds the table and backfills `contract_address`; PostgreSQL adds the column
+  and swaps the unique constraint (`DROP`/`ADD`)
+- Signature: `autoMigrateContract(contract_name, abi_contract, event_names, contract_address)`
+  — the 4th argument is the address (a single contract passes its address;
+  template mode passes `""`)
 
 **RocksDB Key Scheme**:
 | Prefix | Key Pattern                               | Content      |
@@ -224,6 +233,11 @@ config.toml ──► config.zig ──► main.zig
 **Query flow (REST)**: HTTP → whitelist check → cache lookup → DB query → JSON response
 **Query flow (GraphQL)**: HTTP → parse → validate → execute resolvers → DB/RPC queries → JSON response
 **Factory flow**: Indexer processes event → factory callback → extract child address → create child Indexer → start syncing
+**Template flow** (`[[templates]]`): factory discovery event → address added to the template's dynamic clone set → backfill from the discovery block → merged into the single sync loop → one shared `event_{template}_{event}` table set for all clones
+- `LogFilter` accepts an address array, so one `eth_getLogs` covers many addresses
+- Address set and backfill progress persist in `template_addresses`
+- Reorg rollback is template-level (`block_number >= fork`); `sync_state` / `block_hashes` use the synthetic key `template:<template_name>`
+- RocksDB is unsupported in template mode (fails at startup)
 
 ---
 
@@ -339,7 +353,14 @@ zponder 采用分层架构，每层职责单一，通过明确的接口通信。
 - SQLite WAL 模式，外键约束，NORMAL 同步级别
 - **自动迁移**：读取 ABI 事件定义，动态建表
   - 表名：`event_{合约名}_{事件名}`
-  - 列：block_number、transaction_hash、log_index + 事件字段
+  - 列：block_number、transaction_hash、log_index、**contract_address** + 事件字段
+  - 唯一键：`UNIQUE(contract_address, tx_hash, log_index)`（同一 tx/log 在不同合约下可并存）
+  - 索引：`(block_number)`、`(tx_hash)`、`(contract_address, block_number)`
+  - 老库幂等升级：SQLite 重建表并回填地址；PostgreSQL 补列 + 换唯一约束
+  - 签名：`autoMigrateContract(contract_name, abi_contract, event_names, contract_address)`
+    （单合约传合约地址，模板模式传 `""`）
+- **模板地址集合表** `template_addresses(template, address, from_block, backfilled)`：
+  模板模式下动态发现的 clone 地址与补扫进度（`PRIMARY KEY (template, address)`）
 - **绑定安全**：所有 `sqlite3_bind_*` 均检查返回值
 - **同步状态表**：每个合约记录 `last_synced_block`
 - **快照表**：定期存储 JSON 快照
@@ -440,6 +461,13 @@ config.toml ──► config.zig ──► main.zig
 **REST 查询流程**：HTTP → 白名单检查 → 缓存查找 → 数据库查询 → JSON 响应
 **GraphQL 查询流程**：HTTP → 解析 → 验证 → 执行 resolver → 数据库/RPC 查询 → JSON 响应
 **工厂流程**：索引器处理事件 → 工厂回调 → 提取子地址 → 创建子索引器 → 开始同步
+**模板流程**（`[[templates]]`）：工厂发现事件 → 地址并入模板的动态 clone 集合 →
+从「发现区块」补扫 → 并入单一同步循环 → 一套 `event_{模板名}_{事件}` 表承载全部 clone
+- `LogFilter` 支持地址数组，一次 `eth_getLogs` 覆盖多地址
+- 地址集合与补扫进度持久化在 `template_addresses`
+- 重组回滚是模板级（`block_number >= fork`）；`sync_state`/`block_hashes` 用合成键
+  `template:<模板名>`
+- 模板模式不支持 RocksDB（启动期报错）
 
 ---
 

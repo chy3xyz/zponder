@@ -17,7 +17,7 @@
 | `build.zig` + `build.zig.zon` | Complete (embeds QuickJS-ng v0.17.0 + zgraphql v0.8.0, vendored) |
 | `src/` source files     | 22+ Zig files |
 | `config.toml`           | Complete (`ws_url` / `ws_urls` optional) |
-| Unit tests              | 98 passing  |
+| Unit tests              | 274 passing |
 | QuickJS Script Engine   | Production (Ponder-style `ponder.on` JS API) |
 | 业务投影 (ponder.db)     | Production (`exec`/`query` 参数化写库 + `proj_` 表重组级联回滚) |
 | Async Webhook Queue     | Production   |
@@ -26,6 +26,7 @@
 | CLI Tools               | `start`, `check`, `dev`, `add-script`, `install`, `version` |
 | REST & GraphQL API      | Production   |
 | Factory contracts       | Implemented  |
+| 模板索引器 (templates)   | Production (`[[templates]]` + 工厂发现 clone；一套 `event_{模板}_{事件}` 表承载全部地址) |
 | Docs                    | README, API, ARCHITECTURE, WSS, dev.md, EVALUATION, examples |
 
 ---
@@ -42,6 +43,61 @@
 | RPC Client         | HTTP JSON-RPC failover + optional WSS `eth_subscribe` |
 | 事件时间戳          | 有 JS handler 时惰性拉取 + 缓存（`event.block.timestamp`） |
 | Build              | `build.zig` + `build.zig.zon`                 |
+
+---
+
+## Data Model
+
+### Event tables
+
+- Named `event_{contract_name}_{EventName}` (created by `autoMigrateContract`).
+- Columns: ABI inputs, then `block_number`, `tx_hash`, `log_index`,
+  `contract_address TEXT NOT NULL DEFAULT ''`, `created_at`.
+- Unique key `UNIQUE(contract_address, tx_hash, log_index)` — idempotent inserts;
+  the same `tx_hash`/`log_index` pair can coexist under different contracts.
+- Indexes: `(block_number)`, `(tx_hash)`, `(contract_address, block_number)`.
+- **Legacy migration is idempotent**: SQLite rebuilds the table and backfills
+  `contract_address` (the rebuild drops the old `UNIQUE(tx_hash, log_index)`);
+  PostgreSQL uses `ALTER TABLE ADD COLUMN` + constraint `DROP`/`ADD`.
+- `autoMigrateContract(contract_name, abi_contract, event_names, contract_address)`
+  takes the address as its 4th argument — a single-contract indexer passes the
+  contract address, template mode passes `""`.
+
+### Template mode (`[[templates]]`)
+
+- Config section `[[templates]]`: `name`, `abi_path`, `events`, `factory_name`,
+  `discovery_event`, `discovery_address_field`, `from_block`,
+  `poll_interval_ms`, `block_batch_size`. `[[factories]]` gained
+  `template_name`, which is **mutually exclusive** with `child_abi_path`.
+- One `Indexer` holds a dynamic set of clone addresses; every clone's events go
+  into one shared `event_{template}_{event}` table set. `LogFilter` accepts an
+  **address array**, so a single `eth_getLogs` covers many addresses.
+- Newly discovered addresses are backfilled from their discovery block, then
+  merged into the main loop. The address set and backfill progress persist in
+  `template_addresses(template, address, from_block, backfilled)` with
+  `PRIMARY KEY (template, address)`, so restarts resume without re-scanning.
+- Reorg rollback is **template-level**: rows with `block_number >= fork` are
+  removed for the whole template, and address rows with `from_block >= fork` are
+  deleted. `sync_state` / `block_hashes` use the synthetic key
+  `template:<template_name>`.
+- **RocksDB is unsupported in template mode**: `[[templates]]` with
+  `database.type = "rocksdb"` fails at startup, and `?address=` filtering
+  returns `error.UnsupportedOperation` on the RocksDB backend.
+
+### Projection tables (`proj_`)
+
+- Tables named with a `proj_` prefix and carrying a `block_number` column are
+  business projections written via `ponder.db.exec/query` in JS handlers.
+- `rollbackFromBlock` cascades-deletes projection rows with
+  `block_number >= fork_point` inside the same transaction (SQLite/PostgreSQL;
+  RocksDB has no SQL).
+
+### Query surface
+
+- REST: `GET /events/:contract/:event?address=0x…` filters by contract address.
+- GraphQL: `latestEvents(..., address: String)` and `Event.contractAddress: String!`.
+- JS handlers expose `event.contractAddress`; SSE `/stream` payloads carry
+  `contract_address`.
 
 ---
 

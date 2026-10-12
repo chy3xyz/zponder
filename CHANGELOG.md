@@ -17,8 +17,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   并缓存（无 handler 零额外 RPC），K 线/时序投影不再依赖 `track_blocks`。
 - `zponder_projection_errors_total` 指标；handler 抛错与 SQL 失败均记录日志并可观测。
 - 示例 `examples/handlers/erc20_projection.js`（逐笔明细 + 每块 K 线聚合）。
+- **事件表新增 `contract_address` 列与新唯一键**：`UNIQUE(contract_address, tx_hash, log_index)`
+  取代 `UNIQUE(tx_hash, log_index)`，并加 `(contract_address, block_number)` 索引；同一
+  tx/log 在不同合约下不再互相顶掉。老库幂等迁移：SQLite 重建事件表并回填地址，
+  PostgreSQL 走 `ALTER TABLE ADD COLUMN` + 唯一约束 DROP/ADD。
+- **`[[templates]]` 配置段 + 模板索引器**：一个 Indexer 持动态 clone 地址集合，一套
+  `event_{模板名}_{事件}` 表承载全部 clone；`LogFilter` 支持地址数组，一次 `eth_getLogs`
+  覆盖多地址；新地址从发现区块补扫后并入主循环。
+- **模板地址集合持久化**：`template_addresses(template, address, from_block, backfilled)`
+  （`PRIMARY KEY (template, address)`），重启恢复地址集合与补扫进度。
+- **`[[factories]]` 新增 `template_name`**：指向 `[[templates]]`，与 `child_abi_path` 互斥；
+  命中时把发现的子地址喂给模板，不再为每个 clone 建子索引器。
+- **按地址查询/返回**：REST `GET /events/:contract/:event?address=0x…`；
+  GraphQL `latestEvents(..., address: String)` 且 `Event.contractAddress: String!`。
+- **JS handler `event.contractAddress` 与 SSE `contract_address`**：事件对象新增地址字段，
+  SSE `/stream` 载荷同步携带。
+- **launchpad 模板验收示例**：`examples/local-demo/launchpad-demo/`（工厂 + 3 clone，
+  证明只产生一套 `event_curve_*` 表且按地址可区分）。
+
+### Changed
+- **`autoMigrateContract` 变为 4 参**（末参 `contract_address`）：单合约传合约地址，
+  模板模式传 `""`；调用方需同步签名。
+- **老事件表迁移会重建表**（SQLite）：首次启动对老库就地重建并回填 `contract_address`，
+  幂等，仅执行一次。
+- 老 factory（`child_abi_path` 逐个 clone 建子索引器）行为保留不变；但对几千 clone 的
+  场景推荐改用模板模式（单表多地址，避免每 clone 一张表/一个线程）。
 
 ### Fixed
+- **PG 悬垂切片**：`queryEventLogsPG` 的参数格式化结果此前放在块作用域的栈数组
+  `[21]u8` 里，函数返回后切片失效，调用方读到已回收栈帧，导致块号/分页条件静默错乱；
+  现改用与 `params` 同生命周期的 arena。
+- **`ponderQuerySqlite` / `ponderQueryPG` 行内部分填充泄漏**：多列映射中途分配失败时，
+  当前行已 dupe 的列名/值未释放；现按已填充计数清理。
+- **工厂子索引器悬垂 `*ContractConfig`**：`ChildIndexer` 先在栈上建再拷贝进堆，
+  同步线程与 `idx.contract` 指向函数返回后失效的栈帧；现将子索引器直接建在堆上。
+- **RocksDB 静默忽略地址过滤**：带 `address` 的查询在 RocksDB 后端（其 key 不含地址列）
+  此前静默返回全量，现与模板模式一致明确返回 `error.UnsupportedOperation`。
 - **C 字符串终止符越界读取（多处）**：`config.db_name` 等 Zig 切片直接以 `.ptr`
   传给 `sqlite3_open_v2` / `sqlite3_exec` / `rocksdb_open` / `PQconnectdb` / `PQexec`，
   这些 C API 按 NUL 结尾解析，切片无终止符时会读到越界内存——表现为随机
