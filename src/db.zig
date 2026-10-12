@@ -29,6 +29,14 @@ pub const Snapshot = struct {
     snapshot_data: []const u8,
 };
 
+/// 模板模式下动态发现的 clone 地址。
+/// `address` 是堆分配副本，随 Client.listTemplateAddresses 的返回值一起由调用方释放。
+pub const TemplateAddress = struct {
+    address: []u8,
+    from_block: u64,
+    backfilled: bool,
+};
+
 pub const DecodedField = struct {
     name: []const u8,
     value: []const u8,
@@ -237,6 +245,14 @@ pub const Client = struct {
             \\  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             \\);
             \\CREATE INDEX IF NOT EXISTS idx_call_cache_key ON call_cache(cache_key);
+
+            \\CREATE TABLE IF NOT EXISTS template_addresses (
+            \\  template TEXT NOT NULL,
+            \\  address TEXT NOT NULL,
+            \\  from_block INTEGER NOT NULL,
+            \\  backfilled INTEGER NOT NULL DEFAULT 0,
+            \\  PRIMARY KEY (template, address)
+            \\);
         ;
         try self.exec(sql);
     }
@@ -807,6 +823,85 @@ pub const Client = struct {
         var val_buf: [256]u8 = undefined;
         const val = try std.fmt.bufPrint(&val_buf, "{{\"last_synced_block\":{d},\"status\":\"{s}\"}}", .{ state.last_synced_block, state.status });
         try self.rocks.?.put(key, val);
+    }
+
+    // ========================================================================
+    // template_addresses：模板模式下动态发现的 clone 地址集合
+    // 表由 Client.migrate() 建（SQLite / PostgreSQL），RocksDB 未实现。
+    // 读写走 ponderExec/ponderQuery 参数化路径，占位符随后端切换（? / $n）。
+    // ========================================================================
+
+    /// 登记模板动态发现的 clone 地址（幂等）。
+    /// ON CONFLICT(template, address) DO NOTHING：同一地址重复发现不覆盖已有
+    /// from_block/backfilled 进度。落库失败向上返回，由调用方决定是否阻断。
+    pub fn addTemplateAddress(self: *Client, template: []const u8, address: []const u8, from_block: u64) !void {
+        if (self.backend_type == .rocksdb) return error.UnsupportedOperation;
+        const sql = if (self.backend_type == .postgresql)
+            "INSERT INTO template_addresses (template, address, from_block) VALUES ($1, $2, $3) ON CONFLICT(template, address) DO NOTHING;"
+        else
+            "INSERT INTO template_addresses (template, address, from_block) VALUES (?, ?, ?) ON CONFLICT(template, address) DO NOTHING;";
+        _ = try self.ponderExec(sql, &.{ .{ .text = template }, .{ .text = address }, .{ .integer = @intCast(from_block) } });
+    }
+
+    /// 列出模板持有的全部 clone 地址（按 from_block、address 排序）。
+    /// 内存约定同 getSyncState：返回堆数组，调用方负责释放——
+    /// `for (list) |item| alloc.free(item.address);` 之后 `alloc.free(list)`。
+    pub fn listTemplateAddresses(self: *Client, template: []const u8) ![]TemplateAddress {
+        if (self.backend_type == .rocksdb) return error.UnsupportedOperation;
+        const sql = if (self.backend_type == .postgresql)
+            "SELECT address, from_block, backfilled FROM template_addresses WHERE template = $1 ORDER BY from_block, address;"
+        else
+            "SELECT address, from_block, backfilled FROM template_addresses WHERE template = ? ORDER BY from_block, address;";
+        const rows = try self.ponderQuery(sql, &.{.{ .text = template }});
+        defer self.freeQueryRows(rows);
+
+        const list = try self.alloc.alloc(TemplateAddress, rows.len);
+        var filled: usize = 0;
+        errdefer {
+            for (list[0..filled]) |item| self.alloc.free(item.address);
+            self.alloc.free(list);
+        }
+        for (rows, 0..) |row, i| {
+            const addr_text = switch (row.values[0]) {
+                .text => |t| t,
+                else => return error.InvalidData,
+            };
+            const from_block = switch (row.values[1]) {
+                .integer => |v| @as(u64, @intCast(v)),
+                else => return error.InvalidData,
+            };
+            const backfilled = switch (row.values[2]) {
+                .integer => |v| v != 0,
+                else => return error.InvalidData,
+            };
+            list[i] = .{
+                .address = try self.alloc.dupe(u8, addr_text),
+                .from_block = from_block,
+                .backfilled = backfilled,
+            };
+            filled = i + 1;
+        }
+        return list;
+    }
+
+    /// 标记某 clone 的历史区间已回填完成。
+    pub fn markTemplateAddressBackfilled(self: *Client, template: []const u8, address: []const u8) !void {
+        if (self.backend_type == .rocksdb) return error.UnsupportedOperation;
+        const sql = if (self.backend_type == .postgresql)
+            "UPDATE template_addresses SET backfilled = 1 WHERE template = $1 AND address = $2;"
+        else
+            "UPDATE template_addresses SET backfilled = 1 WHERE template = ? AND address = ?;";
+        _ = try self.ponderExec(sql, &.{ .{ .text = template }, .{ .text = address } });
+    }
+
+    /// reorg 回滚：删除该模板中 from_block >= 给定块的 clone 地址。
+    pub fn deleteTemplateAddressesFromBlock(self: *Client, template: []const u8, from_block: u64) !void {
+        if (self.backend_type == .rocksdb) return error.UnsupportedOperation;
+        const sql = if (self.backend_type == .postgresql)
+            "DELETE FROM template_addresses WHERE template = $1 AND from_block >= $2;"
+        else
+            "DELETE FROM template_addresses WHERE template = ? AND from_block >= ?;";
+        _ = try self.ponderExec(sql, &.{ .{ .text = template }, .{ .integer = @intCast(from_block) } });
     }
 
     // ========================================================================
@@ -1608,6 +1703,14 @@ pub const Client = struct {
             \\  created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
             \\);
             \\CREATE INDEX IF NOT EXISTS idx_call_cache_key ON call_cache(cache_key);
+
+            \\CREATE TABLE IF NOT EXISTS template_addresses (
+            \\  template TEXT NOT NULL,
+            \\  address TEXT NOT NULL,
+            \\  from_block BIGINT NOT NULL,
+            \\  backfilled INTEGER NOT NULL DEFAULT 0,
+            \\  PRIMARY KEY (template, address)
+            \\);
         ;
         try self.pgconn.?.exec(sql);
     }
@@ -2487,6 +2590,105 @@ test "db migrate and sync_state" {
     try std.testing.expectEqual(@as(u64, 100), state.?.last_synced_block);
     alloc.free(state.?.contract_address);
     alloc.free(state.?.status);
+}
+
+/// 测试用：按 listTemplateAddresses 的约定释放（address 逐个 free，再 free 数组）
+fn freeTemplateAddressList(alloc: std.mem.Allocator, list: []TemplateAddress) void {
+    for (list) |item| alloc.free(item.address);
+    alloc.free(list);
+}
+
+test "db template_addresses 增删查与回滚" {
+    const alloc = std.testing.allocator;
+    const cfg = DatabaseConfig{ .db_type = "sqlite", .db_name = ":memory:", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var client = try Client.init(alloc, &cfg);
+    defer client.deinit();
+    try client.migrate();
+    try client.migrate(); // 建表幂等
+    try client.addTemplateAddress("curve", "0xA", 100);
+    try client.addTemplateAddress("curve", "0xA", 100); // 幂等
+    try client.addTemplateAddress("curve", "0xA", 999); // 重复发现不得覆盖已有 from_block
+    try client.addTemplateAddress("curve", "0xB", 200);
+    try client.addTemplateAddress("other", "0xC", 50); // 模板维度隔离
+    {
+        const list = try client.listTemplateAddresses("curve");
+        defer freeTemplateAddressList(alloc, list);
+        try std.testing.expectEqual(@as(usize, 2), list.len);
+        try std.testing.expectEqualStrings("0xA", list[0].address);
+        try std.testing.expectEqual(@as(u64, 100), list[0].from_block);
+        try std.testing.expect(!list[0].backfilled);
+        try std.testing.expectEqualStrings("0xB", list[1].address);
+        try std.testing.expectEqual(@as(u64, 200), list[1].from_block);
+    }
+    try client.markTemplateAddressBackfilled("curve", "0xA");
+    try client.deleteTemplateAddressesFromBlock("curve", 150);
+    const after = try client.listTemplateAddresses("curve");
+    defer freeTemplateAddressList(alloc, after);
+    try std.testing.expectEqual(@as(usize, 1), after.len);
+    try std.testing.expectEqualStrings("0xA", after[0].address);
+    try std.testing.expect(after[0].backfilled);
+
+    const empty = try client.listTemplateAddresses("nope");
+    defer freeTemplateAddressList(alloc, empty);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+
+    try client.deleteTemplateAddressesFromBlock("curve", 0);
+    const gone = try client.listTemplateAddresses("curve");
+    defer freeTemplateAddressList(alloc, gone);
+    try std.testing.expectEqual(@as(usize, 0), gone.len);
+}
+
+test "db template_addresses 落库失败向上返回" {
+    const alloc = std.testing.allocator;
+    const cfg = DatabaseConfig{ .db_type = "sqlite", .db_name = ":memory:", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var client = try Client.init(alloc, &cfg);
+    defer client.deinit();
+    // 未 migrate：表不存在，addTemplateAddress 必须把错误上抛而非吞掉（错误码随后端而异）
+    if (client.addTemplateAddress("curve", "0xA", 100)) |_| {
+        return error.TestUnexpectedResult;
+    } else |_| {}
+}
+
+test "db template_addresses PostgreSQL 后端" {
+    const alloc = std.testing.allocator;
+    // 无本地 PG 时跳过（CI 不装 PG）
+    const admin_cfg = DatabaseConfig{ .db_type = "postgresql", .db_name = "host=localhost port=5432 dbname=postgres", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var admin = Client.init(alloc, &admin_cfg) catch return error.SkipZigTest;
+    // 独立测试库，避免污染 postgres 库
+    _ = admin.ponderExec("DROP DATABASE IF EXISTS zponder_tmpl_addr_test;", &.{}) catch {};
+    _ = admin.ponderExec("CREATE DATABASE zponder_tmpl_addr_test;", &.{}) catch {
+        admin.deinit();
+        return error.SkipZigTest;
+    };
+    admin.deinit();
+
+    const cfg = DatabaseConfig{ .db_type = "postgresql", .db_name = "host=localhost port=5432 dbname=zponder_tmpl_addr_test", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var client = try Client.init(alloc, &cfg);
+    try client.migrate();
+    try client.addTemplateAddress("curve", "0xA", 100);
+    try client.addTemplateAddress("curve", "0xA", 999); // ON CONFLICT DO NOTHING 不覆盖已有进度
+    try client.addTemplateAddress("curve", "0xB", 200);
+
+    const list = try client.listTemplateAddresses("curve");
+    defer freeTemplateAddressList(alloc, list);
+    try std.testing.expectEqual(@as(usize, 2), list.len);
+    try std.testing.expectEqualStrings("0xA", list[0].address);
+    try std.testing.expectEqual(@as(u64, 100), list[0].from_block);
+    try std.testing.expectEqualStrings("0xB", list[1].address);
+
+    try client.markTemplateAddressBackfilled("curve", "0xA");
+    try client.deleteTemplateAddressesFromBlock("curve", 150);
+    const after = try client.listTemplateAddresses("curve");
+    defer freeTemplateAddressList(alloc, after);
+    try std.testing.expectEqual(@as(usize, 1), after.len);
+    try std.testing.expectEqualStrings("0xA", after[0].address);
+    try std.testing.expect(after[0].backfilled);
+
+    // 清理测试库
+    client.deinit();
+    var cleanup = Client.init(alloc, &admin_cfg) catch return;
+    _ = cleanup.ponderExec("DROP DATABASE IF EXISTS zponder_tmpl_addr_test;", &.{}) catch {};
+    cleanup.deinit();
 }
 
 test "db snapshot and block_hash" {
