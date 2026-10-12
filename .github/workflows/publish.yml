@@ -48,21 +48,35 @@ jobs:
 
       - name: Install deps (macOS)
         if: runner.os == 'macOS'
-        run: brew install sqlite3 rocksdb libpq
+        # 发布二进制用 -Drocksdb=false -Dpostgres=false 构建，只需要 sqlite3 的开发头文件
+        run: brew install sqlite3
 
       - name: Install deps (Linux)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq libsqlite3-dev librocksdb-dev libpq-dev
-          # 确保 PostgreSQL 头文件存在（此前 apt 曾跳过 libpq-dev 导致构建失败）
-          test -f /usr/include/libpq-fe.h && echo "libpq-fe.h OK" || sudo apt-get install -y libpq-dev
+          sudo apt-get install -y -qq libsqlite3-dev
 
       - name: Build
-        run: zig build -Doptimize=ReleaseFast
+        run: zig build -Doptimize=ReleaseFast -Drocksdb=false -Dpostgres=false
 
       - name: Test
-        run: zig build test
+        run: zig build test -Drocksdb=false -Dpostgres=false
+
+      # 门禁：发布出去的二进制必须在干净机器上能跑 —— 不许动态依赖 librocksdb/libpq。
+      # 只"能运行"不算证据（runner 上恰好装了这些库），必须查动态依赖表。
+      - name: Assert binary has no optional-backend deps
+        run: |
+          set -e
+          BIN=zig-out/bin/zponder
+          ./"$BIN" version
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            otool -L "$BIN"
+            ! otool -L "$BIN" | grep -E "rocksdb|libpq"
+          else
+            ldd "$BIN"
+            ! ldd "$BIN" | grep -E "rocksdb|libpq"
+          fi
 
       - name: Prepare binary
         run: |
