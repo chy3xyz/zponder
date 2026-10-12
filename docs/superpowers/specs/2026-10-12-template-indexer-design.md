@@ -72,6 +72,26 @@ discovery_address_field = "curve"
 - 建表在模板 indexer 启动时一次完成 → 无运行期 DDL（消除隐患）
 - 线程数 = 模板数（个位数），表数 = 模板×事件数
 
+### 2.2.1 持久化与重启（新增表）
+
+地址集合与补扫状态必须落库，否则重启丢失已发现的 clone：
+
+```sql
+CREATE TABLE IF NOT EXISTS template_addresses (
+  template     TEXT NOT NULL,
+  address      TEXT NOT NULL,
+  from_block   INTEGER NOT NULL,   -- 发现（创建）区块
+  backfilled   INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (template, address)
+);
+```
+
+- 启动时按 template 载入 → 重建内存地址集合（`backfilled=0` 的重新入队补扫）
+- 模板游标复用 `sync_state`，key 约定 **`template:<模板名>`**（该列是 `TEXT NOT NULL UNIQUE`，
+  upsert 走 `ON CONFLICT(contract_address)`，无需改表）
+- 重组回滚时同步清理 `template_addresses` 中 `from_block >= fork` 的记录
+  （fork 之后创建的 clone 一律作废，与事件回滚一致）
+
 ### 2.3 对外接口
 
 - REST `/events/:template/:event` 增加可选 `?address=0x…`；响应每行含 `contract_address`
