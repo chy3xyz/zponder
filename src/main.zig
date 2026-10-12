@@ -142,12 +142,22 @@ pub fn main(init: std.process.Init) !void {
             continue;
         }
         if (std.mem.eql(u8, arg, "version") or std.mem.eql(u8, arg, "-v") or std.mem.eql(u8, arg, "--version")) {
+            // 特性列表按构建实测：可选后端被 -Drocksdb=false / -Dpostgres=false 关掉后
+            // 二进制里根本没有它们，banner 不该再宣称支持。
+            const storage = comptime if (build_options.rocksdb and build_options.postgres)
+                "SQLite, RocksDB, PostgreSQL"
+            else if (build_options.rocksdb)
+                "SQLite, RocksDB"
+            else if (build_options.postgres)
+                "SQLite, PostgreSQL"
+            else
+                "SQLite";
             const ver_msg = try std.fmt.allocPrint(alloc,
                 \\zponder v{s} (commit: {s})
                 \\Built with Zig 0.17.0
-                \\Features: QuickJS, SQLite, RocksDB, PostgreSQL, GraphQL, Webhook Queue, SSE Streaming, WSS Subscribe
+                \\Features: QuickJS, {s}, GraphQL, Webhook Queue, SSE Streaming, WSS Subscribe
                 \\
-            , .{ build_options.version, build_options.git_commit });
+            , .{ build_options.version, build_options.git_commit, storage });
             defer alloc.free(ver_msg);
             std.Io.File.stdout().writeStreamingAll(init.io, ver_msg) catch {};
             return;

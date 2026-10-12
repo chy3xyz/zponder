@@ -33,7 +33,9 @@ for entry in "${TARGETS[@]}"; do
 
   mkdir -p "$OUT_DIR"
 
-  zig build -Doptimize=ReleaseFast -Dtarget="$TARGET_TRIPLE" 2>&1 || {
+  # npm 分发的二进制必须是自包含的：关掉可选后端，否则动态依赖
+  # librocksdb / libpq（干净机器上直接 dyld 失败），且交叉编译也链不上系统库。
+  zig build -Doptimize=ReleaseFast -Dtarget="$TARGET_TRIPLE" -Drocksdb=false -Dpostgres=false 2>&1 || {
     echo "WARNING: Failed to build for $PLATFORM_DIR — skipping"
     continue
   }

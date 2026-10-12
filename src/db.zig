@@ -6,6 +6,7 @@ const log = @import("log.zig");
 const utils = @import("utils.zig");
 const rocksdb = @import("rocksdb.zig");
 const pg = @import("pg.zig");
+const build_options = @import("build_options");
 
 pub const DatabaseConfig = @import("config.zig").DatabaseConfig;
 pub const BackendType = enum { sqlite, rocksdb, postgresql };
@@ -135,12 +136,20 @@ pub const Client = struct {
     }
 
     fn initRocksDB(alloc: std.mem.Allocator, config: *const DatabaseConfig) !Client {
+        if (!build_options.rocksdb) {
+            log.err("此二进制未编译 RocksDB 后端（构建时用了 -Drocksdb=false）；请改用 sqlite/postgresql，或自行构建带 RocksDB 的二进制", .{});
+            return error.RocksDbSupportNotCompiled;
+        }
         const path = if (config.db_name.len > 0) config.db_name else "rocksdb_data";
         const rc = try rocksdb.Client.init(alloc, path);
         return .{ .alloc = alloc, .config = config, .backend_type = .rocksdb, .db = null, .read_db = null, .rocks = rc, .pgconn = null };
     }
 
     fn initPostgreSQL(alloc: std.mem.Allocator, config: *const DatabaseConfig) !Client {
+        if (!build_options.postgres) {
+            log.err("此二进制未编译 PostgreSQL 后端（构建时用了 -Dpostgres=false）；请改用 sqlite/rocksdb，或自行构建带 PostgreSQL 的二进制", .{});
+            return error.PostgresSupportNotCompiled;
+        }
         const conninfo = if (config.db_name.len > 0) config.db_name else "host=localhost port=5432 dbname=zponder";
         const conn = try pg.Client.init(alloc, conninfo);
         return .{ .alloc = alloc, .config = config, .backend_type = .postgresql, .db = null, .read_db = null, .rocks = null, .pgconn = conn };
@@ -2797,6 +2806,7 @@ test "db template_addresses list 列类型漂移的部分填充失败路径" {
 }
 
 test "db template_addresses PostgreSQL 后端" {
+    if (!build_options.postgres) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     // 无本地 PG 时跳过（CI 不装 PG）
     const admin_cfg = DatabaseConfig{ .db_type = "postgresql", .db_name = "host=localhost port=5432 dbname=postgres", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
@@ -3059,6 +3069,7 @@ test "db deleteEventLogsInRange" {
 }
 
 test "db rocksdb sync_state and block_hash" {
+    if (!build_options.rocksdb) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const cfg = DatabaseConfig{ .db_type = "rocksdb", .db_name = "/tmp/zponder_test_rocksdb", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
     var client = try Client.init(alloc, &cfg);
@@ -3079,6 +3090,7 @@ test "db rocksdb sync_state and block_hash" {
 }
 
 test "db rocksdb event insert and query" {
+    if (!build_options.rocksdb) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const cfg = DatabaseConfig{ .db_type = "rocksdb", .db_name = "/tmp/zponder_test_rocksdb2", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
     var client = try Client.init(alloc, &cfg);
@@ -3093,6 +3105,7 @@ test "db rocksdb event insert and query" {
 }
 
 test "db rocksdb count and delete" {
+    if (!build_options.rocksdb) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const cfg = DatabaseConfig{ .db_type = "rocksdb", .db_name = "/tmp/zponder_test_rocksdb3", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
     var client = try Client.init(alloc, &cfg);
@@ -3112,6 +3125,7 @@ test "db rocksdb count and delete" {
 }
 
 test "db rocksdb snapshot" {
+    if (!build_options.rocksdb) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const cfg = DatabaseConfig{ .db_type = "rocksdb", .db_name = "/tmp/zponder_test_rocksdb4", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
     var client = try Client.init(alloc, &cfg);
@@ -3197,6 +3211,7 @@ test "db rollbackFromBlock 级联清理 proj_ 投影表" {
 }
 
 test "db ponderExec/ponderQuery PostgreSQL 后端" {
+    if (!build_options.postgres) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     // 无本地 PG 时跳过（CI 不装 PG）
     const admin_cfg = DatabaseConfig{ .db_type = "postgresql", .db_name = "host=localhost port=5432 dbname=postgres", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
@@ -3252,6 +3267,7 @@ test "db ponderExec/ponderQuery PostgreSQL 后端" {
 }
 
 test "db 事件表 contract_address 列：PostgreSQL 同 tx 不同合约与唯一键" {
+    if (!build_options.postgres) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     // 无本地 PG 时跳过（CI 不装 PG）
     const admin_cfg = DatabaseConfig{ .db_type = "postgresql", .db_name = "host=localhost port=5432 dbname=postgres", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
@@ -3319,6 +3335,7 @@ test "db 事件表 contract_address 列：PostgreSQL 同 tx 不同合约与唯�
 // 同上语义的 PostgreSQL 分支：`ON CONFLICT (contract_address, tx_hash, log_index) DO NOTHING`
 // + `PQcmdTuples` 判定是否新插入。
 test "insertEventLog 重复插入返回 false 且行数不变（PostgreSQL）" {
+    if (!build_options.postgres) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     // 无本地 PG 时跳过（CI 不装 PG）
     const admin_cfg = DatabaseConfig{ .db_type = "postgresql", .db_name = "host=localhost port=5432 dbname=postgres", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
@@ -3490,6 +3507,7 @@ test "db 老事件表迁移：补地址列并回填，行数不变" {
 }
 
 test "db 老事件表迁移（PostgreSQL）：补地址列并换唯一键" {
+    if (!build_options.postgres) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     // 无本地 PG 时跳过（CI 不装 PG）
     const admin_cfg = DatabaseConfig{ .db_type = "postgresql", .db_name = "host=localhost port=5432 dbname=postgres", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
@@ -3599,6 +3617,7 @@ test "db 老事件表迁移：已有地址列时保留原地址，只换唯一�
 }
 
 test "db 老事件表迁移（PostgreSQL）：别 schema 同名表不得干扰探测与改动" {
+    if (!build_options.postgres) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const admin_cfg = DatabaseConfig{ .db_type = "postgresql", .db_name = "host=localhost port=5432 dbname=postgres", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
     var admin = Client.init(alloc, &admin_cfg) catch return error.SkipZigTest;
@@ -3692,6 +3711,7 @@ test "db 老事件表迁移（PostgreSQL）：别 schema 同名表不得干扰�
 }
 
 test "db queryEventLogs PostgreSQL 区块区间过滤（回归：参数悬垂切片）" {
+    if (!build_options.postgres) return error.SkipZigTest;
     // 修复前：queryEventLogsPG 把块号/分页参数格式化进块作用域里的栈上 [21]u8，
     // 切片入 params 时其生存期已结束；四段 buf 共用栈槽，后面的写入覆盖前面的值，
     // 于是 `block_from=150, block_to=250, limit=10, offset=0` 实际过滤成 0~0 行。
@@ -3758,6 +3778,7 @@ test "db queryEventLogs PostgreSQL 区块区间过滤（回归：参数悬垂切
 }
 
 test "db rocksdb queryEventLogs 带地址过滤不得静默返回全量" {
+    if (!build_options.rocksdb) return error.SkipZigTest;
     const alloc = std.testing.allocator;
     const cfg = DatabaseConfig{ .db_type = "rocksdb", .db_name = "/tmp/zponder_test_rocksdb_addr_filter", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
     var client = try Client.init(alloc, &cfg);
@@ -3864,6 +3885,7 @@ test "db queryEventLogsPG 参数构建不得依赖调用方的栈帧" {
 }
 
 test "db ponderQuery PostgreSQL 行内部分填充失败路径不泄漏" {
+    if (!build_options.postgres) return error.SkipZigTest;
     // 与 sqlite 版同型：ponderQueryPG 逐列填充时 names[col]/values[col] 的 dupe 已入数组，
     // 但内层 errdefer 只释放 names/values 数组本身、外层 errdefer 只处理已填满的行 →
     // "当前行填到一半"失败会泄漏本行已 dupe 的列名与值（.text 与 .blob 都要释放）。
