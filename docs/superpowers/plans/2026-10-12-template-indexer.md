@@ -278,7 +278,12 @@ Run: `zig build test -- --test-filter "老事件表迁移"` → FAIL（`no membe
         }
 ```
 
-`autoMigrateContract` 签名加 `contract_address: []const u8` 参数（单合约模式传 `self.contract.address`；模板模式传 `""`）。调用点：`src/indexer.zig:86`。
+`autoMigrateContract` 签名加 `contract_address: []const u8` 参数（单合约模式传 `self.contract.address`；模板模式传 `""`）。**本步骤必须同步更新全部既有调用点**，否则编译失败：
+
+- `src/indexer.zig:86`（`Indexer.init` 内）→ `database.autoMigrateContract(contract.name, ac, contract.events, contract.address)`
+- `src/db.zig` 内既有测试：`db event table insert and query`、`db rollbackFromBlock` 等调用 `autoMigrateContract("…", &ac, &.{…})` 的地方补第 4 个参数（单合约传 `"0x…"` 或 `""`）
+- Task 1 新增的测试（`autoMigrateContract("curve", &ac, &.{"Transfer"})`）同样补成 4 参
+- Task 3 及之后的测试一律直接用 4 参形式
 
 - [ ] **Step 5: 运行测试**
 
@@ -617,9 +622,15 @@ git commit -m "feat: 新增 [[templates]] 配置段"
 **Interfaces:**
 - Consumes: Task 1/3/4/5（表结构、地址过滤、`template_addresses`、地址数组）
 - Produces:
+  - `pub const TemplateAddressSet = struct`（独立小类型，便于无 Indexer 单测）：
+    - `init(alloc) TemplateAddressSet` / `deinit(self)`
+    - `add(self, address: []const u8, from_block: u64) bool`（去重；true = 新加入并进入 pending）
+    - `count(self) usize` / `all(self) []const []const u8`（live 地址）
+    - `pending(self) []const PendingBackfill`（`{ address: []const u8, from_block: u64 }`）
+    - `markBackfilled(self, address: []const u8) void`（pending → live）
   - `Indexer.setTemplateMode(self, enabled: bool) void`
   - `Indexer.discoverAddress(self, address: []const u8, from_block: u64) void`
-    （**注意与 `Client.addTemplateAddress` 区分**：本方法入内存队列并落库，线程安全）
+    （**注意与 `Client.addTemplateAddress` 区分**：本方法入内存集合并落库，线程安全）
   - `Indexer.templateAddressCount(self) usize`
   - `Indexer.loadTemplateAddresses(self) !void`（启动时从库恢复）
   - `fn computeBackfillRange(discovered_at_block: u64, current_cursor: u64) [2]u64`（**纯函数，供单测**）
@@ -634,46 +645,54 @@ test "template computeBackfillRange 无缺口" {
     try std.testing.expectEqual([2]u64{ 0, 0 }, computeBackfillRange(300, 250));
 }
 
-test "template 地址集合去重与计数" {
+test "template 地址集合去重/补扫流转" {
     const alloc = std.testing.allocator;
-    const contract = config.ContractConfig{
-        .name = "curve", .address = "", .abi_path = "", .events = &.{},
-        .from_block = 0, .start_block = null, .poll_interval_ms = null,
-        .max_reorg_depth = null, .block_batch_size = null, .filters = &.{},
-    };
-    var idx = Indexer{
-        .alloc = alloc, .rpc = undefined, .database = undefined, .contract = &contract,
-        .snapshot_interval = 0,
-        .state = std.atomic.Value(IndexerState).init(.stopped),
-        .current_block = std.atomic.Value(u64).init(0),
-        .last_tip = std.atomic.Value(u64).init(0),
-        .last_snapshot_time = std.atomic.Value(i64).init(0),
-        .batch_size = 100, .poll_interval_ms = 1000, .abi_contract = null, .thread = null,
-        .track_blocks = false, .chain = "ethereum",
-        .factory_ctx = null, .factory_callback = null, .factory_idx = 0,
-    };
-    defer idx.deinit();
-    idx.setTemplateMode(true);
-    idx.discoverAddress("0xA", 10);
-    idx.discoverAddress("0xA", 10);
-    try std.testing.expectEqual(@as(usize, 1), idx.templateAddressCount());
+    var set = TemplateAddressSet.init(alloc);
+    defer set.deinit();
+
+    try std.testing.expect(set.add("0xA", 10));   // 新地址 → true
+    try std.testing.expect(!set.add("0xA", 10));  // 重复 → false
+    try std.testing.expectEqual(@as(usize, 1), set.count());
+    try std.testing.expectEqual(@as(usize, 1), set.pending().len);
+    try std.testing.expectEqual(@as(usize, 0), set.all().len); // 尚未并入 live
+
+    set.markBackfilled("0xA");
+    try std.testing.expectEqual(@as(usize, 0), set.pending().len);
+    try std.testing.expectEqualStrings("0xA", set.all()[0]);
 }
 ```
 
-> 该字面量与 `src/indexer.zig:1004-1023` 的既有测试写法一致（新增字段有默认值，无需列出）。
-> 注意：`deinit()` 里要释放 `template_addresses` 与 `pending_backfill` 的 dupe 内存，
-> 否则 `std.testing.allocator` 会报告泄漏——这是本任务必须实现的一部分。
+> 该测试**不构造 Indexer**（`Indexer` 字面量里 `rpc = undefined`，调用 `deinit` 会碰到未定义指针）；
+> 地址集合逻辑全部落在 `TemplateAddressSet` 上，Indexer 只是持有者。
 
 - [ ] **Step 2: 运行确认失败** → FAIL
 
 - [ ] **Step 3: 实现要点**
 
 ```zig
-    // 新增字段
-    template_mode: bool = false,
-    template_addresses: std.ArrayList([]const u8) = .empty,   // 已并入 live 的地址
-    template_mutex: std.atomic.Mutex = .unlocked,
-    pending_backfill: std.ArrayList(PendingBackfill) = .empty, // { address: []u8, from_block: u64 }
+/// 模板模式的动态地址集合（去重 + 补扫队列），独立可测
+pub const PendingBackfill = struct { address: []const u8, from_block: u64 };
+
+pub const TemplateAddressSet = struct {
+    alloc: std.mem.Allocator,
+    live: std.ArrayList([]const u8) = .empty,
+    pending_list: std.ArrayList(PendingBackfill) = .empty,
+
+    pub fn init(alloc: std.mem.Allocator) TemplateAddressSet { return .{ .alloc = alloc }; }
+    pub fn deinit(self: *TemplateAddressSet) void {
+        for (self.live.items) |a| self.alloc.free(a);
+        for (self.pending_list.items) |p| self.alloc.free(p.address);
+        self.live.deinit(self.alloc);
+        self.pending_list.deinit(self.alloc);
+    }
+    /// 已存在返回 false；新地址 dupe 进 pending，返回 true
+    pub fn add(self: *TemplateAddressSet, address: []const u8, from_block: u64) bool { … }
+    pub fn count(self: *TemplateAddressSet) usize { return self.live.items.len; }
+    pub fn all(self: *TemplateAddressSet) []const []const u8 { return self.live.items; }
+    pub fn pending(self: *TemplateAddressSet) []const PendingBackfill { return self.pending_list.items; }
+    /// pending -> live（补扫完成）
+    pub fn markBackfilled(self: *TemplateAddressSet, address: []const u8) void { … }
+};
 ```
 
 ```zig
@@ -684,13 +703,15 @@ fn computeBackfillRange(discovered_at_block: u64, current_cursor: u64) [2]u64 {
 }
 ```
 
-- `discoverAddress`：去重（线性查 `template_addresses`）→ `pending_backfill.append(.{ .address = dupe, .from_block })` → `database.addTemplateAddress(name, addr, from_block)`；未 `setTemplateMode(true)` 时直接返回
-- `deinit`：释放 `template_addresses` 各元素、`pending_backfill` 各元素（`.address` dupe）与两个 ArrayList——漏了会被测试分配器逮住
-- 主循环（`runLoop`）每轮：**先**对 `pending_backfill` 逐项 `syncRange(from, to)`（`computeBackfillRange` 取区间）→ 成功后 `database.markTemplateAddressBackfilled` 并移入 `template_addresses` → **再**推进主游标（主 sweep 的 `syncRange` 用 live 地址集合）
-- `syncRange` 模板分支：地址取 `self.template_addresses.items`（live）+ 本次补扫地址；`LogFilter.addresses` 传数组；空集合时直接 return（不发 RPC）
-- `processLog`：插入事件用 `lg.address`（`Log.address`）作为 `contract_address`；`trackTokenTransferState` 的 `contract_address` 同样用 `lg.address`
-- 游标：`sync_state` 的 key 用 `template:<name>`（`self.contract.name` 在模板模式下传模板名即可，无需改表）
-- 重组：`detectAndHandleReorg` 模板模式下 `rollbackFromBlock(self.contract.name, …)` + `deleteTemplateAddressesFromBlock(name, fork_point)`
+Indexer 侧：
+- 新字段 `template_mode: bool = false`、`template_set: TemplateAddressSet`（`init` 里 `.init(alloc)`）、`template_mutex: std.atomic.Mutex = .unlocked`；`deinit` 里 `template_set.deinit()`
+- `setTemplateMode(true)` 时把游标 key 记为 `template:<name>`（模板模式下 `Indexer.init` 传入的合成 ContractConfig `.name` 即模板名）
+- `discoverAddress`：加锁 → 未开模板模式直接返回 → `template_set.add(addr, from_block)` 为 true 时 `database.addTemplateAddress(name, addr, from_block)`（落库失败只 log.warn，不阻断发现）
+- `loadTemplateAddresses`：读库列表 → 逐个 `template_set.add` → `backfilled` 的立即 `markBackfilled`
+- 主循环每轮：**先**遍历 `template_set.pending()` 逐项 `syncRange(from, to)`（区间取 `computeBackfillRange(from_block, 探测时的 current_block)`）→ 成功后 `database.markTemplateAddressBackfilled` + `template_set.markBackfilled(addr)` → **再**推进主游标 sweep
+- `syncRange` 模板分支：地址 = `template_set.all()`（本轮补扫地址单独成批），`LogFilter.addresses` 传数组；集合为空直接 return（不发 RPC）
+- `processLog`：事件插入的 `contract_address` 用 `lg.address`（`eth_rpc.Log` 自带该字段）；`trackTokenTransferState` 的 `contract_address` 同样用 `lg.address`
+- 重组：模板模式 `rollbackFromBlock(self.contract.name, …)` + `database.deleteTemplateAddressesFromBlock(name, fork_point)`；`block_hashes` 的 key 用 `self.contract.name`（模板名，链级事实）
 
 - [ ] **Step 4: 运行测试** → `zig build test` 全绿
 
