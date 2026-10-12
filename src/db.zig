@@ -359,7 +359,7 @@ pub const Client = struct {
         log_index: u64,
         contract_address: []const u8,
     ) !void {
-        // RocksDB 无 SQL，不支持模板模式/地址列（延后项，见 task-1-report）
+        // RocksDB 无 SQL，不支持模板模式/地址列（延后项，见 docs/superpowers/specs/2026-10-12-template-indexer-design.md）
         _ = contract_address;
         var key_buf: [512]u8 = undefined;
         const key = try std.fmt.bufPrint(&key_buf, "e:{s}:{s}:{d:0>20}:{s}:{d:0>20}", .{ contract_name, event_name, block_number, tx_hash, log_index });
@@ -2553,6 +2553,71 @@ test "db ponderExec/ponderQuery PostgreSQL 后端" {
     client.deinit();
     var cleanup = Client.init(alloc, &admin_cfg) catch return;
     _ = cleanup.ponderExec("DROP DATABASE IF EXISTS zponder_ponder_test;", &.{}) catch {};
+    cleanup.deinit();
+}
+
+test "db 事件表 contract_address 列：PostgreSQL 同 tx 不同合约与唯一键" {
+    const alloc = std.testing.allocator;
+    // 无本地 PG 时跳过（CI 不装 PG）
+    const admin_cfg = DatabaseConfig{ .db_type = "postgresql", .db_name = "host=localhost port=5432 dbname=postgres", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var admin = Client.init(alloc, &admin_cfg) catch return error.SkipZigTest;
+    // 独立测试库，避免污染 postgres 库
+    _ = admin.ponderExec("DROP DATABASE IF EXISTS zponder_addr_test;", &.{}) catch {};
+    _ = admin.ponderExec("CREATE DATABASE zponder_addr_test;", &.{}) catch {
+        admin.deinit();
+        return error.SkipZigTest;
+    };
+    admin.deinit();
+
+    const cfg = DatabaseConfig{ .db_type = "postgresql", .db_name = "host=localhost port=5432 dbname=zponder_addr_test", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var client = try Client.init(alloc, &cfg);
+    try client.migrate();
+
+    const test_evt = abi.AbiEvent{ .name = "Transfer", .inputs = &.{
+        .{ .name = "from", .type = "address", .indexed = true },
+        .{ .name = "value", .type = "uint256", .indexed = false },
+    }, .signature = std.mem.zeroes([32]u8) };
+    var events = try alloc.alloc(abi.AbiEvent, 1);
+    events[0] = test_evt;
+    defer alloc.free(events);
+    const ac = abi.AbiContract{ .events = events, .functions = &.{} };
+    try client.autoMigrateContract("curve", &ac, &.{"Transfer"});
+
+    const fields = [_]DecodedField{
+        .{ .name = "from", .value = "0xaaa" },
+        .{ .name = "value", .value = "1" },
+    };
+    // 同一 tx_hash/log_index，两个不同 clone：都必须存在（旧唯一键会把第二条顶掉）
+    try client.insertEventLog("curve", "Transfer", &fields, 100, "0xtx1", 0, "0xCLONE_A");
+    try client.insertEventLog("curve", "Transfer", &fields, 100, "0xtx1", 0, "0xCLONE_B");
+
+    const rows = try client.ponderQuery("SELECT contract_address, COUNT(*) AS n FROM event_curve_Transfer GROUP BY contract_address ORDER BY contract_address;", &.{});
+    defer client.freeQueryRows(rows);
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqualStrings("0xCLONE_A", rows[0].values[0].text);
+    try std.testing.expectEqual(@as(i64, 1), rows[0].values[1].integer);
+    try std.testing.expectEqualStrings("0xCLONE_B", rows[1].values[0].text);
+    try std.testing.expectEqual(@as(i64, 1), rows[1].values[1].integer);
+
+    // 同一地址重复插入被唯一键拒绝：libpq 返回 duplicate key，pg.zig 归一为 ExecFailed
+    try std.testing.expectError(error.ExecFailed, client.insertEventLog("curve", "Transfer", &fields, 100, "0xtx1", 0, "0xCLONE_A"));
+
+    // 被拒后库里仍是两条（每地址一行），确认是唯一键拦下而非行被覆盖
+    const after = try client.ponderQuery("SELECT COUNT(*) AS n FROM event_curve_Transfer;", &.{});
+    defer client.freeQueryRows(after);
+    try std.testing.expectEqual(@as(i64, 2), after[0].values[0].integer);
+
+    // 真实查询路径：地址列随 queryEventLogs 一起返回，两条都还在
+    const listed = try client.queryEventLogs("curve", "Transfer", null, null, "0xtx1", 10, 0, true);
+    defer alloc.free(listed);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "0xCLONE_A") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "0xCLONE_B") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "\"contract_address\":") != null);
+
+    // 清理测试库
+    client.deinit();
+    var cleanup = Client.init(alloc, &admin_cfg) catch return;
+    _ = cleanup.ponderExec("DROP DATABASE IF EXISTS zponder_addr_test;", &.{}) catch {};
     cleanup.deinit();
 }
 
