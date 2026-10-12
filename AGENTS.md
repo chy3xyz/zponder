@@ -17,7 +17,7 @@
 | `build.zig` + `build.zig.zon` | Complete (embeds QuickJS-ng v0.17.0 + zgraphql v0.8.0, vendored) |
 | `src/` source files     | 22+ Zig files |
 | `config.toml`           | Complete (`ws_url` / `ws_urls` optional) |
-| Unit tests              | 274 passing |
+| Unit tests              | 288 passing |
 | QuickJS Script Engine   | Production (Ponder-style `ponder.on` JS API) |
 | 业务投影 (ponder.db)     | Production (`exec`/`query` 参数化写库 + `proj_` 表重组级联回滚) |
 | Async Webhook Queue     | Production   |
@@ -67,11 +67,22 @@
 
 - Config section `[[templates]]`: `name`, `abi_path`, `events`, `factory_name`,
   `discovery_event`, `discovery_address_field`, `from_block`,
-  `poll_interval_ms`, `block_batch_size`. `[[factories]]` gained
-  `template_name`, which is **mutually exclusive** with `child_abi_path`.
+  `poll_interval_ms`, `block_batch_size`, `max_addresses_per_request`. `[[factories]]`
+  gained `template_name`, which is **mutually exclusive** with `child_abi_path`.
+  `discovery_event` / `discovery_address_field` are reserved and currently **not**
+  used at runtime — dispatch follows the factory's `creation_event` /
+  `child_address_field`. `validate()` enforces the pairing: a factory's
+  `template_name` must point back at the template whose `factory_name` names it,
+  and duplicate factory addresses are rejected.
 - One `Indexer` holds a dynamic set of clone addresses; every clone's events go
   into one shared `event_{template}_{event}` table set. `LogFilter` accepts an
-  **address array**, so a single `eth_getLogs` covers many addresses.
+  **address array**, and the main sweep splits that array into chunks of at most
+  `max_addresses_per_request` addresses (default 200) — one `eth_getLogs` per
+  chunk over the same block range, so several thousand clones do not exceed RPC
+  limits.
+- The event row's `contract_address` (and the `event_callback` argument) is the
+  log address normalized to lowercase hex, the same form `discoverAddress`
+  stores in `template_addresses`.
 - Newly discovered addresses are backfilled from their discovery block, then
   merged into the main loop. The address set and backfill progress persist in
   `template_addresses(template, address, from_block, backfilled)` with
@@ -79,7 +90,10 @@
 - Reorg rollback is **template-level**: rows with `block_number >= fork` are
   removed for the whole template, and address rows with `from_block >= fork` are
   deleted. `sync_state` / `block_hashes` use the synthetic key
-  `template:<template_name>`.
+  `template:<template_name>`. After a rollback, the surviving in-memory live
+  addresses are re-inserted idempotently (`ON CONFLICT DO NOTHING`) so a
+  concurrent factory insert absorbed into the rollback transaction cannot drop a
+  clone that should keep being swept.
 - **RocksDB is unsupported in template mode**: `[[templates]]` with
   `database.type = "rocksdb"` fails at startup, and `?address=` filtering
   returns `error.UnsupportedOperation` on the RocksDB backend.

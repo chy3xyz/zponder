@@ -302,6 +302,10 @@ pub const Client = struct {
         } else false;
         if (has_address and unique_ok) return;
 
+        // 重建走 DROP TABLE，用户在该表上自建的索引/触发器会一并消失（触发器语义只有用户
+        // 清楚，不做自动重建）。这里先记下显式索引数，重建后对比留痕。
+        const indexes_before = self.sqliteIndexCount(table) catch 0;
+
         // 3) 新结构列序（不含 contract_address：该列一律回填，不搬旧值）
         var owned_cols: std.ArrayList([]u8) = .empty;
         defer {
@@ -389,6 +393,31 @@ pub const Client = struct {
 
         try self.exec("COMMIT;");
         log.info("事件表 {s} 已迁移：补 contract_address 列 + 地址唯一键（回填 {d} 行）", .{ table, moved });
+
+        const indexes_after = self.sqliteIndexCount(table) catch indexes_before;
+        const lost = indexesLostBeforeRebuild(indexes_before, indexes_after);
+        if (lost > 0) {
+            log.warn("事件表 {s} 重建后丢失 {d} 个用户自建索引（重建前 {d}、重建后 {d}）；如需保留请手工重建", .{ table, lost, indexes_before, indexes_after });
+        }
+    }
+
+    /// 表上**显式创建**的索引数（`PRAGMA index_list` 里 origin = 'c' 的行）。
+    /// UNIQUE 约束自动生成的 `sqlite_autoindex_*`（origin = 'u'）不计入：重建会按新结构
+    /// 自动重建它们，不算用户对象。
+    fn sqliteIndexCount(self: *Client, table: []const u8) !usize {
+        const sql = try std.fmt.allocPrint(self.alloc, "PRAGMA index_list({s});", .{table});
+        defer self.alloc.free(sql);
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        var count: usize = 0;
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            // 列序：(seq, name, unique, origin, partial)
+            const origin = std.mem.sliceTo(c.sqlite3_column_text(stmt, 3), 0);
+            if (std.mem.eql(u8, origin, "c")) count += 1;
+        }
+        return count;
     }
 
     fn sqliteTableExists(self: *Client, table: []const u8) !bool {
@@ -2573,6 +2602,11 @@ fn columnIndex(cols: []const []u8, name: []const u8) ?usize {
     return null;
 }
 
+/// 重建前后显式索引数的比较：返回因重建而丢失的数量（0 = 无损失，无需告警）。
+fn indexesLostBeforeRebuild(before: usize, after: usize) usize {
+    return if (after < before) before - after else 0;
+}
+
 /// 建表 DDL 里唯一键是否已含地址列（SQLite：约束内嵌在 CREATE TABLE 语句里，用子串匹配）。
 fn ddlHasAddressUnique(alloc: std.mem.Allocator, ddl: []const u8) !bool {
     return ddlHasUniqueKey(alloc, ddl, "unique(contract_address,tx_hash,log_index)");
@@ -3782,4 +3816,46 @@ test "db ponderQuery PostgreSQL 行内部分填充失败路径不泄漏" {
     var cleanup = Client.init(alloc, &admin_cfg) catch return;
     _ = cleanup.ponderExec("DROP DATABASE IF EXISTS zponder_pgfill_test;", &.{}) catch {};
     cleanup.deinit();
+}
+
+
+test "db 事件表重建丢用户自建索引：显式索引数下降 → 触发告警判定" {
+    const alloc = std.testing.allocator;
+    const cfg = DatabaseConfig{ .db_type = "sqlite", .db_name = ":memory:", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var client = try Client.init(alloc, &cfg);
+    defer client.deinit();
+    try client.migrate();
+
+    // 旧结构表（无地址列、旧唯一键）+ 用户自建的 4 条索引
+    try client.exec(
+        \\CREATE TABLE event_dai_Transfer (
+        \\  id INTEGER PRIMARY KEY AUTOINCREMENT,
+        \\  evt_from TEXT, evt_value TEXT,
+        \\  block_number INTEGER NOT NULL, tx_hash TEXT NOT NULL, log_index INTEGER NOT NULL,
+        \\  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        \\  UNIQUE(tx_hash, log_index));
+    );
+    try client.exec("INSERT INTO event_dai_Transfer (evt_from, evt_value, block_number, tx_hash, log_index) VALUES ('0xa','1',10,'0xt',0);");
+    try client.exec("CREATE INDEX idx_user_from ON event_dai_Transfer(evt_from);");
+    try client.exec("CREATE INDEX idx_user_value ON event_dai_Transfer(evt_value);");
+    try client.exec("CREATE INDEX idx_user_block ON event_dai_Transfer(block_number);");
+    try client.exec("CREATE INDEX idx_user_tx ON event_dai_Transfer(tx_hash);");
+
+    const before = try client.sqliteIndexCount("event_dai_Transfer");
+    try std.testing.expectEqual(@as(usize, 4), before); // UNIQUE 的 autoindex（origin='u'）不计入
+
+    const test_evt = abi.AbiEvent{ .name = "Transfer", .inputs = &.{
+        .{ .name = "from", .type = "address", .indexed = true },
+        .{ .name = "value", .type = "uint256", .indexed = false },
+    }, .signature = std.mem.zeroes([32]u8) };
+    try client.migrateEventTableAddress("dai", &test_evt, "0xDAI");
+
+    // 重建只补回三条标准索引，用户自建的四条随 DROP TABLE 一起消失
+    const after = try client.sqliteIndexCount("event_dai_Transfer");
+    try std.testing.expectEqual(@as(usize, 3), after);
+
+    // 这正是告警判定：索引数变少 → 必须留痕（>0）；不丢（相等/变多）→ 不告警
+    try std.testing.expectEqual(@as(usize, 1), indexesLostBeforeRebuild(before, after));
+    try std.testing.expectEqual(@as(usize, 0), indexesLostBeforeRebuild(3, 3));
+    try std.testing.expectEqual(@as(usize, 0), indexesLostBeforeRebuild(3, 4));
 }

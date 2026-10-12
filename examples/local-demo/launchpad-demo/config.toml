@@ -55,8 +55,13 @@ name = "curve"
 abi_path = "./examples/local-demo/launchpad-demo/Curve.abi"
 events = ["Buy"]
 factory_name = "launchpad_factory"
+# discovery_event / discovery_address_field are NOT used at runtime: dispatch is
+# decided by the [[factories]] entry above (creation_event / child_address_field).
+# They are reserved keys and currently have no effect.
 discovery_event = "CurveCreated"
 discovery_address_field = "curve"
 from_block = 0
 poll_interval_ms = 200
 block_batch_size = 500
+# Optional; default 200. Upper bound on clone addresses per eth_getLogs request.
+max_addresses_per_request = 200

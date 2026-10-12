@@ -182,7 +182,10 @@ discovery_address_field = "curve"
 from_block = 0                     # 补扫历史事件的起点
 poll_interval_ms = 200
 block_batch_size = 500
+max_addresses_per_request = 200    # 主 sweep 单次 eth_getLogs 最多带多少个 clone 地址（默认 200）
 ```
+
+> 注意：`[[templates]]` 的 `discovery_event` / `discovery_address_field` **不参与运行期分发**——实际由 `[[factories]]` 的 `creation_event` / `child_address_field` 决定（见上面的工厂段）。这两个键为预留、暂不生效，配了也不会改变行为。
 
 要点：
 

@@ -119,6 +119,10 @@ pub const TemplateConfig = struct {
     from_block: u64,
     poll_interval_ms: ?u32,
     block_batch_size: ?u32,
+    /// 主 sweep 单次 `eth_getLogs` 携带的最大 clone 地址数（null = 运行期默认值，
+    /// 见 `Indexer.setMaxAddressesPerRequest`）。地址数达数千时必须分块，
+    /// 否则一次请求必然超 RPC 上限。
+    max_addresses_per_request: ?u32,
 };
 
 pub const QueryParam = struct {
@@ -699,6 +703,7 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
                     .from_block = 0,
                     .poll_interval_ms = null,
                     .block_batch_size = null,
+                    .max_addresses_per_request = null,
                 };
             } else {
                 section = .none;
@@ -768,6 +773,8 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
                 ct.poll_interval_ms = try parseU32(value);
             } else if (std.mem.eql(u8, key, "block_batch_size")) {
                 ct.block_batch_size = try parseU32(value);
+            } else if (std.mem.eql(u8, key, "max_addresses_per_request")) {
+                ct.max_addresses_per_request = try parseU32(value);
             }
             continue;
         }
@@ -1055,6 +1062,25 @@ fn hasTemplateNamed(cfg: *const Config, name: []const u8) bool {
     return false;
 }
 
+fn findFactoryByName(cfg: *const Config, name: []const u8) ?*const FactoryConfig {
+    for (cfg.factories) |*f| {
+        if (std.mem.eql(u8, f.name, name)) return f;
+    }
+    return null;
+}
+
+/// 工厂 address 是否与更早声明的工厂重复（大小写不敏感：`0xAbC` 与 `0xabc` 是同一个
+/// 地址，但 main 的"工厂 → 索引器"关联只保留最后一个 factory_idx，先配的工厂会静默
+/// 停止发现，其喂入的模板地址集合也随之断流）。
+fn hasDuplicateFactoryAddress(cfg: *const Config, index: usize) bool {
+    const addr = cfg.factories[index].address;
+    if (addr.len == 0) return false;
+    for (cfg.factories[0..index]) |prev| {
+        if (prev.address.len > 0 and std.ascii.eqlIgnoreCase(prev.address, addr)) return true;
+    }
+    return false;
+}
+
 pub fn validate(cfg: *const Config) !void {
     var errors: u32 = 0;
 
@@ -1131,13 +1157,18 @@ pub fn validate(cfg: *const Config) !void {
         }
     }
 
-    for (cfg.factories) |f| {
+    for (cfg.factories, 0..) |f, fi| {
         if (f.name.len == 0) {
             log.err("配置错误: 工厂合约名不能为空", .{});
             errors += 1;
         }
         if (f.address.len == 0) {
             log.err("配置错误: 工厂合约 {s} 的 address 不能为空", .{f.name});
+            errors += 1;
+        } else if (hasDuplicateFactoryAddress(cfg, fi)) {
+            // 同一工厂声明两次：main 的关联循环按地址匹配且只留最后一个 factory_idx，
+            // 先配的那个工厂再也不会被喂事件（发现静默停止）
+            log.err("配置错误: 工厂 {s} 的 address {s} 与前面的工厂重复（同一工厂只能声明一次）", .{ f.name, f.address });
             errors += 1;
         }
         if (f.creation_event.len == 0) {
@@ -1204,6 +1235,15 @@ pub fn validate(cfg: *const Config) !void {
             // 携转约束 5：启动期就报错，不留到运行期
             log.err("配置错误: 模板 {s} 的 factory_name '{s}' 未在 [[factories]] 中定义", .{ t.name, t.factory_name });
             errors += 1;
+        } else if (findFactoryByName(cfg, t.factory_name)) |f| {
+            // 反向一致性（工厂↔模板必须一对一）：喂地址集合的工厂必须指回本模板。
+            // 若它的 template_name 指向别的模板、或根本没配 template_name（走老
+            // child_abi_path 路径），本模板的地址集合永远为空 → 空集短路 + 游标照常推进
+            // → 进程显示 running 却一个事件都不索引。
+            if (!std.mem.eql(u8, f.template_name, t.name)) {
+                log.err("配置错误: 模板 {s} 的 factory_name '{s}' 指向的工厂其 template_name 是 '{s}'，未反向指回该模板（工厂↔模板必须一一对应）", .{ t.name, t.factory_name, f.template_name });
+                errors += 1;
+            }
         }
     }
 
@@ -1682,10 +1722,67 @@ test "config validate: 模板名重复被拒（携转约束 4）" {
     try std.testing.expectEqual(@as(usize, 2), dup.templates.len);
     try std.testing.expectError(error.InvalidConfig, validate(&dup));
 
-    // 对照：名字不同的第二个模板可以共存
-    var distinct = try loadTemplateFixture(alloc, "", "[[templates]]\nname = \"curve2\"\nabi_path = \"./abis/curve.abi\"\nfactory_name = \"launchpad_factory\"\n");
+    // 对照：名字不同的第二个模板可以共存——但它必须有自己的工厂反向指回它（一对一）。
+    // 沿用同一个工厂会让 curve2 的地址集合永远为空（本文件另有用例覆盖该拒绝）。
+    const second_factory =
+        "[[factories]]\nname = \"curve2_factory\"\naddress = \"0x2\"\nabi_path = \"./abis/launchpad.abi\"\ncreation_event = \"CurveCreated\"\nchild_address_field = \"curve\"\ntemplate_name = \"curve2\"\n";
+    const second_template =
+        "[[templates]]\nname = \"curve2\"\nabi_path = \"./abis/curve.abi\"\nfactory_name = \"curve2_factory\"\n";
+    var distinct = try loadTemplateFixture(alloc, second_factory, second_template);
     defer distinct.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), distinct.templates.len);
+    try std.testing.expectEqual(@as(usize, 2), distinct.factories.len);
     try validate(&distinct);
+}
+
+test "config validate: 工厂↔模板必须一对一（工厂必须反向指回模板）" {
+    const alloc = std.testing.allocator;
+    // 工厂存在、正向校验能过，但它的 template_name 不指回 curve（这里退回老
+    // child_abi_path 路径）→ curve 的地址集合永远为空：进程 running 却零索引。
+    var not_back = try loadTemplateFixture(
+        alloc,
+        "template_name = \"\"\nchild_abi_path = \"./abis/curve.abi\"\n",
+        "",
+    );
+    defer not_back.deinit(alloc);
+    try std.testing.expectError(error.InvalidConfig, validate(&not_back));
+
+    // 对照：同一份配置，工厂反向指回 curve 时通过
+    var ok = try loadTemplateFixture(alloc, "", "");
+    defer ok.deinit(alloc);
+    try validate(&ok);
+}
+
+test "config validate: 重复的工厂 address 被拒" {
+    const alloc = std.testing.allocator;
+    const dup_sql = "[[factories]]\nname = \"f2\"\naddress = \"0x1\"\nabi_path = \"./abis/x.abi\"\ncreation_event = \"E\"\nchild_address_field = \"c\"\nchild_abi_path = \"./abis/curve.abi\"\n";
+    var dup = try loadTemplateFixture(alloc, dup_sql, "");
+    defer dup.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), dup.factories.len);
+    try std.testing.expectError(error.InvalidConfig, validate(&dup));
+
+    // 大小写不同但同一地址：同样拒绝
+    const case_dup = "[[factories]]\nname = \"f2\"\naddress = \"0X1\"\nabi_path = \"./abis/x.abi\"\ncreation_event = \"E\"\nchild_address_field = \"c\"\nchild_abi_path = \"./abis/curve.abi\"\n";
+    var dup_case = try loadTemplateFixture(alloc, case_dup, "");
+    defer dup_case.deinit(alloc);
+    try std.testing.expectError(error.InvalidConfig, validate(&dup_case));
+
+    // 对照：地址不同的第二个工厂（老 child_abi_path 路径）可以并存
+    const other = "[[factories]]\nname = \"f2\"\naddress = \"0x2\"\nabi_path = \"./abis/x.abi\"\ncreation_event = \"E\"\nchild_address_field = \"c\"\nchild_abi_path = \"./abis/curve.abi\"\n";
+    var ok = try loadTemplateFixture(alloc, other, "");
+    defer ok.deinit(alloc);
+    try validate(&ok);
+}
+
+test "config templates 解析 max_addresses_per_request（缺省 null，运行期落默认值）" {
+    const alloc = std.testing.allocator;
+    var set = try loadTemplateFixture(alloc, "", "max_addresses_per_request = 50\n");
+    defer set.deinit(alloc);
+    try std.testing.expectEqual(@as(?u32, 50), set.templates[0].max_addresses_per_request);
+
+    var dflt = try loadTemplateFixture(alloc, "", "");
+    defer dflt.deinit(alloc);
+    try std.testing.expect(dflt.templates[0].max_addresses_per_request == null);
 }
 
 test "config validate: template.factory_name 必须存在（携转约束 5）" {

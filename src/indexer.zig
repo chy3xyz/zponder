@@ -180,6 +180,26 @@ fn clampBatchSize(raw: u64) u64 {
     return @max(1, raw);
 }
 
+/// 主 sweep 单次 `eth_getLogs` 的默认地址数上限（`[[templates]]` 未配
+/// `max_addresses_per_request` 时）。目标规模是几千 clone，一次全塞进请求会
+/// 必然超 RPC 上限，故默认就分块。
+pub const default_max_addresses_per_request: u32 = 200;
+
+/// 单次请求的地址数上限夹紧：0 视为 1（上限为 0 若不夹紧会让分块循环零推进）。
+fn clampAddressBatch(raw: u32) usize {
+    return @max(1, raw);
+}
+
+/// 第 `index` 块在地址集里的半开区间 `[start, end)`；已越过末尾返回 null。
+/// 相邻块首尾相接（下一块起点 == 上一块终点）、步长恒为上限，
+/// 因此各块恰好铺满 `[0, len)`：既不重叠也不遗漏。
+fn addressChunkAt(len: usize, max_raw: u32, index: usize) ?[2]usize {
+    const max = clampAddressBatch(max_raw);
+    const start = index *| max;
+    if (start >= len) return null;
+    return .{ start, @min(start +| max, len) };
+}
+
 /// `loadTemplateAddresses` 的前置校验：未开模板模式必须报错。
 /// 若静默返回，Task 8 把 `setTemplateMode(true)` 写在 `loadTemplateAddresses()` 之后时，
 /// 携转约束 2 的启动期 fail-fast（RocksDB 也含在内）会失效；地址集合恒为空 → 空集短路
@@ -293,6 +313,9 @@ pub const Indexer = struct {
     /// （模板模式下 contract.address 是空串，不能直接当 key；详见 setTemplateMode）。
     template_state_key: [256]u8 = undefined,
     template_state_key_len: usize = 0,
+    /// 主 sweep 单次 `eth_getLogs` 携带的最大 clone 地址数（见 setMaxAddressesPerRequest）。
+    /// 默认 `default_max_addresses_per_request`；测试用的结构体字面量省略该字段即取默认值。
+    max_addresses_per_request: u32 = default_max_addresses_per_request,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -472,6 +495,18 @@ pub const Indexer = struct {
         self.lockTemplateSet();
         defer self.unlockTemplateSet();
         return self.template_set.count();
+    }
+
+    /// 设置模板主 sweep 的地址分块上限（`null` 用默认值；0 视为 1）。
+    /// 地址集合按该上限切块、逐块 `eth_getLogs`：几千 clone 时一次全量请求必然超 RPC 上限。
+    /// 必须在 `start()` 之前调用（运行中改会让同一次 sweep 的块边界漂移）。
+    pub fn setMaxAddressesPerRequest(self: *Indexer, raw: ?u32) void {
+        self.max_addresses_per_request = @intCast(clampAddressBatch(raw orelse default_max_addresses_per_request));
+    }
+
+    /// 当前生效的地址分块上限（状态展示/测试用）。
+    pub fn getMaxAddressesPerRequest(self: *Indexer) u32 {
+        return self.max_addresses_per_request;
     }
 
     /// 启动时从库恢复模板地址集合。必须在 `start()` 之前调用。
@@ -796,6 +831,19 @@ pub const Indexer = struct {
                 log.warn("清理克隆地址记录失败: {any}", .{e});
             };
             self.template_set.removeFromBlock(fork_block);
+
+            // 补偿并发插入：`rollbackFromBlock` 是多语句事务，工厂线程的
+            // `addTemplateAddress`（单语句）若恰好落在同一事务里，回滚（失败时的
+            // ROLLBACK）会把这条**不该删**的地址行一起丢弃——内存里该 clone 仍存活，
+            // 但重启后库里没有它 → 不再进 live → 主 sweep 不再覆盖它（跨重启不自愈）。
+            // 这里把内存中仍存活的 live 地址幂等补回：`ON CONFLICT DO NOTHING` 不会覆盖
+            // 已有进度；`removeFromBlock` 已先删掉 fork 之后的条目，故补回的恰是该留的那批。
+            // 全程持锁 → 与 `discoverAddress` 不会交错（其插入不受本次补偿影响）。
+            for (self.template_set.live.items, self.template_set.live_blocks.items) |addr, from_block| {
+                self.database.addTemplateAddress(self.contract.name, addr, from_block) catch |e| {
+                    log.warn("模板 {s}: 回滚后补回 clone 地址失败 {s}: {any}", .{ self.contract.name, addr, e });
+                };
+            }
         }
     }
 
@@ -950,19 +998,43 @@ pub const Indexer = struct {
 
     /// 用给定地址集合拉取并处理 `[from_block, to_block]` 的日志。
     /// 地址集合为空时**直接返回、不发起任何 RPC**——空集合等价于"不过滤地址"（携转约束 1）。
+    ///
+    /// 地址集合按 `max_addresses_per_request` 分块（模板模式地址数可达数千，一次请求必然
+    /// 超 RPC 上限）：块与块恰好铺满整个集合，每块对**同一个** `[from_block, to_block]`
+    /// 独立 `getLogs`。因此区间内不遗漏（分块铺满、每块都处理），也不重复（地址互斥，
+    /// getLogs 按地址过滤）；跨块的重复写入再由 `(contract_address, tx_hash, log_index)`
+    /// 唯一键兜底。
     fn syncRangeWithAddresses(
         self: *Indexer,
         addresses: []const []const u8,
         from_block: u64,
         to_block: u64,
     ) !void {
-        const topics = try self.buildEventTopics();
-        defer self.freeEventTopics(topics);
-
-        const filter = makeLogFilter(addresses, if (topics.len > 0) topics else null, from_block, to_block) orelse {
+        if (addresses.len == 0) {
             log.debug("模板 {s}: 地址集合为空，跳过区块 {}~{}（不发请求）", .{ self.contract.name, from_block, to_block });
             return;
-        };
+        }
+
+        const topics = try self.buildEventTopics();
+        defer self.freeEventTopics(topics);
+        const topics_opt: ?[]const []const u8 = if (topics.len > 0) topics else null;
+
+        // 分块只影响"一次请求带多少地址"；区间边界（from/to）与单块路径完全一致。
+        var chunk: usize = 0;
+        while (addressChunkAt(addresses.len, self.max_addresses_per_request, chunk)) |b| : (chunk += 1) {
+            try self.syncRangeChunk(addresses[b[0]..b[1]], topics_opt, from_block, to_block);
+        }
+    }
+
+    /// 单块地址的实际拉取 + 落库（分块由 `syncRangeWithAddresses` 负责）。
+    fn syncRangeChunk(
+        self: *Indexer,
+        addresses: []const []const u8,
+        topics: ?[]const []const u8,
+        from_block: u64,
+        to_block: u64,
+    ) !void {
+        const filter = makeLogFilter(addresses, topics, from_block, to_block) orelse return;
 
         const logs = try self.rpc.getLogs(filter);
         defer eth_rpc.freeLogs(self.alloc, logs);
@@ -1099,6 +1171,14 @@ pub const Indexer = struct {
 
     /// 处理单条日志：解码、过滤并写入对应事件表
     fn processLog(self: *Indexer, lg: eth_rpc.Log) !void {
+        // 日志来源地址只归一化这一次，落库/回调/余额追踪共用同一个形态。
+        // 模板模式下必须与 `discoverAddress` 落 `template_addresses` 的形态一致（都是小写
+        // hex）：`?address=` 与 GraphQL 是精确匹配，同一 clone 若两处大小写不同就永远查不到。
+        // 非 `0x` + 40 hex 的形态（如单测里的哨兵值）保持原样——单合约模式下它本就是
+        // 配置里的 contract.address，不得改写。
+        var addr_buf: [42]u8 = undefined;
+        const source_address = normalizeHexAddress(&addr_buf, lg.address) orelse lg.address;
+
         if (self.abi_contract) |ac| {
             if (lg.topics.len > 0) {
                 const topic0 = lg.topics[0];
@@ -1145,13 +1225,14 @@ pub const Indexer = struct {
                         lg.block_number,
                         lg.transaction_hash,
                         lg.log_index,
-                        // 日志来源地址：模板模式下即该事件所属的 clone；
-                        // 单合约模式下 getLogs 只过滤单地址，lg.address == contract.address。
-                        lg.address,
+                        // 日志来源地址：模板模式下即该事件所属的 clone（已归一化，与
+                        // discoverAddress 落库的形态一致）；单合约模式下 getLogs 只过滤
+                        // 单地址，lg.address == contract.address。
+                        source_address,
                     );
 
                     if (std.mem.eql(u8, evt.name, "Transfer")) {
-                        self.trackTokenTransferState(lg.address, db_fields.items, lg.block_number);
+                        self.trackTokenTransferState(source_address, db_fields.items, lg.block_number);
                     }
 
                     log.debug("已写入 {s}.{s} @ 区块 {}", .{ self.contract.name, evt.name, lg.block_number });
@@ -1165,8 +1246,8 @@ pub const Indexer = struct {
                         const block_ts = self.resolveBlockTimestamp(lg.block_number);
                         // 事件来源地址：模板模式下是该事件所属的 clone；单合约模式下
                         // getLogs 只过滤 contract.address，故 lg.address 即 contract.address
-                        // （与上方 insertEventLog 的注释同一条不变量），两种模式写法一致。
-                        cb(self.event_callback_ctx, self.contract.name, evt.name, db_fields.items, lg.block_number, block_ts, lg.address);
+                        // （与上方 insertEventLog 同一条不变量，共用同一归一化结果）。
+                        cb(self.event_callback_ctx, self.contract.name, evt.name, db_fields.items, lg.block_number, block_ts, source_address);
                     }
                     return;
                 }
@@ -1619,6 +1700,36 @@ test "template batch_size = 0 时补扫仍逐块推进（不得零推进却标�
     try std.testing.expectEqual(@as(u64, 500), clampBatchSize(500));
 }
 
+test "template 地址分块不重不漏（整除/有余/max>len/max==0 防御）" {
+    const addrs = [_][]const u8{ "0xA", "0xB", "0xC", "0xD", "0xE" };
+    const per_one = [_][2]usize{ .{ 0, 1 }, .{ 1, 2 }, .{ 2, 3 }, .{ 3, 4 }, .{ 4, 5 } };
+    const Case = struct { max: u32, bounds: []const [2]usize };
+    const cases = [_]Case{
+        .{ .max = 5, .bounds = &.{.{ 0, 5 }} }, // 整除：恰好一块
+        .{ .max = 3, .bounds = &.{ .{ 0, 3 }, .{ 3, 5 } } }, // 有余：末块短
+        .{ .max = 2, .bounds = &.{ .{ 0, 2 }, .{ 2, 4 }, .{ 4, 5 } } },
+        .{ .max = 1, .bounds = &per_one }, // 逐地址
+        .{ .max = 10, .bounds = &.{.{ 0, 5 }} }, // max > len：单块
+        .{ .max = 0, .bounds = &per_one }, // 防御：夹紧为 1，绝不能零推进（否则永不前进）
+    };
+    for (cases) |cs| {
+        var chunk: usize = 0;
+        while (addressChunkAt(addrs.len, cs.max, chunk)) |b| : (chunk += 1) {
+            try std.testing.expect(chunk < cs.bounds.len);
+            try std.testing.expectEqual(cs.bounds[chunk], b);
+        }
+        // 块数精确匹配：少一块（漏地址）或多一块（重复）都会在这里红
+        try std.testing.expectEqual(cs.bounds.len, chunk);
+    }
+
+    // 空集合：一块都没有 → 主 sweep 一次请求都不发（携转约束 1 的纯函数侧）
+    try std.testing.expect(addressChunkAt(0, 5, 0) == null);
+    // 上限夹紧（0 视为 1）
+    try std.testing.expectEqual(@as(usize, 1), clampAddressBatch(0));
+    try std.testing.expectEqual(@as(usize, 200), clampAddressBatch(200));
+    try std.testing.expectEqual(@as(u32, 200), default_max_addresses_per_request);
+}
+
 test "template 地址集合去重/补扫流转" {
     const alloc = std.testing.allocator;
     var set = TemplateAddressSet.init(alloc);
@@ -2003,4 +2114,168 @@ test "事件回调携带日志来源地址（真实 processLog 路径）" {
 
     try std.testing.expectEqualStrings("CurveCreated", seen_event.?);
     try std.testing.expectEqualStrings("0xSINGLE", seen_addr.?);
+}
+
+// 同一形态不变量（Task 12）：事件行 / 回调里的来源地址与 discoverAddress 落
+// template_addresses 的形态必须一致（都是小写 hex）——`?address=` 与 GraphQL 是精确匹配，
+// 大小写不同会让同一 clone 的数据"查得到一行、查不到另一行"（Anvil 全小写所以 e2e 测不出）。
+test "processLog 落库地址归一化：与 discoverAddress 同形态（精确匹配查得到）" {
+    const alloc = std.testing.allocator;
+    const db_cfg = db.DatabaseConfig{ .db_type = "sqlite", .db_name = ":memory:", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var database = try db.Client.init(alloc, &db_cfg);
+    defer database.deinit();
+    try database.migrate();
+
+    var rpc_cfg = config.RpcConfig{ .url = "", .retry_count = 0, .retry_delay_ms = 0, .request_timeout_ms = 0, .max_concurrent = 0 };
+    var rpc = eth_rpc.Client.init(alloc, undefined, &rpc_cfg);
+    defer rpc.deinit();
+
+    const contract = config.ContractConfig{
+        .name = "curve",
+        .address = "",
+        .abi_path = "",
+        .from_block = 0,
+        .events = &.{"Buy"},
+        .start_block = null,
+        .block_batch_size = null,
+        .poll_interval_ms = null,
+        .max_reorg_depth = null,
+        .filters = &.{},
+    };
+
+    const inputs = try alloc.alloc(abi.AbiEventInput, 1);
+    inputs[0] = .{ .name = try alloc.dupe(u8, "curve"), .type = try alloc.dupe(u8, "uint256"), .indexed = false };
+    const events = try alloc.alloc(abi.AbiEvent, 1);
+    events[0] = .{ .name = try alloc.dupe(u8, "Buy"), .inputs = inputs, .signature = std.mem.zeroes([32]u8) };
+    var ac = abi.AbiContract{ .events = events, .functions = try alloc.alloc(abi.AbiFunction, 0) };
+    try database.autoMigrateContract("curve", &ac, &.{"Buy"}, "");
+
+    var idx = testIndexerWithDb(alloc, &database, &rpc, &contract);
+    defer idx.deinit();
+    idx.abi_contract = ac;
+    idx.setTemplateMode(true);
+
+    // 节点返回的 raw 形态是 mixed-case（Anvil 全小写，真实链上常见 mixed-case）
+    const MIXED = "0xAbCdEf0123456789AbCdEf0123456789AbCdEf01";
+
+    var topic0_buf: [66]u8 = undefined;
+    @memset(&topic0_buf, '0');
+    topic0_buf[0] = '0';
+    topic0_buf[1] = 'x';
+    var data_buf: [66]u8 = undefined;
+    @memset(&data_buf, '0');
+    data_buf[0] = '0';
+    data_buf[1] = 'x';
+    data_buf[65] = '7';
+    var topics = [_][]const u8{&topic0_buf};
+
+    // 回调里的地址切片只在本次回调期间有效（消费者要么当场建 JS 字符串、要么 dupe：
+    // 见 js_engine.handleEvent / event_bus.Event.clone），故测试当场拷贝出来再断言。
+    var seen_buf: [42]u8 = undefined;
+    var seen_len: usize = 0;
+    const Ctx = struct {
+        buf: *[42]u8,
+        len: *usize,
+        fn cb(ctx: ?*anyopaque, _: []const u8, _: []const u8, _: []const db.DecodedField, _: u64, _: u64, contract_address: []const u8) void {
+            const p: *@This() = @ptrCast(@alignCast(ctx.?));
+            const n = @min(contract_address.len, p.buf.len);
+            @memcpy(p.buf[0..n], contract_address[0..n]);
+            p.len.* = n;
+        }
+    };
+    var ctx = Ctx{ .buf = &seen_buf, .len = &seen_len };
+    idx.setEventCallback(&ctx, Ctx.cb);
+
+    try idx.processLog(.{
+        .address = MIXED,
+        .topics = &topics,
+        .data = &data_buf,
+        .block_number = 7,
+        .transaction_hash = "0xtx",
+        .log_index = 0,
+    });
+
+    // 事件行必须是归一化（小写）形态，而不是 raw 的 mixed-case
+    const rows = try database.ponderQuery("SELECT contract_address FROM event_curve_Buy;", &.{});
+    defer database.freeQueryRows(rows);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualStrings("0xabcdef0123456789abcdef0123456789abcdef01", rows[0].values[0].text);
+    // 回调（→ handler / SSE / GraphQL 过滤）与落库共用同一形态
+    try std.testing.expectEqualStrings("0xabcdef0123456789abcdef0123456789abcdef01", seen_buf[0..seen_len]);
+}
+
+// 模板模式下 `rollbackFromBlock` 是多语句事务，工厂线程的单语句 `addTemplateAddress`
+// 若落在同一事务里，回滚（失败时的 ROLLBACK）会把这条**不该删**的地址行一起丢弃：
+// 内存里该 clone 仍存活，但重启后库里没有它 → 不再进 live → 主 sweep 不再覆盖它。
+// 这里用同一连接上的 BEGIN / INSERT / ROLLBACK 确定性地复现该状态。
+test "rollbackTo 把仍存活的 clone 地址幂等补回（被回滚吞掉的插入）" {
+    const alloc = std.testing.allocator;
+    const db_cfg = db.DatabaseConfig{ .db_type = "sqlite", .db_name = ":memory:", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var database = try db.Client.init(alloc, &db_cfg);
+    defer database.deinit();
+    try database.migrate();
+
+    var rpc_cfg = config.RpcConfig{ .url = "", .retry_count = 0, .retry_delay_ms = 0, .request_timeout_ms = 0, .max_concurrent = 0 };
+    var rpc = eth_rpc.Client.init(alloc, undefined, &rpc_cfg);
+    defer rpc.deinit();
+
+    const contract = config.ContractConfig{
+        .name = "curve",
+        .address = "",
+        .abi_path = "",
+        .from_block = 0,
+        .events = &.{},
+        .start_block = null,
+        .block_batch_size = null,
+        .poll_interval_ms = null,
+        .max_reorg_depth = null,
+        .filters = &.{},
+    };
+    var idx = testIndexerWithDb(alloc, &database, &rpc, &contract);
+    defer idx.deinit();
+    idx.setTemplateMode(true);
+
+    const live = "0xabcdef0123456789abcdef0123456789abcdef01";
+    const after_fork = "0x1111111111111111111111111111111111111111";
+
+    // 工厂线程发现 clone：插入恰好落在回滚已开启的事务里
+    _ = try database.ponderExec("BEGIN;", &.{});
+    idx.discoverAddress(live, 100);
+    // 回滚 → 同一连接上的插入被一起丢弃（内存集合仍认为该 clone 存活）
+    _ = try database.ponderExec("ROLLBACK;", &.{});
+
+    {
+        const list = try database.listTemplateAddresses("curve");
+        defer {
+            for (list) |item| alloc.free(item.address);
+            alloc.free(list);
+        }
+        // 前提：DB 里这一行没了（内存里还在 pending）
+        try std.testing.expectEqual(@as(usize, 0), list.len);
+    }
+
+    idx.markAddressBackfilled(live); // 补扫完成 → 并入 live（此时 DB 里没有行可标）
+    try std.testing.expectEqual(@as(usize, 1), idx.templateAddressCount());
+
+    // fork 之后发现的 clone：回滚应当作废它，且补偿逻辑不得把它复活
+    idx.discoverAddress(after_fork, 300);
+
+    idx.rollbackTo(200);
+
+    const list = try database.listTemplateAddresses("curve");
+    defer {
+        for (list) |item| alloc.free(item.address);
+        alloc.free(list);
+    }
+    // 仍存活的 live 地址被幂等补回，from_block 保持发现块（不覆盖已有进度）
+    try std.testing.expectEqual(@as(usize, 1), list.len);
+    try std.testing.expectEqualStrings(live, list[0].address);
+    try std.testing.expectEqual(@as(u64, 100), list[0].from_block);
+    // 补回走的是 `addTemplateAddress`（INSERT ... DO NOTHING），新行的 backfilled 是默认 0：
+    // 本进程内存里它已是 live，不受影响；重启后它会重新进 pending 补扫一次——与
+    // `markAddressBackfilled` 落库失败时的既有降级一致（幂等，重复行由唯一键兜底）。
+    try std.testing.expect(!list[0].backfilled);
+    // 内存集合与 DB 一致
+    try std.testing.expectEqual(@as(usize, 1), idx.templateAddressCount());
+    try std.testing.expectEqualStrings(live, idx.template_set.all()[0]);
 }

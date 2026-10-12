@@ -75,8 +75,10 @@ const TemplateRegistry = struct {
 /// `loadTemplateAddresses()`——后者在非模板模式下返回 `error.NotTemplateMode`，
 /// 顺序写反会让启动期 fail-fast 静默失效。读库错误（含 RocksDB 的
 /// `UnsupportedOperation`）必须上抛，不能吞掉。
-fn enableTemplateRuntime(idx: *indexer.Indexer, template_name: []const u8) !void {
+/// `max_addresses_per_request` 也在这里落到索引器上（模板配置 → 运行期默认值 200）。
+fn enableTemplateRuntime(idx: *indexer.Indexer, template_name: []const u8, max_addresses_per_request: ?u32) !void {
     idx.setTemplateMode(true);
+    idx.setMaxAddressesPerRequest(max_addresses_per_request);
     idx.loadTemplateAddresses() catch |e| {
         log.err("模板 {s}: 启动期恢复 clone 地址失败: {any}", .{ template_name, e });
         return e;
@@ -321,7 +323,7 @@ pub fn main(init: std.process.Init) !void {
             };
             const idx_ptr = &indexers.items[indexers.items.len - 1];
             // 硬约束：先 setTemplateMode(true) 再 loadTemplateAddresses()（携转约束 1）
-            try enableTemplateRuntime(idx_ptr, t.name);
+            try enableTemplateRuntime(idx_ptr, t.name, t.max_addresses_per_request);
             log.info("模板索引器: {s} (abi={s}) 起始={d} 事件={d}", .{ t.name, t.abi_path, t.from_block, t.events.len });
         }
         // 全部 append 完成后才取指针（ArrayList 增长会搬移元素）
@@ -927,7 +929,10 @@ test "模板分发表: 工厂发现经 hook 喂入对应模板的地址集合" {
 
     // 启动顺序硬约束（携转约束 1）：调用即成功，等价于"先 setTemplateMode(true)
     // 再 loadTemplateAddresses()"。顺序写反会返回 error.NotTemplateMode → 测试变红。
-    try enableTemplateRuntime(&idx, "curve");
+    try enableTemplateRuntime(&idx, "curve", null);
+    // 模板配置未给 max_addresses_per_request → 运行期默认值（不能是 0：0 会让分块零推进）
+    try std.testing.expectEqual(indexer.default_max_addresses_per_request, idx.getMaxAddressesPerRequest());
+    try std.testing.expect(idx.getMaxAddressesPerRequest() > 0);
 
     var registry = TemplateRegistry{};
     defer registry.deinit(alloc);
