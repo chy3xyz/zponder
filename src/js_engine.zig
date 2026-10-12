@@ -533,7 +533,7 @@ pub const JsEngine = struct {
     }
 
     /// 事件触发入口（indexer 线程）：查找匹配 handler 并执行
-    pub fn handleEvent(self: *JsEngine, contract_name: []const u8, event_name: []const u8, fields: []const db.DecodedField, block_number: u64, block_timestamp: u64, contract_address: []const u8) void {
+    pub fn handleEvent(self: *JsEngine, contract_name: []const u8, event_name: []const u8, fields: []const db.DecodedField, block_number: u64, block_timestamp: u64, contract_address: []const u8, tx_hash: []const u8, log_index: u64) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
 
@@ -563,6 +563,12 @@ pub const JsEngine = struct {
         _ = c.JS_SetPropertyStr(ctx, event_obj, "args", args_obj);
         const ca = c.JS_NewStringLen(ctx, contract_address.ptr, contract_address.len);
         _ = c.JS_SetPropertyStr(ctx, event_obj, "contractAddress", ca);
+        // 交易位置：与 contractAddress 一样是扁平字段。投影表拿它当主键
+        // （tx_hash + log_index 唯一确定一条日志），才能跳区块浏览器。
+        const th = c.JS_NewStringLen(ctx, tx_hash.ptr, tx_hash.len);
+        _ = c.JS_SetPropertyStr(ctx, event_obj, "transactionHash", th);
+        const li = c.JS_NewInt64(ctx, @intCast(log_index));
+        _ = c.JS_SetPropertyStr(ctx, event_obj, "logIndex", li);
         const block_obj = c.JS_NewObject(ctx);
         const bn = c.JS_NewInt64(ctx, @intCast(block_number));
         _ = c.JS_SetPropertyStr(ctx, block_obj, "number", bn);
@@ -852,7 +858,7 @@ test "js engine ponder.on 注册与事件触发" {
 
     // 触发事件（Contract:Event 与 Event 两种写法都应匹配）
     const fields = [_]db.DecodedField{.{ .name = "value", .value = "100" }};
-    engine.handleEvent("dai", "Transfer", &fields, 123, 1700000000, "0xDAI");
+    engine.handleEvent("dai", "Transfer", &fields, 123, 1700000000, "0xDAI", "0xhash1", 1);
 
     // 验证 handler 被调用
     try engine.evalScript("if (received !== 123) throw new Error('handler not called: ' + received);", "check.js");
@@ -869,7 +875,7 @@ test "js engine ponder.on Contract:Event 全名匹配" {
     , "test.js");
 
     const fields = [_]db.DecodedField{.{ .name = "value", .value = "0x64" }};
-    engine.handleEvent("Dai", "Transfer", &fields, 1, 1700000000, "0xDAI");
+    engine.handleEvent("Dai", "Transfer", &fields, 1, 1700000000, "0xDAI", "0xhash2", 2);
 
     try engine.evalScript("if (hit !== '0x64') throw new Error('not hit: ' + hit);", "check.js");
 }
@@ -1041,7 +1047,7 @@ test "js engine event.block.timestamp 注入" {
     , "test.js");
 
     const fields = [_]db.DecodedField{.{ .name = "value", .value = "1" }};
-    engine.handleEvent("dai", "Transfer", &fields, 5, 1700000123, "0xDAI");
+    engine.handleEvent("dai", "Transfer", &fields, 5, 1700000123, "0xDAI", "0xhash3", 3);
 
     try engine.evalScript("if (ts !== 1700000123) throw new Error('ts=' + ts);", "check.js");
 }
@@ -1057,7 +1063,30 @@ test "js engine event.contractAddress 注入" {
     , "test.js");
 
     const fields = [_]db.DecodedField{.{ .name = "value", .value = "1" }};
-    engine.handleEvent("curve", "Transfer", &fields, 5, 1700000123, "0xCLONE");
+    engine.handleEvent("curve", "Transfer", &fields, 5, 1700000123, "0xCLONE", "0xhash", 0);
 
     try engine.evalScript("if (ca !== '0xCLONE') throw new Error('ca=' + ca);", "check.js");
+}
+
+test "js engine event.transactionHash / logIndex 注入" {
+    const alloc = std.testing.allocator;
+    var engine = try JsEngine.init(alloc, undefined);
+    defer engine.deinit();
+
+    try engine.evalScript(
+        \\var th = null, li = null;
+        \\ponder.on("Transfer", function(event) {
+        \\  th = event.transactionHash;
+        \\  li = event.logIndex;
+        \\});
+    , "test.js");
+
+    const fields = [_]db.DecodedField{.{ .name = "value", .value = "1" }};
+    const tx = "0xabc0000000000000000000000000000000000000000000000000000000000001";
+    engine.handleEvent("curve", "Transfer", &fields, 5, 1700000123, "0xCLONE", tx, 7);
+
+    try engine.evalScript(
+        \\if (th !== "0xabc0000000000000000000000000000000000000000000000000000000000001") throw new Error('th=' + th);
+        \\if (li !== 7) throw new Error('li=' + li);
+    , "check.js");
 }

@@ -32,6 +32,10 @@ pub const EventHookCallback = *const fn (
     block_number: u64,
     block_timestamp: u64,
     contract_address: []const u8,
+    /// 日志在交易内的位置：`(tx_hash, log_index)` 唯一确定一条日志，
+    /// 投影表要靠它给出可跳区块浏览器的稳定主键。
+    tx_hash: []const u8,
+    log_index: u64,
 ) void;
 
 /// 模板模式下一个待补扫的 clone：发现区块起，补扫到"探测时的游标"为止。
@@ -1259,7 +1263,17 @@ pub const Indexer = struct {
                         // 事件来源地址：模板模式下是该事件所属的 clone；单合约模式下
                         // getLogs 只过滤 contract.address，故 lg.address 即 contract.address
                         // （与上方 insertEventLog 同一条不变量，共用同一归一化结果）。
-                        cb(self.event_callback_ctx, self.contract.name, evt.name, db_fields.items, lg.block_number, block_ts, source_address);
+                        cb(
+                            self.event_callback_ctx,
+                            self.contract.name,
+                            evt.name,
+                            db_fields.items,
+                            lg.block_number,
+                            block_ts,
+                            source_address,
+                            lg.transaction_hash,
+                            lg.log_index,
+                        );
                     }
                     return;
                 }
@@ -2096,7 +2110,7 @@ test "事件回调携带日志来源地址（真实 processLog 路径）" {
         addr: *?[]const u8,
         event: *?[]const u8,
         count: *u32,
-        fn cb(ctx: ?*anyopaque, _: []const u8, event_name: []const u8, _: []const db.DecodedField, _: u64, _: u64, contract_address: []const u8) void {
+        fn cb(ctx: ?*anyopaque, _: []const u8, event_name: []const u8, _: []const db.DecodedField, _: u64, _: u64, contract_address: []const u8, _: []const u8, _: u64) void {
             const self_ptr: *@This() = @ptrCast(@alignCast(ctx.?));
             self_ptr.addr.* = contract_address;
             self_ptr.event.* = event_name;
@@ -2211,7 +2225,7 @@ test "processLog 落库地址归一化：与 discoverAddress 同形态（精确�
     const Ctx = struct {
         buf: *[42]u8,
         len: *usize,
-        fn cb(ctx: ?*anyopaque, _: []const u8, _: []const u8, _: []const db.DecodedField, _: u64, _: u64, contract_address: []const u8) void {
+        fn cb(ctx: ?*anyopaque, _: []const u8, _: []const u8, _: []const db.DecodedField, _: u64, _: u64, contract_address: []const u8, _: []const u8, _: u64) void {
             const p: *@This() = @ptrCast(@alignCast(ctx.?));
             const n = @min(contract_address.len, p.buf.len);
             @memcpy(p.buf[0..n], contract_address[0..n]);

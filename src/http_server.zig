@@ -124,10 +124,12 @@ fn buildEventCacheKey(
 /// 序列化一条 SSE 事件的 `data:` 载荷（不含 `event:` 前缀与结尾空行）。
 /// `contract_address` 与事件表列名一致（REST `/events` 返回的行也是这个键）。
 fn writeSsePayload(w: *std.Io.Writer, ev: *const eb.Event) !void {
-    try w.print("{{\"contract\":\"{s}\",\"contract_address\":\"{s}\",\"block_number\":{d},\"fields\":{{", .{
+    try w.print("{{\"contract\":\"{s}\",\"contract_address\":\"{s}\",\"block_number\":{d},\"tx_hash\":\"{s}\",\"log_index\":{d},\"fields\":{{", .{
         ev.contract_name,
         ev.contract_address,
         ev.block_number,
+        ev.tx_hash,
+        ev.log_index,
     });
     for (ev.fields, 0..) |f, i| {
         if (i > 0) try w.writeByte(',');
@@ -1427,7 +1429,7 @@ test "?address= 解析结果透传到 queryEventLogs" {
     try std.testing.expect(std.mem.indexOf(u8, json_str, "0xA") == null);
 }
 
-test "SSE 载荷含 contract_address" {
+test "SSE 载荷含 contract_address 与 tx_hash/log_index" {
     const alloc = std.testing.allocator;
     const fields = [_]db.DecodedField{ .{ .name = "value", .value = "1" }, .{ .name = "to", .value = "0xBB" } };
     const ev = eb.Event{
@@ -1436,6 +1438,8 @@ test "SSE 载荷含 contract_address" {
         .contract_address = "0xCLONE",
         .block_number = 5,
         .block_timestamp = 1700000123,
+        .tx_hash = "0xTX",
+        .log_index = 4,
         .fields = @constCast(&fields),
     };
 
@@ -1444,7 +1448,7 @@ test "SSE 载荷含 contract_address" {
     try writeSsePayload(&out.writer, &ev);
 
     try std.testing.expectEqualStrings(
-        "{\"contract\":\"curve\",\"contract_address\":\"0xCLONE\",\"block_number\":5,\"fields\":{\"value\":\"1\",\"to\":\"0xBB\"}}",
+        "{\"contract\":\"curve\",\"contract_address\":\"0xCLONE\",\"block_number\":5,\"tx_hash\":\"0xTX\",\"log_index\":4,\"fields\":{\"value\":\"1\",\"to\":\"0xBB\"}}",
         out.written(),
     );
 }

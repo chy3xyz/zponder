@@ -418,12 +418,14 @@ pub fn main(init: std.process.Init) !void {
             block_number: u64,
             block_timestamp: u64,
             contract_address: []const u8,
+            tx_hash: []const u8,
+            log_index: u64,
         ) void {
             if (ctx_ptr) |ptr| {
                 const self_ptr: *@This() = @ptrCast(@alignCast(ptr));
                 self_ptr.script_eng.processEvent(contract_name, event_name, fields, block_number);
-                self_ptr.js_eng.handleEvent(contract_name, event_name, fields, block_number, block_timestamp, contract_address);
-                self_ptr.bus.publish(contract_name, event_name, contract_address, fields, block_number, block_timestamp);
+                self_ptr.js_eng.handleEvent(contract_name, event_name, fields, block_number, block_timestamp, contract_address, tx_hash, log_index);
+                self_ptr.bus.publish(contract_name, event_name, contract_address, fields, block_number, block_timestamp, tx_hash, log_index);
             }
         }
     };

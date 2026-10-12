@@ -9,9 +9,12 @@ pub const Event = struct {
     contract_address: []const u8,
     block_number: u64,
     block_timestamp: u64,
+    /// 日志在交易内的位置：`(tx_hash, log_index)` 唯一确定一条日志。
+    tx_hash: []const u8,
+    log_index: u64,
     fields: []db.DecodedField,
 
-    pub fn clone(alloc: std.mem.Allocator, contract_name: []const u8, event_name: []const u8, contract_address: []const u8, fields: []const db.DecodedField, block_number: u64, block_timestamp: u64) !Event {
+    pub fn clone(alloc: std.mem.Allocator, contract_name: []const u8, event_name: []const u8, contract_address: []const u8, fields: []const db.DecodedField, block_number: u64, block_timestamp: u64, tx_hash: []const u8, log_index: u64) !Event {
         const fields_copy = try alloc.alloc(db.DecodedField, fields.len);
         var filled: usize = 0;
         errdefer {
@@ -35,12 +38,16 @@ pub const Event = struct {
         errdefer alloc.free(en);
         const ca = try alloc.dupe(u8, contract_address);
         errdefer alloc.free(ca);
+        const th = try alloc.dupe(u8, tx_hash);
+        errdefer alloc.free(th);
         return .{
             .contract_name = cn,
             .event_name = en,
             .contract_address = ca,
             .block_number = block_number,
             .block_timestamp = block_timestamp,
+            .tx_hash = th,
+            .log_index = log_index,
             .fields = fields_copy,
         };
     }
@@ -49,6 +56,7 @@ pub const Event = struct {
         alloc.free(self.contract_name);
         alloc.free(self.event_name);
         alloc.free(self.contract_address);
+        alloc.free(self.tx_hash);
         for (self.fields) |f| {
             alloc.free(f.name);
             alloc.free(f.value);
@@ -158,17 +166,17 @@ pub const EventBus = struct {
     }
 
     /// 广播事件到所有订阅者（每个订阅者深拷贝一份）。
-    pub fn publish(self: *EventBus, contract_name: []const u8, event_name: []const u8, contract_address: []const u8, fields: []const db.DecodedField, block_number: u64, block_timestamp: u64) void {
+    pub fn publish(self: *EventBus, contract_name: []const u8, event_name: []const u8, contract_address: []const u8, fields: []const db.DecodedField, block_number: u64, block_timestamp: u64, tx_hash: []const u8, log_index: u64) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
         for (self.subscribers.items) |s| {
-            const ev = Event.clone(self.alloc, contract_name, event_name, contract_address, fields, block_number, block_timestamp) catch continue;
+            const ev = Event.clone(self.alloc, contract_name, event_name, contract_address, fields, block_number, block_timestamp, tx_hash, log_index) catch continue;
             s.push(ev);
         }
     }
 };
 
-test "EventBus publish/clone 深拷贝 contract_address 且 deinit 不泄漏" {
+test "EventBus publish/clone 深拷贝 contract_address 与 tx_hash 且 deinit 不泄漏" {
     const alloc = std.testing.allocator;
     var bus = EventBus.init(alloc);
     defer bus.deinit();
@@ -177,7 +185,7 @@ test "EventBus publish/clone 深拷贝 contract_address 且 deinit 不泄漏" {
 
     const fields = [_]db.DecodedField{.{ .name = "value", .value = "1" }};
     // 入参是栈上字面量：clone 必须 dupe，ev.deinit 释放的是自己那份
-    bus.publish("curve", "Transfer", "0xCLONE", &fields, 5, 1700000123);
+    bus.publish("curve", "Transfer", "0xCLONE", &fields, 5, 1700000123, "0xTXHASH", 9);
 
     var ev = sub.next(undefined) orelse return error.TestUnexpectedResult;
     defer ev.deinit(alloc);
@@ -186,6 +194,9 @@ test "EventBus publish/clone 深拷贝 contract_address 且 deinit 不泄漏" {
     try std.testing.expectEqualStrings("Transfer", ev.event_name);
     try std.testing.expectEqualStrings("0xCLONE", ev.contract_address);
     try std.testing.expectEqual(@as(u64, 1700000123), ev.block_timestamp);
+    try std.testing.expectEqualStrings("0xTXHASH", ev.tx_hash);
+    try std.testing.expectEqual(@as(u64, 9), ev.log_index);
     // 深拷贝：指针与入参不同（独立所有权）
     try std.testing.expect(ev.contract_address.ptr != "0xCLONE".ptr);
+    try std.testing.expect(ev.tx_hash.ptr != "0xTXHASH".ptr);
 }
