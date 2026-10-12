@@ -37,7 +37,7 @@
 |--------------------|-----------------------------------------------|
 | Language           | Zig 0.17.0                                    |
 | Script Engine      | Native Embedded QuickJS-ng C Runtime (v0.17.0) |
-| Storage            | SQLite (with `read_db` pool) / RocksDB / PostgreSQL |
+| Storage            | SQLite (with `read_db` pool) / RocksDB / PostgreSQL（后两者是可选构建特性，见 Build & Run） |
 | HTTP Server        | `std.http.Server` + `std.Io`                 |
 | GraphQL Engine     | [zgraphql](https://github.com/chy3xyz/zgraphql) v0.8.0 (vendored) |
 | RPC Client         | HTTP JSON-RPC failover + optional WSS `eth_subscribe` |
@@ -168,6 +168,12 @@ zponder/
 ```bash
 # Debug build & test
 zig build test
+
+# Release build；RocksDB / PostgreSQL 是可选特性（默认 on），
+# 关掉后二进制不再链接 librocksdb / libpq（发布包就是这个模式）。
+zig build -Doptimize=ReleaseFast
+zig build -Doptimize=ReleaseFast -Drocksdb=false -Dpostgres=false
+zig build test -Drocksdb=false -Dpostgres=false
 
 # Install fast release binary
 ./install.sh

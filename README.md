@@ -73,6 +73,30 @@ npm install -g zponder
 git clone https://github.com/chy3xyz/zponder.git && cd zponder && ./install.sh
 ```
 
+### 构建矩阵（可选后端）
+
+RocksDB 与 PostgreSQL 是**可选构建特性**，默认都开启：
+
+| 构建 | 命令 | 动态依赖 | 适用场景 |
+| :--- | :--- | :--- | :--- |
+| 默认 | `zig build -Doptimize=ReleaseFast` | sqlite3 + librocksdb + libpq | 需要三种后端，机器上已装 rocksdb / libpq 开发包 |
+| sqlite-only | `zig build -Doptimize=ReleaseFast -Drocksdb=false -Dpostgres=false` | sqlite3 | 发布/分发：干净机器上直接能跑 |
+
+npm 上的预编译二进制即 sqlite-only —— 此前它动态依赖 `librocksdb.11.dylib`
+（CI 的 brew rocksdb 版本）与 `libpq.5.dylib`，在没装这两个库的机器上启动就
+`dyld: Library not loaded`，等于不可用。关闭后端后，把它们当作
+`database.type` 使用会在启动时明确报错（`RocksDbSupportNotCompiled` /
+`PostgresSupportNotCompiled`），不会被静默忽略。
+
+要自己带后端构建：
+
+```bash
+# 依赖：brew install rocksdb libpq   /   apt-get install librocksdb-dev libpq-dev
+zig build -Doptimize=ReleaseFast                          # 两者都开（默认）
+zig build -Doptimize=ReleaseFast -Drocksdb=false          # 只关 RocksDB
+zig build -Doptimize=ReleaseFast -Dpostgres=false         # 只关 PostgreSQL
+```
+
 ### Index your first contract
 
 ```bash

@@ -29,6 +29,16 @@ zponder -c config.toml
 - **Rate Limiting** — token-bucket for both REST and GraphQL
 - **Reorg Detection** — automatic fork detection and rollback
 
+## Storage backends
+
+The npm binaries are built **sqlite-only** (`-Drocksdb=false -Dpostgres=false`) so
+they run on any machine without a matching `librocksdb` / `libpq`. Setting
+`database.type = "rocksdb"` (or `"postgresql"`) with these binaries fails fast at
+startup with a clear error instead of a dynamic-loader crash.
+
+Need RocksDB or PostgreSQL? Build from source with the backends enabled (see below);
+both are on by default there.
+
 ## Platforms
 
 Pre-built binaries for:
@@ -45,11 +55,13 @@ Pre-built binaries for:
 ```bash
 git clone https://github.com/chy3xyz/zponder.git
 cd zponder
-zig build -Doptimize=ReleaseFast
+zig build -Doptimize=ReleaseFast                     # 三种后端全开（默认）
+zig build -Doptimize=ReleaseFast -Drocksdb=false -Dpostgres=false   # sqlite-only
 ./zig-out/bin/zponder -c config.toml
 ```
 
-Requirements: [Zig](https://ziglang.org/) 0.17.0+, sqlite3, rocksdb (optional), libpq (optional for PostgreSQL)
+Requirements: [Zig](https://ziglang.org/) 0.17.0+, sqlite3; rocksdb / libpq are
+only needed for the default build — pass `-Drocksdb=false -Dpostgres=false` to skip them.
 
 ## Documentation
 
