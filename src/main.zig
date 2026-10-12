@@ -71,6 +71,33 @@ const TemplateRegistry = struct {
     }
 };
 
+/// 把工厂条目关联到匹配的索引器。发现源有两种：
+///  · `address` —— 匹配具体合约地址（老语义）
+///  · `from_template` —— 匹配模板索引器（其合成配置的 `name` 即模板名），
+///    于是「被发现的 clone 自己发出的事件」也能作为发现源（如 pair）。
+/// 一个索引器可以同时是多个工厂条目的发现源，故用 append 累积、且不 break。
+/// 抽成独立函数是为了能在单测里直接验证匹配规则与多条目累积。
+fn associateFactorySources(
+    alloc: std.mem.Allocator,
+    factories: []const config.FactoryConfig,
+    indexers: []indexer.Indexer,
+    factory_manager: *factory.FactoryManager,
+) !void {
+    for (factories, 0..) |fc, fi| {
+        for (indexers) |*idx| {
+            const is_source = if (fc.from_template.len > 0)
+                std.mem.eql(u8, fc.from_template, idx.contract.name)
+            else
+                std.mem.eql(u8, fc.address, idx.contract.address);
+            if (!is_source) continue;
+            idx.factory_ctx = factory_manager;
+            idx.factory_callback = factory.FactoryManager.onFactoryEventCallback;
+            try idx.factory_idxs.append(alloc, fi);
+            log.info("工厂 {s}: 已关联到索引器 {s}", .{ fc.name, idx.contract.name });
+        }
+    }
+}
+
 /// 启动顺序硬约束（携转约束 1）：必须先 `setTemplateMode(true)` 再
 /// `loadTemplateAddresses()`——后者在非模板模式下返回 `error.NotTemplateMode`，
 /// 顺序写反会让启动期 fail-fast 静默失效。读库错误（含 RocksDB 的
@@ -290,7 +317,6 @@ pub fn main(init: std.process.Init) !void {
             cfg.global.chain,
             null,
             null,
-            0,
         );
         try indexers.append(alloc, idx);
         log.info("索引器: {s} ({s}) 起始={d} 事件={d}", .{
@@ -334,7 +360,6 @@ pub fn main(init: std.process.Init) !void {
                 cfg.global.chain,
                 null,
                 null,
-                0,
             );
             indexers.append(alloc, idx) catch |e| {
                 // append 失败时这个 Indexer 尚未被 indexers 接管，需自行释放
@@ -368,18 +393,8 @@ pub fn main(init: std.process.Init) !void {
             cfg.global.track_blocks,
         );
 
-        // 将工厂回调关联到匹配的索引器
-        for (cfg.factories, 0..) |fc, fi| {
-            for (indexers.items) |*idx| {
-                if (std.mem.eql(u8, fc.address, idx.contract.address)) {
-                    idx.factory_ctx = &factory_manager.?;
-                    idx.factory_callback = factory.FactoryManager.onFactoryEventCallback;
-                    idx.factory_idx = fi;
-                    log.info("工厂 {s}: 已关联到索引器 {s}", .{ fc.name, idx.contract.name });
-                    break;
-                }
-            }
-        }
+        // 将工厂回调关联到匹配的索引器（发现源 = 具体合约地址 或 模板名）
+        try associateFactorySources(alloc, cfg.factories, indexers.items, &factory_manager.?);
 
         // 模板分发表：工厂发现 → 对应模板索引器的 discoverAddress（老 factory 行为不变）
         if (cfg.templates.len > 0) {
@@ -1002,7 +1017,7 @@ test "模板分发表: 工厂发现经 hook 喂入对应模板的地址集合" {
         .block_batch_size = null,
         .filters = &.{},
     };
-    var idx = try indexer.Indexer.init(alloc, io, &rpc, &database, &curve_cfg, 0, false, "bsc", null, null, 0);
+    var idx = try indexer.Indexer.init(alloc, io, &rpc, &database, &curve_cfg, 0, false, "bsc", null, null);
     defer idx.deinit();
 
     // 启动顺序硬约束（携转约束 1）：调用即成功，等价于"先 setTemplateMode(true)
@@ -1032,6 +1047,118 @@ test "模板分发表: 工厂发现经 hook 喂入对应模板的地址集合" {
     // 未注册的模板名：告警后忽略，不得崩溃或串到别的模板
     TemplateRegistry.onDiscovery(&registry, "ghost", "0xAbCdEf0123456789AbCdEf0123456789AbCdEf01", 1);
     try std.testing.expectEqual(@as(usize, 1), idx.templateAddressCount());
+}
+
+test "工厂发现源为模板（from_template）：clone 事件喂入第二个模板" {
+    const alloc = std.testing.allocator;
+    var backend = std.Io.Threaded.init(alloc, .{});
+    defer backend.deinit();
+    const io = backend.io();
+
+    const db_cfg = db.DatabaseConfig{
+        .db_type = "sqlite",
+        .db_name = ":memory:",
+        .wal_mode = true,
+        .busy_timeout_ms = 5000,
+        .max_connections = 10,
+    };
+    var database = try db.Client.init(alloc, &db_cfg);
+    defer database.deinit();
+    try database.migrate();
+
+    const rpc_cfg = config.RpcConfig{ .url = "", .retry_count = 0, .retry_delay_ms = 0, .request_timeout_ms = 0, .max_concurrent = 0 };
+    var rpc = eth_rpc.Client.init(alloc, io, &rpc_cfg);
+    defer rpc.deinit();
+
+    // 发现源模板 curve（clone 地址集合）与目标模板 pair。两个索引器放在数组里：
+    // 关联函数会把指针存进 Indexer（factory_idxs 的宿主必须地址稳定）。
+    const curve_cfg = config.ContractConfig{
+        .name = "curve",
+        .address = "",
+        .abi_path = "",
+        .events = &.{},
+        .from_block = 0,
+        .start_block = null,
+        .poll_interval_ms = null,
+        .max_reorg_depth = null,
+        .block_batch_size = null,
+        .filters = &.{},
+    };
+    const pair_cfg = config.ContractConfig{
+        .name = "pair",
+        .address = "",
+        .abi_path = "",
+        .events = &.{},
+        .from_block = 0,
+        .start_block = null,
+        .poll_interval_ms = null,
+        .max_reorg_depth = null,
+        .block_batch_size = null,
+        .filters = &.{},
+    };
+
+    var indexers: [2]indexer.Indexer = undefined;
+    indexers[0] = try indexer.Indexer.init(alloc, io, &rpc, &database, &curve_cfg, 0, false, "bsc", null, null);
+    defer indexers[0].deinit();
+    indexers[1] = try indexer.Indexer.init(alloc, io, &rpc, &database, &pair_cfg, 0, false, "bsc", null, null);
+    defer indexers[1].deinit();
+    try enableTemplateRuntime(&indexers[0], "curve", null);
+    try enableTemplateRuntime(&indexers[1], "pair", null);
+
+    // 一条工厂规则：发现源是模板 curve，发现到的事件字段 pair → 喂给模板 pair
+    const factories = [_]config.FactoryConfig{.{
+        .name = "pair_discovery",
+        .address = "",
+        .abi_path = "",
+        .creation_event = "Paired",
+        .child_address_field = "pair",
+        .child_abi_path = "",
+        .child_events = &.{},
+        .max_children = 1000,
+        .child_poll_interval_ms = null,
+        .child_batch_size = null,
+        .template_name = "pair",
+        .from_template = "curve",
+    }};
+    var fm = try factory.FactoryManager.init(alloc, io, &rpc, &database, &factories, 0, "bsc", false);
+    defer fm.deinit();
+
+    var registry = TemplateRegistry{};
+    defer registry.deinit(alloc);
+    try registry.register(alloc, "curve", &indexers[0]);
+    try registry.register(alloc, "pair", &indexers[1]);
+    fm.setTemplateHook(&registry, TemplateRegistry.onDiscovery);
+
+    try associateFactorySources(alloc, &factories, &indexers, &fm);
+
+    // 规则挂在发现源 curve 上；pair 自己不是任何规则的发现源
+    try std.testing.expectEqual(@as(usize, 1), indexers[0].factory_idxs.items.len);
+    try std.testing.expectEqual(@as(usize, 0), indexers[1].factory_idxs.items.len);
+
+    // 等价于 indexer.zig 里对 factory_idxs 的分发：curve 的日志里出现 Paired
+    const fields = [_]db.DecodedField{.{ .name = "pair", .value = "0xAbCdEf0123456789AbCdEf0123456789AbCdEf01" }};
+    for (indexers[0].factory_idxs.items) |fi| {
+        factory.FactoryManager.onFactoryEventCallback(indexers[0].factory_ctx.?, fi, "Paired", &fields, 7000);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), indexers[1].templateAddressCount());
+    try std.testing.expectEqual(@as(usize, 0), indexers[0].templateAddressCount());
+    {
+        const list = try database.listTemplateAddresses("pair");
+        defer {
+            for (list) |item| alloc.free(item.address);
+            alloc.free(list);
+        }
+        try std.testing.expectEqual(@as(usize, 1), list.len);
+        try std.testing.expectEqualStrings("0xabcdef0123456789abcdef0123456789abcdef01", list[0].address);
+        try std.testing.expectEqual(@as(u64, 7000), list[0].from_block);
+    }
+
+    // 事件名不匹配 creation_event（Paired）→ 不得误喂
+    for (indexers[0].factory_idxs.items) |fi| {
+        factory.FactoryManager.onFactoryEventCallback(indexers[0].factory_ctx.?, fi, "Buy", &fields, 7100);
+    }
+    try std.testing.expectEqual(@as(usize, 1), indexers[1].templateAddressCount());
 }
 
 test "启动校验: rocksdb + [[templates]] 快速失败（携转约束 2）" {

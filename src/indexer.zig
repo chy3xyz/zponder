@@ -296,7 +296,9 @@ pub const Indexer = struct {
     chain: []const u8,
     factory_ctx: ?*anyopaque,
     factory_callback: ?FactoryCallback,
-    factory_idx: usize,
+    /// 本索引器作为发现源时，挂在其上的工厂规则下标（可多条：一个发现源可以
+    /// 有多条规则，各有 creation_event / child_address_field / 目标模板）。
+    factory_idxs: std.ArrayListUnmanaged(usize) = .empty,
     event_callback_ctx: ?*anyopaque = null,
     event_callback: ?EventHookCallback = null,
     /// 事件回调是否需要链上区块时间戳（JS handler 存在时开启）；
@@ -332,7 +334,6 @@ pub const Indexer = struct {
         chain: []const u8,
         factory_ctx: ?*anyopaque,
         factory_callback: ?FactoryCallback,
-        factory_idx: usize,
     ) !Indexer {
         // 加载 ABI
         var abi_contract: ?abi.AbiContract = null;
@@ -391,7 +392,6 @@ pub const Indexer = struct {
             .chain = chain,
             .factory_ctx = factory_ctx,
             .factory_callback = factory_callback,
-            .factory_idx = factory_idx,
             .template_set = TemplateAddressSet.init(alloc),
         };
     }
@@ -552,6 +552,7 @@ pub const Indexer = struct {
             self.abi_contract = null;
         }
         self.template_set.deinit();
+        self.factory_idxs.deinit(self.alloc);
         self.block_ts_cache.deinit(self.alloc);
         self.block_ts_cache = .empty;
     }
@@ -1255,7 +1256,11 @@ pub const Indexer = struct {
 
                     if (self.factory_callback) |cb| {
                         if (self.factory_ctx) |fctx| {
-                            cb(fctx, self.factory_idx, evt.name, db_fields.items, lg.block_number);
+                            // 一个发现源可以挂多条规则（各有 creation_event /
+                            // child_address_field / 目标模板），逐条喂给工厂管理器。
+                            for (self.factory_idxs.items) |fi| {
+                                cb(fctx, fi, evt.name, db_fields.items, lg.block_number);
+                            }
                         }
                     }
                     if (self.event_callback) |cb| {
@@ -1565,7 +1570,6 @@ test "shouldRecordEvent filtering" {
         .chain = "ethereum",
         .factory_ctx = null,
         .factory_callback = null,
-        .factory_idx = 0,
         .template_set = TemplateAddressSet.init(alloc),
     };
 
@@ -1642,7 +1646,6 @@ test "indexer getStatus and getCurrentBlock" {
         .chain = "ethereum",
         .factory_ctx = null,
         .factory_callback = null,
-        .factory_idx = 0,
         .template_set = TemplateAddressSet.init(alloc),
     };
 
@@ -1997,7 +2000,6 @@ fn testIndexerWithDb(alloc: std.mem.Allocator, database: *db.Client, rpc: *eth_r
         .chain = "bsc",
         .factory_ctx = null,
         .factory_callback = null,
-        .factory_idx = 0,
         .template_set = TemplateAddressSet.init(alloc),
     };
 }

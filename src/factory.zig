@@ -250,7 +250,7 @@ pub const FactoryManager = struct {
             self.alloc, self.io, self.rpc, self.database,
             &child.contract_config, self.snapshot_interval,
             self.track_blocks, self.chain,
-            null, null, 0,
+            null, null,
         );
         errdefer child.idx.deinit();
 
