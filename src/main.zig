@@ -34,6 +34,66 @@ fn setupSignals() void {
     posix.sigaction(posix.SIG.TERM, &sa, null);
 }
 
+/// 模板索引器的分发表：模板个数是个位数，线性查找足够（不上哈希表）。
+/// 装配在 `Indexer.start()` 之前一次完成，此后只读；工厂线程读取安全
+/// （写入与线程启动之间有 happens-before）。只持 `*indexer.Indexer` 指针，
+/// Indexer 的内部不暴露给 factory.zig。
+const TemplateRegistry = struct {
+    names: std.ArrayList([]const u8) = .empty,
+    indexers: std.ArrayList(*indexer.Indexer) = .empty,
+
+    fn deinit(self: *TemplateRegistry, alloc: std.mem.Allocator) void {
+        self.names.deinit(alloc);
+        self.indexers.deinit(alloc);
+    }
+
+    fn register(self: *TemplateRegistry, alloc: std.mem.Allocator, name: []const u8, idx: *indexer.Indexer) !void {
+        try self.names.append(alloc, name);
+        errdefer _ = self.names.pop();
+        try self.indexers.append(alloc, idx);
+    }
+
+    fn find(self: *TemplateRegistry, name: []const u8) ?*indexer.Indexer {
+        for (self.names.items, self.indexers.items) |n, idx| {
+            if (std.mem.eql(u8, n, name)) return idx;
+        }
+        return null;
+    }
+
+    /// 工厂发现的 clone 地址 → 对应模板索引器的动态地址集合。
+    fn onDiscovery(ctx: *anyopaque, template_name: []const u8, address: []const u8, from_block: u64) void {
+        const self: *TemplateRegistry = @ptrCast(@alignCast(ctx));
+        const idx = self.find(template_name) orelse {
+            log.err("模板分发表: 未找到模板 {s}（工厂发现 clone {s}），已忽略", .{ template_name, address });
+            return;
+        };
+        idx.discoverAddress(address, from_block);
+    }
+};
+
+/// 启动顺序硬约束（携转约束 1）：必须先 `setTemplateMode(true)` 再
+/// `loadTemplateAddresses()`——后者在非模板模式下返回 `error.NotTemplateMode`，
+/// 顺序写反会让启动期 fail-fast 静默失效。读库错误（含 RocksDB 的
+/// `UnsupportedOperation`）必须上抛，不能吞掉。
+fn enableTemplateRuntime(idx: *indexer.Indexer, template_name: []const u8) !void {
+    idx.setTemplateMode(true);
+    idx.loadTemplateAddresses() catch |e| {
+        log.err("模板 {s}: 启动期恢复 clone 地址失败: {any}", .{ template_name, e });
+        return e;
+    };
+}
+
+/// RocksDB 后端没有 template_addresses（Task 4：四个 CRUD 一律 UnsupportedOperation），
+/// 配了 [[templates]] 时必须在启动期失败，而不是等到发现第一个 clone（携转约束 2）。
+/// 该检查进不了 `config.validate()`——那里拿不到后端类型。
+fn checkTemplateBackendSupport(cfg: *const config.Config) !void {
+    if (cfg.templates.len == 0) return;
+    if (std.mem.eql(u8, cfg.database.db_type, "rocksdb")) {
+        log.err("配置错误: database.type = \"rocksdb\" 不支持 [[templates]]（template_addresses 仅 SQLite/PostgreSQL 可用）", .{});
+        return error.UnsupportedOperation;
+    }
+}
+
 pub fn main(init: std.process.Init) !void {
     const alloc = init.gpa;
     setupSignals();
@@ -132,6 +192,9 @@ pub fn main(init: std.process.Init) !void {
     log.info("🚀 启动 zponder v{s} ({s})", .{ build_options.version, build_options.git_commit });
     log.info("RPC: {s}, 数据库: {s}", .{ cfg.rpc.url, cfg.database.db_type });
 
+    // 启动期 fail-fast：RocksDB 没有 template_addresses（携转约束 2）
+    try checkTemplateBackendSupport(&cfg);
+
     // 3. 自动获取 ABI + 自动发现事件
     var resolved = try resolveEvents(alloc, init.io, &cfg);
     defer resolved.deinit();
@@ -160,6 +223,11 @@ pub fn main(init: std.process.Init) !void {
     if (latest_block > 0) log.info("RPC 连接成功，最新区块: {d}", .{latest_block});
 
     // 7. 初始化索引器
+    // 模板的合成 ContractConfig 必须比索引器活得久（Indexer 只存指针），故在 indexers
+    // 之前声明：defer 先注册后执行 → 先停/释索引器，再释放模板配置（顺序颠倒会 UAF）。
+    var template_contracts: std.ArrayList(config.ContractConfig) = .empty;
+    defer template_contracts.deinit(alloc);
+
     var indexers: std.ArrayList(indexer.Indexer) = .empty;
     defer {
         for (indexers.items) |*idx| idx.deinit();
@@ -190,6 +258,58 @@ pub fn main(init: std.process.Init) !void {
             resolved.contracts[i].events.len,
         });
     }
+
+    // 模板索引器（Task 8 装配）：每个模板一个 Indexer，承载动态发现的 clone 地址集合。
+    var template_registry = TemplateRegistry{};
+    defer template_registry.deinit(alloc);
+    if (cfg.templates.len > 0) {
+        // 先把所有模板配置装进 template_contracts（此后不再 append，元素地址才稳定），
+        // 再逐个建索引器——索引器只存 `*const ContractConfig`，指向数组元素。
+        for (cfg.templates) |t| {
+            try template_contracts.append(alloc, .{
+                .name = t.name,
+                .address = "",
+                .abi_path = t.abi_path,
+                .events = t.events,
+                .from_block = t.from_block,
+                .start_block = null,
+                .poll_interval_ms = t.poll_interval_ms,
+                .max_reorg_depth = null,
+                .block_batch_size = t.block_batch_size,
+                .filters = &.{},
+            });
+        }
+        const template_base = indexers.items.len;
+        for (template_contracts.items, cfg.templates) |*tc, t| {
+            var idx = try indexer.Indexer.init(
+                alloc,
+                init.io,
+                &rpc,
+                &database,
+                tc,
+                cfg.global.snapshot_interval,
+                cfg.global.track_blocks,
+                cfg.global.chain,
+                null,
+                null,
+                0,
+            );
+            indexers.append(alloc, idx) catch |e| {
+                // append 失败时这个 Indexer 尚未被 indexers 接管，需自行释放
+                idx.deinit();
+                return e;
+            };
+            const idx_ptr = &indexers.items[indexers.items.len - 1];
+            // 硬约束：先 setTemplateMode(true) 再 loadTemplateAddresses()（携转约束 1）
+            try enableTemplateRuntime(idx_ptr, t.name);
+            log.info("模板索引器: {s} (abi={s}) 起始={d} 事件={d}", .{ t.name, t.abi_path, t.from_block, t.events.len });
+        }
+        // 全部 append 完成后才取指针（ArrayList 增长会搬移元素）
+        for (cfg.templates, 0..) |t, ti| {
+            try template_registry.register(alloc, t.name, &indexers.items[template_base + ti]);
+        }
+    }
+
     for (indexers.items) |*idx| try indexer_ptrs.append(alloc, idx);
 
     // 工厂合约管理
@@ -217,6 +337,12 @@ pub fn main(init: std.process.Init) !void {
                     break;
                 }
             }
+        }
+
+        // 模板分发表：工厂发现 → 对应模板索引器的 discoverAddress（老 factory 行为不变）
+        if (cfg.templates.len > 0) {
+            factory_manager.?.setTemplateHook(&template_registry, TemplateRegistry.onDiscovery);
+            log.info("模板分发表: 已注册 {d} 个模板，工厂发现将喂入对应模板", .{cfg.templates.len});
         }
     }
 
@@ -726,4 +852,111 @@ fn resolveEvents(alloc: std.mem.Allocator, io: std.Io, cfg: *const config.Config
     }
 
     return .{ .contracts = resolved, .owned = owned, .alloc = alloc };
+}
+
+// ============================================================================
+// Task 8：[[]] 模板装配的测试（分发表 hook + RocksDB 启动期快速失败）
+// ============================================================================
+
+test "模板分发表: 工厂发现经 hook 喂入对应模板的地址集合" {
+    const alloc = std.testing.allocator;
+    var backend = std.Io.Threaded.init(alloc, .{});
+    defer backend.deinit();
+    const io = backend.io();
+
+    const db_cfg = db.DatabaseConfig{
+        .db_type = "sqlite",
+        .db_name = ":memory:",
+        .wal_mode = true,
+        .busy_timeout_ms = 5000,
+        .max_connections = 10,
+    };
+    var database = try db.Client.init(alloc, &db_cfg);
+    defer database.deinit();
+    try database.migrate();
+
+    const rpc_cfg = config.RpcConfig{ .url = "", .retry_count = 0, .retry_delay_ms = 0, .request_timeout_ms = 0, .max_concurrent = 0 };
+    var rpc = eth_rpc.Client.init(alloc, io, &rpc_cfg);
+    defer rpc.deinit();
+
+    // 合成 ContractConfig：真实装配里由 template_contracts 数组持有，生命周期覆盖索引器
+    const curve_cfg = config.ContractConfig{
+        .name = "curve",
+        .address = "",
+        .abi_path = "",
+        .events = &.{},
+        .from_block = 0,
+        .start_block = null,
+        .poll_interval_ms = null,
+        .max_reorg_depth = null,
+        .block_batch_size = null,
+        .filters = &.{},
+    };
+    var idx = try indexer.Indexer.init(alloc, io, &rpc, &database, &curve_cfg, 0, false, "bsc", null, null, 0);
+    defer idx.deinit();
+
+    // 启动顺序硬约束（携转约束 1）：调用即成功，等价于"先 setTemplateMode(true)
+    // 再 loadTemplateAddresses()"。顺序写反会返回 error.NotTemplateMode → 测试变红。
+    try enableTemplateRuntime(&idx, "curve");
+
+    var registry = TemplateRegistry{};
+    defer registry.deinit(alloc);
+    try registry.register(alloc, "curve", &idx);
+
+    TemplateRegistry.onDiscovery(&registry, "curve", "0xAbCdEf0123456789AbCdEf0123456789AbCdEf01", 4242);
+    try std.testing.expectEqual(@as(usize, 1), idx.templateAddressCount());
+    {
+        const list = try database.listTemplateAddresses("curve");
+        defer {
+            for (list) |item| alloc.free(item.address);
+            alloc.free(list);
+        }
+        try std.testing.expectEqual(@as(usize, 1), list.len);
+        try std.testing.expectEqualStrings("0xabcdef0123456789abcdef0123456789abcdef01", list[0].address);
+        try std.testing.expectEqual(@as(u64, 4242), list[0].from_block);
+    }
+
+    // 未注册的模板名：告警后忽略，不得崩溃或串到别的模板
+    TemplateRegistry.onDiscovery(&registry, "ghost", "0xAbCdEf0123456789AbCdEf0123456789AbCdEf01", 1);
+    try std.testing.expectEqual(@as(usize, 1), idx.templateAddressCount());
+}
+
+test "启动校验: rocksdb + [[templates]] 快速失败（携转约束 2）" {
+    const alloc = std.testing.allocator;
+    const skeleton =
+        \\[rpc]
+        \\url = "http://localhost:8545"
+        \\
+    ;
+
+    var rocks = try config.loadFromString(alloc, skeleton ++
+        \\[database]
+        \\type = "rocksdb"
+        \\db_name = "rdb"
+        \\[[templates]]
+        \\name = "curve"
+        \\
+    );
+    defer rocks.deinit(alloc);
+    try std.testing.expectError(error.UnsupportedOperation, checkTemplateBackendSupport(&rocks));
+
+    var sqlite = try config.loadFromString(alloc, skeleton ++
+        \\[database]
+        \\type = "sqlite"
+        \\db_name = "t.db"
+        \\[[templates]]
+        \\name = "curve"
+        \\
+    );
+    defer sqlite.deinit(alloc);
+    try checkTemplateBackendSupport(&sqlite);
+
+    var rocks_plain = try config.loadFromString(alloc, skeleton ++
+        \\[database]
+        \\type = "rocksdb"
+        \\db_name = "rdb"
+        \\
+    );
+    defer rocks_plain.deinit(alloc);
+    try checkTemplateBackendSupport(&rocks_plain);
 }

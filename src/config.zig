@@ -1035,6 +1035,26 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
     return cfg;
 }
 
+/// 实体闸门：至少一个 [[contracts]] / [[factories]] / [[templates]] 才构成可索引配置。
+/// 携转约束 3：只配 [[templates]] 的配置此前被误判为"没有任何实体"。
+fn hasIndexableEntity(cfg: *const Config) bool {
+    return cfg.contracts.len > 0 or cfg.factories.len > 0 or cfg.templates.len > 0;
+}
+
+fn hasFactoryNamed(cfg: *const Config, name: []const u8) bool {
+    for (cfg.factories) |f| {
+        if (std.mem.eql(u8, f.name, name)) return true;
+    }
+    return false;
+}
+
+fn hasTemplateNamed(cfg: *const Config, name: []const u8) bool {
+    for (cfg.templates) |t| {
+        if (std.mem.eql(u8, t.name, name)) return true;
+    }
+    return false;
+}
+
 pub fn validate(cfg: *const Config) !void {
     var errors: u32 = 0;
 
@@ -1070,8 +1090,8 @@ pub fn validate(cfg: *const Config) !void {
         log.err("配置错误: database.db_name 不能为空", .{});
         errors += 1;
     }
-    if (cfg.contracts.len == 0 and cfg.factories.len == 0) {
-        log.err("配置错误: 必须至少配置一个合约或工厂合约", .{});
+    if (!hasIndexableEntity(cfg)) {
+        log.err("配置错误: 必须至少配置一个合约、工厂合约或模板", .{});
         errors += 1;
     }
     for (cfg.contracts) |contract| {
@@ -1128,7 +1148,18 @@ pub fn validate(cfg: *const Config) !void {
             log.err("配置错误: 工厂合约 {s} 的 child_address_field 不能为空", .{f.name});
             errors += 1;
         }
-        if (f.child_abi_path.len == 0) {
+        if (f.child_abi_path.len > 0 and f.template_name.len > 0) {
+            // 携转约束 7：同一发现事件不能既建老 factory 子索引器、又喂模板地址集合
+            // （否则同一批 clone 被两套索引器重复索引）
+            log.err("配置错误: 工厂合约 {s} 不能同时配置 child_abi_path 与 template_name", .{f.name});
+            errors += 1;
+        } else if (f.template_name.len > 0) {
+            if (!hasTemplateNamed(cfg, f.template_name)) {
+                log.err("配置错误: 工厂合约 {s} 的 template_name '{s}' 未在 [[templates]] 中定义", .{ f.name, f.template_name });
+                errors += 1;
+            }
+        } else if (f.child_abi_path.len == 0) {
+            // 配了 template_name 时发现路径交给模板，不再要求 child_abi_path
             log.err("配置错误: 工厂合约 {s} 的 child_abi_path 不能为空", .{f.name});
             errors += 1;
         }
@@ -1141,11 +1172,46 @@ pub fn validate(cfg: *const Config) !void {
         }
     }
 
+    for (cfg.templates, 0..) |t, ti| {
+        if (t.name.len == 0) {
+            log.err("配置错误: 模板名不能为空", .{});
+            errors += 1;
+        }
+        for (cfg.templates[0..ti]) |prev| {
+            if (prev.name.len > 0 and std.mem.eql(u8, prev.name, t.name)) {
+                // 携转约束 4：name 是分发表 key，重复会静默覆盖
+                log.err("配置错误: 模板名 '{s}' 重复", .{t.name});
+                errors += 1;
+                break;
+            }
+        }
+        if (t.abi_path.len == 0) {
+            log.err("配置错误: 模板 {s} 的 abi_path 不能为空", .{t.name});
+            errors += 1;
+        }
+        for (cfg.contracts) |c| {
+            // 事件表名是 event_{name}_{event}：模板与合约同名会写进同一张表
+            if (std.mem.eql(u8, c.name, t.name)) {
+                log.err("配置错误: 模板名 '{s}' 与 [[contracts]] 中的合约名重复（事件表前缀相同）", .{t.name});
+                errors += 1;
+                break;
+            }
+        }
+        if (t.factory_name.len == 0) {
+            log.err("配置错误: 模板 {s} 的 factory_name 不能为空（地址集合由该工厂喂入）", .{t.name});
+            errors += 1;
+        } else if (!hasFactoryNamed(cfg, t.factory_name)) {
+            // 携转约束 5：启动期就报错，不留到运行期
+            log.err("配置错误: 模板 {s} 的 factory_name '{s}' 未在 [[factories]] 中定义", .{ t.name, t.factory_name });
+            errors += 1;
+        }
+    }
+
     if (errors > 0) {
         return error.InvalidConfig;
     }
 
-    log.info("配置验证通过: 发现 {d} 个合约, {d} 个自定义查询", .{cfg.contracts.len, cfg.queries.len});
+    log.info("配置验证通过: {d} 个合约, {d} 个工厂, {d} 个模板, {d} 个自定义查询", .{ cfg.contracts.len, cfg.factories.len, cfg.templates.len, cfg.queries.len });
 }
 
 // ============================================================================
@@ -1518,7 +1584,6 @@ test "config 解析 [[templates]]" {
         \\child_address_field = "curve"
         \\child_abi_path = "./abis/curve.abi"
         \\child_events = ["Buy"]
-        \\template_name = "curve"
         \\[[templates]]
         \\name = "curve"
         \\abi_path = "./abis/curve.abi"
@@ -1535,5 +1600,131 @@ test "config 解析 [[templates]]" {
     try std.testing.expectEqualStrings("curve", cfg.templates[0].name);
     try std.testing.expectEqual(@as(usize, 2), cfg.templates[0].events.len);
     try std.testing.expectEqual(@as(u64, 100), cfg.templates[0].from_block);
+}
+
+test "config factory template_name 解析" {
+    const alloc = std.testing.allocator;
+    var cfg = try loadTemplateFixture(alloc, "", "");
+    defer cfg.deinit(alloc);
     try std.testing.expectEqualStrings("curve", cfg.factories[0].template_name);
+    // 配了 template_name 时不再要求 child_abi_path（发现路径交给模板）
+    try std.testing.expectEqualStrings("", cfg.factories[0].child_abi_path);
+}
+
+// ---------------------------------------------------------------------------
+// Task 8：[[templates]] 装配的启动期校验（携转约束 3/4/5/7）
+// ---------------------------------------------------------------------------
+
+/// 模板装配的配置骨架：工厂用 template_name 指向模板（默认**不**配 child_abi_path）。
+/// `factory_lines` / `template_lines` 用于注入变体，后者可以追加新的 `[[templates]]` 段。
+fn loadTemplateFixture(alloc: std.mem.Allocator, factory_lines: []const u8, template_lines: []const u8) !Config {
+    const toml = try std.fmt.allocPrint(alloc,
+        \\[rpc]
+        \\url = "http://localhost:8545"
+        \\
+        \\[database]
+        \\type = "sqlite"
+        \\db_name = "t.db"
+        \\
+        \\[[factories]]
+        \\name = "launchpad_factory"
+        \\address = "0x1"
+        \\abi_path = "./abis/launchpad.abi"
+        \\creation_event = "CurveCreated"
+        \\child_address_field = "curve"
+        \\template_name = "curve"
+        \\{s}
+        \\
+        \\[[templates]]
+        \\name = "curve"
+        \\abi_path = "./abis/curve.abi"
+        \\events = ["Buy"]
+        \\factory_name = "launchpad_factory"
+        \\from_block = 100
+        \\{s}
+        \\
+    , .{ factory_lines, template_lines });
+    defer alloc.free(toml);
+    return loadFromString(alloc, toml);
+}
+
+test "config 实体闸门纳入 templates（携转约束 3）" {
+    const alloc = std.testing.allocator;
+    const skeleton =
+        \\[rpc]
+        \\url = "http://localhost:8545"
+        \\[database]
+        \\type = "sqlite"
+        \\db_name = "t.db"
+        \\
+    ;
+    var empty = try loadFromString(alloc, skeleton);
+    defer empty.deinit(alloc);
+    try std.testing.expect(!hasIndexableEntity(&empty));
+
+    // 只有 [[templates]]（无 contracts / factories）也构成实体，不再被闸门拒绝
+    var only_templates = try loadFromString(alloc, skeleton ++ "[[templates]]\nname = \"curve\"\n");
+    defer only_templates.deinit(alloc);
+    try std.testing.expect(hasIndexableEntity(&only_templates));
+}
+
+test "config validate: 模板装配的合法配置通过（template_name 免除 child_abi_path）" {
+    const alloc = std.testing.allocator;
+    var cfg = try loadTemplateFixture(alloc, "", "");
+    defer cfg.deinit(alloc);
+    try validate(&cfg);
+}
+
+test "config validate: 模板名重复被拒（携转约束 4）" {
+    const alloc = std.testing.allocator;
+    var dup = try loadTemplateFixture(alloc, "", "[[templates]]\nname = \"curve\"\nabi_path = \"./abis/curve.abi\"\nfactory_name = \"launchpad_factory\"\n");
+    defer dup.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), dup.templates.len);
+    try std.testing.expectError(error.InvalidConfig, validate(&dup));
+
+    // 对照：名字不同的第二个模板可以共存
+    var distinct = try loadTemplateFixture(alloc, "", "[[templates]]\nname = \"curve2\"\nabi_path = \"./abis/curve.abi\"\nfactory_name = \"launchpad_factory\"\n");
+    defer distinct.deinit(alloc);
+    try validate(&distinct);
+}
+
+test "config validate: template.factory_name 必须存在（携转约束 5）" {
+    const alloc = std.testing.allocator;
+    var ghost = try loadTemplateFixture(alloc, "", "factory_name = \"ghost_factory\"\n");
+    defer ghost.deinit(alloc);
+    try std.testing.expectError(error.InvalidConfig, validate(&ghost));
+}
+
+test "config validate: 同一工厂不得同时配 child_abi_path 与 template_name（携转约束 7）" {
+    const alloc = std.testing.allocator;
+    var both = try loadTemplateFixture(alloc, "child_abi_path = \"./abis/curve.abi\"\n", "");
+    defer both.deinit(alloc);
+    try std.testing.expectError(error.InvalidConfig, validate(&both));
+}
+
+test "config validate: factory.template_name 必须指向已定义的模板" {
+    const alloc = std.testing.allocator;
+    var ghost = try loadTemplateFixture(alloc, "template_name = \"ghost_template\"\n", "");
+    defer ghost.deinit(alloc);
+    try std.testing.expectError(error.InvalidConfig, validate(&ghost));
+}
+
+test "config validate: 模板缺少 name / abi_path 被拒" {
+    const alloc = std.testing.allocator;
+    var no_name = try loadTemplateFixture(alloc, "", "name = \"\"\n");
+    defer no_name.deinit(alloc);
+    try std.testing.expectError(error.InvalidConfig, validate(&no_name));
+
+    var no_abi = try loadTemplateFixture(alloc, "", "abi_path = \"\"\n");
+    defer no_abi.deinit(alloc);
+    try std.testing.expectError(error.InvalidConfig, validate(&no_abi));
+}
+
+test "config validate: 模板名不得与合约名重复（事件表前缀冲突）" {
+    const alloc = std.testing.allocator;
+    // 追加一个与模板同名的 [[contracts]]：两者的表前缀都是 event_curve_*
+    var clash = try loadTemplateFixture(alloc, "", "[[contracts]]\nname = \"curve\"\naddress = \"0x2\"\nabi_path = \"./abis/curve.abi\"\n");
+    defer clash.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), clash.contracts.len);
+    try std.testing.expectError(error.InvalidConfig, validate(&clash));
 }
