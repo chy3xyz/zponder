@@ -106,6 +106,19 @@ pub const FactoryConfig = struct {
     max_children: u64,
     child_poll_interval_ms: ?u32,
     child_batch_size: ?u32,
+    template_name: []const u8,
+};
+
+pub const TemplateConfig = struct {
+    name: []const u8,
+    abi_path: []const u8,
+    events: []const []const u8,
+    factory_name: []const u8,
+    discovery_event: []const u8,
+    discovery_address_field: []const u8,
+    from_block: u64,
+    poll_interval_ms: ?u32,
+    block_batch_size: ?u32,
 };
 
 pub const QueryParam = struct {
@@ -133,6 +146,7 @@ pub const Config = struct {
     queries: []const QueryConfig,
     dashboards: []const DashboardConfig,
     factories: []const FactoryConfig,
+    templates: []const TemplateConfig,
 
     pub fn deinit(self: *Config, alloc: std.mem.Allocator) void {
         alloc.free(self.global.log_level);
@@ -207,8 +221,19 @@ pub const Config = struct {
             alloc.free(f.child_abi_path);
             for (f.child_events) |e| alloc.free(e);
             alloc.free(f.child_events);
+            alloc.free(f.template_name);
         }
         alloc.free(self.factories);
+        for (self.templates) |t| {
+            alloc.free(t.name);
+            alloc.free(t.abi_path);
+            for (t.events) |e| alloc.free(e);
+            alloc.free(t.events);
+            alloc.free(t.factory_name);
+            alloc.free(t.discovery_event);
+            alloc.free(t.discovery_address_field);
+        }
+        alloc.free(self.templates);
     }
 };
 
@@ -510,8 +535,23 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
             alloc.free(f.child_abi_path);
             for (f.child_events) |e| alloc.free(e);
             alloc.free(f.child_events);
+            alloc.free(f.template_name);
         }
         factories.deinit(alloc);
+    }
+
+    var templates: std.ArrayList(TemplateConfig) = .empty;
+    errdefer {
+        for (templates.items) |t| {
+            alloc.free(t.name);
+            alloc.free(t.abi_path);
+            for (t.events) |e| alloc.free(e);
+            alloc.free(t.events);
+            alloc.free(t.factory_name);
+            alloc.free(t.discovery_event);
+            alloc.free(t.discovery_address_field);
+        }
+        templates.deinit(alloc);
     }
 
     const Section = enum {
@@ -526,6 +566,7 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
         dashboards,
         dashboard_widgets,
         factories,
+        templates,
     };
     var section: Section = .none;
     var current_contract: ?ContractConfig = null;
@@ -534,6 +575,7 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
     var current_widget: ?WidgetConfig = null;
     var current_widgets: std.ArrayList(WidgetConfig) = .empty;
     var current_factory: ?FactoryConfig = null;
+    var current_template: ?TemplateConfig = null;
 
     var lines = std.mem.splitScalar(u8, content, '\n');
     while (lines.next()) |line_raw| {
@@ -542,10 +584,14 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
         if (std.mem.startsWith(u8, line, "#")) continue;
 
         if (std.mem.startsWith(u8, line, "[") and std.mem.endsWith(u8, line, "]")) {
-            // 保存之前的合约/查询/dashboard/factory
+            // 保存之前的合约/查询/dashboard/factory/template
             if (current_factory) |cf| {
                 try factories.append(alloc, cf);
                 current_factory = null;
+            }
+            if (current_template) |ct| {
+                try templates.append(alloc, ct);
+                current_template = null;
             }
             if (current_contract) |cc| {
                 try contracts.append(alloc, cc);
@@ -639,6 +685,20 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
                     .max_children = 1000,
                     .child_poll_interval_ms = null,
                     .child_batch_size = null,
+                    .template_name = try alloc.dupe(u8, ""),
+                };
+            } else if (std.mem.eql(u8, section_name, "templates")) {
+                section = .templates;
+                current_template = TemplateConfig{
+                    .name = try alloc.dupe(u8, ""),
+                    .abi_path = try alloc.dupe(u8, ""),
+                    .events = try alloc.alloc([]const u8, 0),
+                    .factory_name = try alloc.dupe(u8, ""),
+                    .discovery_event = try alloc.dupe(u8, ""),
+                    .discovery_address_field = try alloc.dupe(u8, ""),
+                    .from_block = 0,
+                    .poll_interval_ms = null,
+                    .block_batch_size = null,
                 };
             } else {
                 section = .none;
@@ -677,6 +737,37 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
                 cf.child_poll_interval_ms = try parseU32(value);
             } else if (std.mem.eql(u8, key, "child_batch_size")) {
                 cf.child_batch_size = try parseU32(value);
+            } else if (std.mem.eql(u8, key, "template_name")) {
+                if (cf.template_name.len > 0) alloc.free(cf.template_name);
+                cf.template_name = try unquote(alloc, value);
+            }
+            continue;
+        }
+
+        if (current_template) |*ct| {
+            if (std.mem.eql(u8, key, "name")) {
+                if (ct.name.len > 0) alloc.free(ct.name);
+                ct.name = try unquote(alloc, value);
+            } else if (std.mem.eql(u8, key, "abi_path")) {
+                if (ct.abi_path.len > 0) alloc.free(ct.abi_path);
+                ct.abi_path = try unquote(alloc, value);
+            } else if (std.mem.eql(u8, key, "events")) {
+                ct.events = try parseEvents(alloc, value);
+            } else if (std.mem.eql(u8, key, "factory_name")) {
+                if (ct.factory_name.len > 0) alloc.free(ct.factory_name);
+                ct.factory_name = try unquote(alloc, value);
+            } else if (std.mem.eql(u8, key, "discovery_event")) {
+                if (ct.discovery_event.len > 0) alloc.free(ct.discovery_event);
+                ct.discovery_event = try unquote(alloc, value);
+            } else if (std.mem.eql(u8, key, "discovery_address_field")) {
+                if (ct.discovery_address_field.len > 0) alloc.free(ct.discovery_address_field);
+                ct.discovery_address_field = try unquote(alloc, value);
+            } else if (std.mem.eql(u8, key, "from_block")) {
+                ct.from_block = try parseU64(value);
+            } else if (std.mem.eql(u8, key, "poll_interval_ms")) {
+                ct.poll_interval_ms = try parseU32(value);
+            } else if (std.mem.eql(u8, key, "block_batch_size")) {
+                ct.block_batch_size = try parseU32(value);
             }
             continue;
         }
@@ -880,6 +971,9 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
     if (current_factory) |cf| {
         try factories.append(alloc, cf);
     }
+    if (current_template) |ct| {
+        try templates.append(alloc, ct);
+    }
     if (current_contract) |cc| {
         try contracts.append(alloc, cc);
     }
@@ -918,6 +1012,12 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
     }
     factories.deinit(alloc);
 
+    var final_templates = try alloc.alloc(TemplateConfig, templates.items.len);
+    for (templates.items, 0..) |t, i| {
+        final_templates[i] = t;
+    }
+    templates.deinit(alloc);
+
     const cfg = Config{
         .alloc = alloc,
         .global = global,
@@ -929,6 +1029,7 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
         .queries = final_queries,
         .dashboards = final_dashboards,
         .factories = final_factories,
+        .templates = final_templates,
     };
 
     return cfg;
@@ -1395,4 +1496,44 @@ test "config: cors=true 的 cfg deinit 不崩溃（回归：释放静态字面�
     var cfg = try loadFromString(alloc, toml);
     defer cfg.deinit(alloc);
     try std.testing.expectEqualStrings("*", cfg.http.cors_origins[0]);
+}
+
+test "config 解析 [[templates]]" {
+    const alloc = std.testing.allocator;
+    const toml =
+        \\[global]
+        \\chain = "bsc"
+        \\[rpc]
+        \\url = "http://localhost:8545"
+        \\[[contracts]]
+        \\name = "launchpad"
+        \\address = "0x1"
+        \\abi_path = "./abis/launchpad.abi"
+        \\events = ["CurveCreated"]
+        \\[[factories]]
+        \\name = "launchpad_factory"
+        \\address = "0x1"
+        \\abi_path = "./abis/launchpad.abi"
+        \\creation_event = "CurveCreated"
+        \\child_address_field = "curve"
+        \\child_abi_path = "./abis/curve.abi"
+        \\child_events = ["Buy"]
+        \\template_name = "curve"
+        \\[[templates]]
+        \\name = "curve"
+        \\abi_path = "./abis/curve.abi"
+        \\events = ["Buy", "Sell"]
+        \\factory_name = "launchpad_factory"
+        \\discovery_event = "CurveCreated"
+        \\discovery_address_field = "curve"
+        \\from_block = 100
+        \\
+    ;
+    var cfg = try loadFromString(alloc, toml);
+    defer cfg.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), cfg.templates.len);
+    try std.testing.expectEqualStrings("curve", cfg.templates[0].name);
+    try std.testing.expectEqual(@as(usize, 2), cfg.templates[0].events.len);
+    try std.testing.expectEqual(@as(u64, 100), cfg.templates[0].from_block);
+    try std.testing.expectEqualStrings("curve", cfg.factories[0].template_name);
 }
