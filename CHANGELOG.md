@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.8.3] - 2026-10-12
 
 ### Added
 - **`ponder.db` 业务投影 API**：JS handler 内 `ponder.db.exec/query` 参数化写读派生表
@@ -34,6 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SSE `/stream` 载荷同步携带。
 - **launchpad 模板验收示例**：`examples/local-demo/launchpad-demo/`（工厂 + 3 clone，
   证明只产生一套 `event_curve_*` 表且按地址可区分）。
+- **`[[templates]].max_addresses_per_request`**（默认 200）：主 sweep 按地址数分块
+  发 `eth_getLogs`，避免几千 clone 时单请求超 RPC 上限。
+- **工厂↔模板启动期一致性校验**：反向校验模板的 `factory_name`、拒绝重复工厂地址，
+  避免错配时"进程显示 running 却零索引"。
 
 ### Changed
 - **`autoMigrateContract` 变为 4 参**（末参 `contract_address`）：单合约传合约地址，
@@ -59,6 +63,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `DatabaseOpenFailed (CANTOPEN)`、构造失败等布局相关故障。现统一复制并补终止符，
   并加回归测试覆盖。
 - JS 事件 handler 抛出的异常此前被静默吞掉，现记录 `log.err` 并计入指标。
+- **重复事件日志静默去重**：分块请求或补扫重叠导致的重取，此前会因唯一键冲突走入
+  错误路径并往 `raw_logs` 写死信行（该表语义是"未被静默丢弃的日志"）；现
+  `insertEventLog` 返回"是否真的新插入"，重复时整体跳过状态更新与回调——
+  既不污染死信表，也不会二次执行 handler（投影不会重复累加）。
 
 ## [0.8.2] - 2026-10-05
 
