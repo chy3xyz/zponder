@@ -975,8 +975,8 @@ git commit -m "test: launchpad 多 clone 端到端验收 + 模板模式文档"
 这四个缺陷都**不是**本计划引入的，但都由本计划的评审发现，且都在热路径上；合并前应修掉（每个都要有判别测试：修前红、修后绿）。
 
 **Files:**
-- Modify: `src/db.zig`（前两项）
-- Modify: `src/factory.zig`（第三项）
+- Modify: `src/db.zig`（Step 1/2/4：PG 悬垂切片、部分填充泄漏、RocksDB 过滤报错）
+- Modify: `src/factory.zig`（Step 3：子索引器悬垂配置）
 - Test: 对应文件的 test 块
 
 **Interfaces:**
