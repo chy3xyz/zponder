@@ -116,6 +116,15 @@ fn validateThenStartIndexers(
     while (i < indexer_count) : (i += 1) try start_one(ctx, i);
 }
 
+/// 子命令把失败细节写进日志后，统一由这里负责把退出码置为非 0，并且**不**让 main
+/// 返回 error —— 这类失败（配置写错、目录建不了）属于用户/环境问题，不需要 Zig 的
+/// 错误返回栈。走 catch 也意味着子命令自身的 defer 已正常展开（日志在退出前 flush）。
+fn exitOnFailure(result: anyerror!void) void {
+    result catch {
+        std.process.exit(1);
+    };
+}
+
 pub fn main(init: std.process.Init) !void {
     const alloc = init.gpa;
     setupSignals();
@@ -153,7 +162,7 @@ pub fn main(init: std.process.Init) !void {
             if (arg_idx + 1 < args.len and std.mem.eql(u8, args[arg_idx + 1], "--json")) {
                 is_json = true;
             }
-            try cmdAddScript(alloc, init.io, script_name, is_json);
+            exitOnFailure(cmdAddScript(alloc, init.io, script_name, is_json));
             return;
         }
         if (std.mem.eql(u8, arg, "init")) {
@@ -164,17 +173,11 @@ pub fn main(init: std.process.Init) !void {
             if (arg_idx + 1 < args.len and (std.mem.eql(u8, args[arg_idx + 1], "-c") or std.mem.eql(u8, args[arg_idx + 1], "--config"))) {
                 if (arg_idx + 2 < args.len) config_path = args[arg_idx + 2];
             }
-            // 失败详情已由 cmdCheck 逐条 ✗ 打出；这里只把退出码置为非 0。
-            // 走 error 返回的话 Zig 会追加一段错误返回栈，而这属于用户配置问题，
-            // 不需要栈回溯。注意必须是"cmdCheck 正常展开（defer 里的日志 flush 完）
-            // 之后再 exit"。
-            cmdCheck(alloc, init.io, config_path) catch {
-                std.process.exit(1);
-            };
+            exitOnFailure(cmdCheck(alloc, init.io, config_path));
             return;
         }
         if (std.mem.eql(u8, arg, "install")) {
-            try cmdInstall(alloc, init.io);
+            exitOnFailure(cmdInstall(alloc, init.io));
             return;
         }
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "help")) {
@@ -565,8 +568,9 @@ fn cmdInstall(alloc: std.mem.Allocator, io: std.Io) !void {
     defer alloc.free(local_target);
 
     std.Io.Dir.cwd().copyFile(exe_path, std.Io.Dir.cwd(), local_target, io, .{}) catch |err| {
-        log.err("复制二进制文件至 {s} 失败: {any}", .{ local_target, err });
-        return;
+        log.err("复制二进制文件 [{s}] → [{s}] 失败: {any}", .{ exe_path, local_target, err });
+        log.err("提示: 请在仓库根目录先执行 zig build -Doptimize=ReleaseFast 生成 {s}", .{exe_path});
+        return error.InstallFailed;
     };
 
     log.info("🎉 成功安装 zponder 二进制文件至: {s}", .{local_target});
@@ -581,8 +585,14 @@ fn cmdAddScript(alloc: std.mem.Allocator, io: std.Io, name: []const u8, is_json:
     defer log.deinit(alloc, io);
 
     var d = std.Io.Dir.cwd().openDir(io, "handlers", .{}) catch blk: {
-        std.Io.Dir.cwd().createDir(io, "handlers", @enumFromInt(0o755)) catch {};
-        break :blk std.Io.Dir.cwd().openDir(io, "handlers", .{}) catch return;
+        std.Io.Dir.cwd().createDir(io, "handlers", @enumFromInt(0o755)) catch |mk_err| {
+            log.err("创建 handlers/ 目录失败: {any}", .{mk_err});
+            return error.AddScriptFailed;
+        };
+        break :blk std.Io.Dir.cwd().openDir(io, "handlers", .{}) catch |err| {
+            log.err("handlers/ 目录已创建但打开失败: {any}", .{err});
+            return error.AddScriptFailed;
+        };
     };
     d.close(io);
 
@@ -640,13 +650,13 @@ fn cmdAddScript(alloc: std.mem.Allocator, io: std.Io, name: []const u8, is_json:
 
     const file = std.Io.Dir.cwd().createFile(io, filename, .{}) catch |err| {
         log.err("创建脚本模版文件 [{s}] 失败: {any}", .{ filename, err });
-        return;
+        return error.AddScriptFailed;
     };
     defer file.close(io);
 
     file.writeStreamingAll(io, content) catch |err| {
-        log.err("写入脚本模版内容失败: {any}", .{err});
-        return;
+        log.err("写入脚本模版内容 [{s}] 失败: {any}", .{ filename, err });
+        return error.AddScriptFailed;
     };
 
     log.info("🎉 成功生成业务脚本模版文件: {s}", .{filename});
