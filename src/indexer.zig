@@ -164,13 +164,19 @@ fn backfillLast(to_exclusive: u64) u64 {
 }
 
 /// 补扫分块推进：`from` 起、半开上界 `to_exclusive`，返回本块**闭区间** `[from, end]`。
-/// 返回 null 表示已越过末尾（含 `batch_size == 0`：防 `batch_size - 1` 下溢 panic）。
-/// eth_getLogs 的 toBlock 是闭区间，故内部经 `backfillLast` 做一次上界换算；
-/// 这样"补扫恰好覆盖 [from, 游标)"的换算不会漏在调用方里。
+/// 返回 null 表示已越过末尾。eth_getLogs 的 toBlock 是闭区间，故内部经 `backfillLast`
+/// 做一次上界换算；这样"补扫恰好覆盖 [from, 游标)"的换算不会漏在调用方里。
+/// `batch_size` 在读取侧已夹紧为 >=1，这里再防御性夹紧一次：0 若漏进来，`batch_size - 1`
+/// 会下溢，或（若只判 null）退化成"零推进却标记完成"→ 永久漏扫。
 fn nextBackfillChunk(from: u64, batch_size: u64, to_exclusive: u64) ?[2]u64 {
-    if (batch_size == 0) return null;
+    const batch = clampBatchSize(batch_size);
     if (from >= to_exclusive) return null;
-    return .{ from, @min(from +| (batch_size - 1), backfillLast(to_exclusive)) };
+    return .{ from, @min(from +| (batch - 1), backfillLast(to_exclusive)) };
+}
+
+/// 批次大小下限夹紧：`block_batch_size = 0` 视为逐块（1），绝不退化为 0。
+fn clampBatchSize(raw: u64) u64 {
+    return @max(1, raw);
 }
 
 /// `loadTemplateAddresses` 的前置校验：未开模板模式必须报错。
@@ -332,7 +338,11 @@ pub const Indexer = struct {
             log.info("合约 {s} 从起始区块开始: {}", .{ contract.name, start_block });
         }
 
-        const batch_size = contract.block_batch_size orelse 500;
+        // block_batch_size = 0 是合法配置输入（parseU32 接受 "0"，validate 不校验）：
+        // 夹紧为 1（逐块，与主 sweep "0 退化为逐块" 的既有行为一致）。
+        // 若不夹紧，nextBackfillChunk 会退化成"零推进"→ processPendingBackfills 仍标记
+        // 补扫完成 → [from_block, cursor) 永不扫描，历史事件永久丢失且无告警。
+        const batch_size = clampBatchSize(contract.block_batch_size orelse 500);
         const poll_interval_ms = contract.poll_interval_ms orelse 2000;
 
         return .{
@@ -398,14 +408,21 @@ pub const Indexer = struct {
         };
         self.template_state_key_len = key.len;
 
-        if (self.database.getSyncState(key)) |state| {
+        // getSyncState 返回 `!?SyncState`，必须分两步解包：先 catch 掉错误（告警后按
+        // 配置起始区块继续，不阻断启动），再对 `?SyncState` 做 if 捕获。
+        // 直接写 `if (db.getSyncState(key)) |state|` 会把整个 error union 当错误分支解包，
+        // state 的类型是 `?SyncState`，字段访问编译不过（且因无调用方而被惰性分析掩盖）。
+        // 注意 `try` 在 `void` 函数里非法，故用 catch。
+        const existing = self.database.getSyncState(key) catch |e| {
+            log.warn("模板 {s} 读取断点失败: {any}，从配置起始区块开始", .{ self.contract.name, e });
+            return;
+        };
+        if (existing) |state| {
             self.current_block.store(state.last_synced_block, .monotonic);
             self.last_tip.store(state.last_synced_block, .monotonic);
             log.info("模板 {s} 从断点续传: 区块 {}", .{ self.contract.name, state.last_synced_block });
             self.alloc.free(state.contract_address);
             self.alloc.free(state.status);
-        } else |e| {
-            log.warn("模板 {s} 读取断点失败: {any}，从配置起始区块开始", .{ self.contract.name, e });
         }
     }
 
@@ -1573,8 +1590,29 @@ test "template 补扫分块连续无重叠（闭区间换算）" {
     try std.testing.expectEqual([2]u64{ 100, 249 }, nextBackfillChunk(100, 500, 250).?);
     // 起点即游标 → 无块
     try std.testing.expect(nextBackfillChunk(250, 500, 250) == null);
-    // batch_size == 0 不得下溢 panic（block_batch_size = 0 是合法配置输入）
-    try std.testing.expect(nextBackfillChunk(0, 0, 100) == null);
+    // batch_size == 0 夹紧为逐块：必须真的推进（不是 null，否则零 RPC 却标记完成）
+    try std.testing.expectEqual([2]u64{ 0, 0 }, nextBackfillChunk(0, 0, 100).?);
+}
+
+test "template batch_size = 0 时补扫仍逐块推进（不得零推进却标记完成）" {
+    // batch=0 若不夹紧会返回 null → backfillRange 的 while 体一次都不执行
+    // （零 RPC）→ processPendingBackfills 仍 markAddressBackfilled → [from,cursor) 永不扫描。
+    // 这里用纯分块循环证明"真的推进到底"：5 块、逐块、恰好覆盖 [0, 5)。
+    var from: u64 = 0;
+    var iterations: usize = 0;
+    while (nextBackfillChunk(from, 0, 5)) |c| {
+        try std.testing.expectEqual(from, c[0]);
+        try std.testing.expectEqual(c[0], c[1]); // batch 夹紧为 1 → 每块恰好 1 个
+        from = c[1] + 1;
+        iterations += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 5), iterations);
+    try std.testing.expectEqual(@as(u64, 5), from);
+
+    // 读取侧夹紧：block_batch_size = 0 → 1（逐块），不得为 0
+    try std.testing.expectEqual(@as(u64, 1), clampBatchSize(0));
+    try std.testing.expectEqual(@as(u64, 1), clampBatchSize(1));
+    try std.testing.expectEqual(@as(u64, 500), clampBatchSize(500));
 }
 
 test "template 地址集合去重/补扫流转" {
@@ -1748,28 +1786,40 @@ test "template dupePending 复制 pending 且调用方可独立释放" {
     try std.testing.expectEqualStrings("0xaaa", snap[0].address);
 }
 
-test "template 重组作废发现块 >= fork 的条目（pending 与 live）" {
+test "template 重组作废发现块 >= fork 的条目（含连续多项 + 等长不变量）" {
     const alloc = std.testing.allocator;
     var set = TemplateAddressSet.init(alloc);
     defer set.deinit();
 
-    try std.testing.expect(set.add("0xold", 50)); // 早于 fork（保留）
-    set.markBackfilled("0xold");
-    try std.testing.expect(set.add("0xlive_lt", 100)); // fork 前发现、晚回填（保留）
-    set.markBackfilled("0xlive_lt");
-    try std.testing.expect(set.add("0xlive_eq", 101)); // 恰为 fork（作废，含边界）
-    set.markBackfilled("0xlive_eq");
-    try std.testing.expect(set.add("0xpending_gt", 120)); // fork 后 pending（作废）
+    // 保留侧（from_block < fork）
+    try std.testing.expect(set.add("0xold", 50));
+    set.markBackfilled("0xold"); // live, 50
+    try std.testing.expect(set.add("0xkeep", 100));
+    set.markBackfilled("0xkeep"); // live, 100
+    // 作废侧 live：**连续两项**都命中（101 == fork 含边界、102）
+    try std.testing.expect(set.add("0xdrop_a", 101));
+    set.markBackfilled("0xdrop_a"); // live, 101
+    try std.testing.expect(set.add("0xdrop_b", 102));
+    set.markBackfilled("0xdrop_b"); // live, 102
+    // 作废侧 pending：**连续两项**都命中（120、130）
+    try std.testing.expect(set.add("0xpend_a", 120));
+    try std.testing.expect(set.add("0xpend_b", 130));
+
+    // live / live_blocks 等长不变量（任何一处漏维护都会破坏它）
+    try std.testing.expectEqual(set.live.items.len, set.live_blocks.items.len);
 
     set.removeFromBlock(101); // fork = 101
 
     // 保留 from_block < 101
     try std.testing.expectEqual(@as(usize, 2), set.all().len);
     try std.testing.expectEqualStrings("0xold", set.all()[0]);
-    try std.testing.expectEqualStrings("0xlive_lt", set.all()[1]);
-    // 移除 from_block >= 101（live 与 pending 都处理；live/live_blocks 保持等长）
+    try std.testing.expectEqualStrings("0xkeep", set.all()[1]);
+    // pending 连续两项都必须被移除（"移除分支里多 i+=1"会漏掉第二项 → 这里会红）
     try std.testing.expectEqual(@as(usize, 0), set.pending().len);
     try std.testing.expectEqual(@as(usize, 2), set.count());
+    // live 连续两项都被移除后仍等长
+    try std.testing.expectEqual(set.live.items.len, set.live_blocks.items.len);
+    try std.testing.expectEqual(@as(usize, 2), set.live_blocks.items.len);
 }
 
 test "template 模式守卫（未开模板模式 / 运行中切换）" {
@@ -1781,4 +1831,95 @@ test "template 模式守卫（未开模板模式 / 运行中切换）" {
     try ensureNotRunning(.error_state);
     try std.testing.expectError(error.AlreadyRunning, ensureNotRunning(.running));
     try std.testing.expectError(error.AlreadyRunning, ensureNotRunning(.replaying));
+}
+
+// 用真实 db.Client 构造一个 Indexer，覆盖模板模式整条公有 API 的**函数体**。
+// 目的：Zig 惰性分析——没有调用方的函数体不会被语义分析，`setTemplateMode` 曾因此
+// 带着 `optional type does not support field access` 的编译错误"全绿"至今，直到 Task 8
+// 第一次调用才炸。这里的调用是防止同类回归的接线防线。
+fn testIndexerWithDb(alloc: std.mem.Allocator, database: *db.Client, rpc: *eth_rpc.Client, contract: *const config.ContractConfig) Indexer {
+    return .{
+        .alloc = alloc,
+        .rpc = rpc,
+        .database = database,
+        .contract = contract,
+        .snapshot_interval = 0,
+        .state = std.atomic.Value(IndexerState).init(.stopped),
+        .current_block = std.atomic.Value(u64).init(0),
+        .last_tip = std.atomic.Value(u64).init(0),
+        .last_snapshot_time = std.atomic.Value(i64).init(0),
+        .batch_size = 100,
+        .poll_interval_ms = 1000,
+        .abi_contract = null,
+        .thread = null,
+        .track_blocks = false,
+        .chain = "bsc",
+        .factory_ctx = null,
+        .factory_callback = null,
+        .factory_idx = 0,
+        .template_set = TemplateAddressSet.init(alloc),
+    };
+}
+
+test "template 模板模式 API 接线（真实调用，杜绝惰性分析漏编译）" {
+    const alloc = std.testing.allocator;
+    const db_cfg = db.DatabaseConfig{
+        .db_type = "sqlite",
+        .db_name = ":memory:",
+        .wal_mode = true,
+        .busy_timeout_ms = 5000,
+        .max_connections = 10,
+    };
+    var database = try db.Client.init(alloc, &db_cfg);
+    defer database.deinit();
+    try database.migrate();
+
+    var rpc_cfg = config.RpcConfig{ .url = "", .retry_count = 0, .retry_delay_ms = 0, .request_timeout_ms = 0, .max_concurrent = 0 };
+    var rpc = eth_rpc.Client.init(alloc, undefined, &rpc_cfg);
+    defer rpc.deinit();
+
+    const contract = config.ContractConfig{
+        .name = "curve",
+        .address = "",
+        .abi_path = "",
+        .from_block = 0,
+        .events = &.{},
+        .start_block = null,
+        .block_batch_size = null,
+        .poll_interval_ms = null,
+        .max_reorg_depth = null,
+        .filters = &.{},
+    };
+
+    var idx = testIndexerWithDb(alloc, &database, &rpc, &contract);
+    defer idx.deinit();
+
+    // 直接调用真实函数体（编译期必须能实例化）
+    idx.setTemplateMode(true);
+    try std.testing.expectEqualStrings("template:curve", idx.stateKey());
+    try std.testing.expectEqual(@as(usize, 0), idx.templateAddressCount());
+
+    // loadTemplateAddresses 走真实读库路径（空表）
+    try idx.loadTemplateAddresses();
+    try std.testing.expectEqual(@as(usize, 0), idx.templateAddressCount());
+
+    // discoverAddress：入口归一化 + 幂等 + 落库
+    idx.discoverAddress("0xAbCdEf0123456789AbCdEf0123456789AbCdEf01", 100);
+    idx.discoverAddress("0xabcdef0123456789abcdef0123456789abcdef01", 100); // 归一化后同地址 → 幂等
+    try std.testing.expectEqual(@as(usize, 1), idx.templateAddressCount());
+    {
+        const list = try database.listTemplateAddresses("curve");
+        defer {
+            for (list) |item| alloc.free(item.address);
+            alloc.free(list);
+        }
+        try std.testing.expectEqual(@as(usize, 1), list.len);
+        try std.testing.expectEqualStrings("0xabcdef0123456789abcdef0123456789abcdef01", list[0].address);
+    }
+
+    // 断点续传分支：合成 key 下已有记录 → 覆盖游标（含 SyncState 内存释放路径）
+    try database.upsertSyncState(.{ .contract_address = "template:curve", .last_synced_block = 123, .status = "running" });
+    idx.setTemplateMode(true);
+    try std.testing.expectEqual(@as(u64, 123), idx.getCurrentBlock());
+    try std.testing.expectEqual(@as(u64, 123), idx.last_tip.load(.monotonic));
 }
