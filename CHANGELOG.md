@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.6] - 2026-10-13
+
+### Added
+- **JS 事件对象新增 `event.transactionHash` / `event.logIndex`**，SSE 载荷同步新增
+  `tx_hash` / `log_index`：投影表可以用 `(tx_hash, log_index)` 作真实主键，成交记录
+  终于能跳区块浏览器（此前只能拿合成键）。
+- **`[[factories]]` 新增 `from_template` 发现源**：以某个模板地址集合里的事件作为
+  发现源（与 `address` 互斥），用于「地址只有被发现的合约自己知道」的场景 —— 例如
+  曲线 clone 发出 `LiquidityMigrated(pair)`，pair 地址因此能进第二个模板。一个发现源
+  可以挂多条规则（`Indexer.factory_idxs` 改为列表），事件不再只喂第一条。
+- demo（`examples/local-demo/launchpad-demo`）：新增 `Pair.sol` 与 `Paired` 事件，
+  端到端验证「clone 事件 → 第二个模板」；断言扩到 A1–A10。
+
+### Changed
+- **RocksDB / PostgreSQL 变为可选构建特性**（`-Drocksdb=false -Dpostgres=false`，默认
+  开启）。关闭时对应后端在启动时明确报错，且**不再链接** librocksdb / libpq。
+  npm 预编译二进制改用该模式构建 —— 此前它们动态依赖构建机上的 `librocksdb.11.dylib`
+  与 `libpq.5.dylib`，在干净机器上直接 dyld 失败，等于不可用（实测 `zponder@0.8.5`
+  的 darwin-arm64 二进制）。
+- CI 新增发布门禁：构建后先跑 `zponder version`，再用 `otool -L` / `ldd` 断言二进制
+  不依赖 rocksdb/libpq（只"能跑"不算证据 —— runner 上恰好装了这些库时发现不了）。
+- `version` 横幅的特性列表按构建实测输出；`scripts/build-all-targets.sh` 交叉编译同样
+  关闭两个可选后端。
+
 ## [0.8.5] - 2026-10-12
 
 ### Fixed
