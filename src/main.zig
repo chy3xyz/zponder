@@ -251,10 +251,10 @@ pub fn main(init: std.process.Init) !void {
     defer template_contracts.deinit(alloc);
 
     var indexers: std.ArrayList(indexer.Indexer) = .empty;
-    defer {
-        for (indexers.items) |*idx| idx.deinit();
-        indexers.deinit(alloc);
-    }
+    // 注意：索引器的 deinit（stop + join 线程）**必须**晚于 script_eng/js_eng/event_bus
+    // 的 deinit 注册 —— defer 是 LIFO，晚注册的先执行。否则线程会在引擎已被释放后
+    // 继续回调（processEvent 读已释放的 rules → 0xaa 段错误）。故这里先只声明，
+    // 真正的清理 defer 放在引擎/总线声明之后注册。
     var indexer_ptrs: std.ArrayList(*indexer.Indexer) = .empty;
     defer indexer_ptrs.deinit(alloc);
 
@@ -378,6 +378,15 @@ pub fn main(init: std.process.Init) !void {
     // 实时事件总线：indexer 解码事件 → SSE 订阅者
     var event_bus = eb.EventBus.init(alloc);
     defer event_bus.deinit();
+
+    // 索引器清理：晚于引擎/总线注册 → LIFO 下**先** stop+join 全部索引器线程，
+    // 之后才释放 script_eng/js_eng/event_bus。顺序颠倒会让仍在跑的回调读到已释放的
+    // ScriptEngine.rules（0xaa 段错误），典型触发是 start() 之后的任何启动失败
+    //（HTTP 端口被占用、host 非法导致 bind 报 InvalidAddress 等）走 unwind。
+    defer {
+        for (indexers.items) |*idx| idx.deinit();
+        indexers.deinit(alloc);
+    }
 
     // ponder.db 必须在加载 handler 前注入：脚本顶层常以 ponder.db 建投影表
     js_eng.setDb(&database);
