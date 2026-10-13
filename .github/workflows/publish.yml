@@ -10,6 +10,10 @@ env:
   # 从 ziglang.org/download/<version> 下载（命名 zig-<triplet>-<version>）。
   ZIG_VERSION: "0.17.0"
 
+# 默认最小权限；只有 publish job 需要写权限（建 GitHub Release）
+permissions:
+  contents: read
+
 jobs:
   build:
     name: build-${{ matrix.platform }}
@@ -57,8 +61,17 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq libsqlite3-dev
 
+      # 冷缓存时要现拉 build.zig.zon 里的 zgraphql git 依赖，GitHub 偶发
+      # `HttpConnectionClosing`（v0.8.6 首跑就死在这，整个发布失败、npm 也没发出去）。
+      # 依赖拉取发生在任何编译之前，重试成本很低，所以这里直接重试整步。
       - name: Build
-        run: zig build -Doptimize=ReleaseFast -Drocksdb=false -Dpostgres=false
+        run: |
+          for i in 1 2 3; do
+            if zig build -Doptimize=ReleaseFast -Drocksdb=false -Dpostgres=false; then exit 0; fi
+            echo "::warning::第 $i 次构建失败（多为依赖拉取网络抖动），10 秒后重试"
+            sleep 10
+          done
+          echo "::error::连续 3 次构建失败"; exit 1
 
       - name: Test
         run: zig build test -Drocksdb=false -Dpostgres=false
@@ -93,6 +106,8 @@ jobs:
     name: publish npm
     runs-on: ubuntu-latest
     needs: build
+    permissions:
+      contents: write # gh release create
     steps:
       - uses: actions/checkout@v4
 
@@ -127,3 +142,27 @@ jobs:
           token: ${{ secrets.NPM_TOKEN }}
           package: npm/zponder
           access: public
+
+      # npm 之外再挂一份可下载的二进制：此前仓库最新 Release 还停在 v0.4.0 且
+      # assets=0，任何 releases/download/… 链接都是 404。用 tag 的注解当 release notes
+      # （tag 是 annotated 的）；重跑时改为覆盖上传，保持幂等。
+      - name: Create GitHub Release with binaries
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          mkdir -p dist
+          for p in darwin-arm64 darwin-x64 linux-x64; do
+            cp "npm/zponder/bin/$p/zponder" "dist/zponder-$p"
+          done
+          chmod +x dist/*
+          ls -lh dist
+          if gh release view "v${VERSION}" >/dev/null 2>&1; then
+            gh release upload "v${VERSION}" dist/* --clobber
+          else
+            gh release create "v${VERSION}" \
+              --title "zponder v${VERSION}" \
+              --notes-from-tag \
+              dist/*
+          fi
