@@ -26,6 +26,8 @@ pub const ContractConfig = struct {
     max_reorg_depth: ?u32,
     block_batch_size: ?u32,
     filters: []const EventFilter,
+    /// 空字符串：用唯一那条链，或多链时的第一条。非空则必须等于某条 ChainConfig.name。
+    chain: []const u8 = "",
 
     fn deinit(self: *const ContractConfig, alloc: std.mem.Allocator) void {
         alloc.free(self.name);
@@ -35,6 +37,8 @@ pub const ContractConfig = struct {
         alloc.free(self.events);
         for (self.filters) |*f| f.deinit(alloc);
         alloc.free(self.filters);
+        // 默认值是静态空串，不能 free；只有解析到非空 chain 时才是堆内存。
+        if (self.chain.len > 0) alloc.free(self.chain);
     }
 };
 
@@ -45,6 +49,8 @@ pub const GlobalConfig = struct {
     etherscan_api_key: []const u8,
     chain: []const u8,            // "ethereum" | "bsc" | "polygon"
     track_blocks: bool,
+    /// 用户表定义文件。空字符串表示不建 `user_` 表。
+    schema_path: []const u8 = "",
 };
 
 pub const IndexerConfig = struct {
@@ -76,6 +82,9 @@ pub const HttpConfig = struct {
     cors_origins: []const []const u8,
     rate_limit_rps: ?u32,
     rate_limit_burst: ?u32,
+    /// 空字符串表示不鉴权。非空时，除 GET /health 与 CORS 预检外要求
+    /// `Authorization: Bearer <api_token>`。GraphQL 使用同一枚 token。
+    api_token: []const u8,
 };
 
 pub const GraphQLConfig = struct {
@@ -95,6 +104,9 @@ pub const DatabaseConfig = struct {
     wal_mode: bool,
     busy_timeout_ms: u32,
     max_connections: u32,
+    /// 原始日志缓存。SQLite 挂到旁边的 `.sync.db`，PostgreSQL 使用 schema `sync`。
+    /// RocksDB 不支持。默认关闭，避免现有部署突然写下整段历史。
+    log_cache: bool = false,
 };
 
 pub const WidgetConfig = struct {
@@ -198,6 +210,22 @@ pub const QueryParam = struct {
     }
 };
 
+/// 一条链的 RPC 端点。没有 `[[chains]]` 时由 [global].chain 与 [rpc] 合成一条
+/// （chain_id = 0，ws_url 来自 [rpc].ws_url）。合成条目的字符串是独立副本，
+/// deinit 只释放副本，不会碰到 rpc / global 自己的内存。
+pub const ChainConfig = struct {
+    name: []const u8,
+    chain_id: u64,
+    rpc_url: []const u8,
+    ws_url: ?[]const u8,
+
+    pub fn deinit(self: *const ChainConfig, alloc: std.mem.Allocator) void {
+        alloc.free(self.name);
+        alloc.free(self.rpc_url);
+        if (self.ws_url) |wu| alloc.free(wu);
+    }
+};
+
 pub const QueryConfig = struct {
     name: []const u8,
     path: []const u8,
@@ -221,6 +249,7 @@ pub const Config = struct {
     http: HttpConfig,
     graphql: GraphQLConfig,
     database: DatabaseConfig,
+    chains: []const ChainConfig,
     contracts: []const ContractConfig,
     queries: []const QueryConfig,
     dashboards: []const DashboardConfig,
@@ -232,6 +261,7 @@ pub const Config = struct {
         alloc.free(self.global.log_file);
         alloc.free(self.global.etherscan_api_key);
         alloc.free(self.global.chain);
+        alloc.free(self.global.schema_path);
         alloc.free(self.rpc.url);
         if (self.rpc.urls.len > 0) {
             for (self.rpc.urls) |u| alloc.free(u);
@@ -243,6 +273,7 @@ pub const Config = struct {
             alloc.free(self.rpc.ws_urls);
         }
         alloc.free(self.http.host);
+        alloc.free(self.http.api_token);
         if (self.http.cors_origins.len > 0) {
             for (self.http.cors_origins) |o| alloc.free(o);
             alloc.free(self.http.cors_origins);
@@ -250,6 +281,8 @@ pub const Config = struct {
         alloc.free(self.graphql.host);
         alloc.free(self.database.db_type);
         alloc.free(self.database.db_name);
+        for (self.chains) |*ch| ch.deinit(alloc);
+        alloc.free(self.chains);
         for (self.contracts) |*c| c.deinit(alloc);
         alloc.free(self.contracts);
         for (self.queries) |*q| q.deinit(alloc);
@@ -485,6 +518,22 @@ fn parseQueryParams(alloc: std.mem.Allocator, value: []const u8) ![]const QueryP
     return &.{};
 }
 
+/// 无 [[chains]] 时合成一条链。name / rpc_url / ws_url 全部 dupe，避免与
+/// global.chain、rpc.url、rpc.ws_url 共享分配，deinit 可以各自释放。
+fn syntheticChain(alloc: std.mem.Allocator, name: []const u8, rpc_url: []const u8, ws_url: ?[]const u8) !ChainConfig {
+    const name_copy = try alloc.dupe(u8, name);
+    errdefer alloc.free(name_copy);
+    const rpc_copy = try alloc.dupe(u8, rpc_url);
+    errdefer alloc.free(rpc_copy);
+    const ws_copy: ?[]const u8 = if (ws_url) |wu| try alloc.dupe(u8, wu) else null;
+    return .{
+        .name = name_copy,
+        .chain_id = 0,
+        .rpc_url = rpc_copy,
+        .ws_url = ws_copy,
+    };
+}
+
 pub fn load(alloc: std.mem.Allocator, io: std.Io, config_path: []const u8) !Config {
     const content = try std.Io.Dir.cwd().readFileAlloc(io, config_path, alloc, .limited(1024 * 1024));
     defer alloc.free(content);
@@ -504,12 +553,14 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
         .etherscan_api_key = try alloc.dupe(u8, ""),
         .chain = try alloc.dupe(u8, "ethereum"),
         .track_blocks = false,
+        .schema_path = try alloc.dupe(u8, ""),
     };
     errdefer {
         alloc.free(global.log_level);
         alloc.free(global.log_file);
         alloc.free(global.etherscan_api_key);
         alloc.free(global.chain);
+        alloc.free(global.schema_path);
     }
     var rpc = RpcConfig{
         .url = try alloc.dupe(u8, ""),
@@ -528,8 +579,12 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
         .cors_origins = &.{},
         .rate_limit_rps = null,
         .rate_limit_burst = null,
+        .api_token = try alloc.dupe(u8, ""),
     };
-    errdefer alloc.free(http.host);
+    errdefer {
+        alloc.free(http.host);
+        alloc.free(http.api_token);
+    }
     var graphql = GraphQLConfig{
         .enabled = false,
         .host = try alloc.dupe(u8, "0.0.0.0"),
@@ -583,6 +638,12 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
         templates.deinit(alloc);
     }
 
+    var chains: std.ArrayList(ChainConfig) = .empty;
+    errdefer {
+        for (chains.items) |*ch| ch.deinit(alloc);
+        chains.deinit(alloc);
+    }
+
     const Section = enum {
         none,
         global,
@@ -591,6 +652,7 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
         http,
         graphql,
         contracts,
+        chains,
         queries,
         dashboards,
         dashboard_widgets,
@@ -599,6 +661,7 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
     };
     var section: Section = .none;
     var current_contract: ?ContractConfig = null;
+    var current_chain: ?ChainConfig = null;
     var current_query: ?QueryConfig = null;
     var current_dashboard: ?DashboardConfig = null;
     var current_widget: ?WidgetConfig = null;
@@ -611,6 +674,7 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
     // 释放时要**先元素、后容器**：current_widgets 里的元素归它自己，不在容器里。
     errdefer {
         if (current_contract) |*cc| cc.deinit(alloc);
+        if (current_chain) |*ch| ch.deinit(alloc);
         if (current_query) |*cq| cq.deinit(alloc);
         if (current_factory) |*cf| cf.deinit(alloc);
         if (current_template) |*ct| ct.deinit(alloc);
@@ -642,6 +706,10 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
             if (current_contract) |cc| {
                 try contracts.append(alloc, cc);
                 current_contract = null;
+            }
+            if (current_chain) |ch| {
+                try chains.append(alloc, ch);
+                current_chain = null;
             }
             if (current_query) |cq| {
                 try queries.append(alloc, cq);
@@ -691,6 +759,14 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
                     .max_reorg_depth = null,
                     .block_batch_size = null,
                     .filters = &.{},
+                };
+            } else if (std.mem.eql(u8, section_name, "chains")) {
+                section = .chains;
+                current_chain = ChainConfig{
+                    .name = try alloc.dupe(u8, ""),
+                    .chain_id = 0,
+                    .rpc_url = try alloc.dupe(u8, ""),
+                    .ws_url = null,
                 };
             } else if (std.mem.eql(u8, section_name, "queries")) {
                 section = .queries;
@@ -847,6 +923,34 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
                 cc.max_reorg_depth = try parseU32(value);
             } else if (std.mem.eql(u8, key, "block_batch_size")) {
                 cc.block_batch_size = try parseU32(value);
+            } else if (std.mem.eql(u8, key, "chain")) {
+                const next = try unquote(alloc, value);
+                if (cc.chain.len > 0) alloc.free(cc.chain);
+                if (next.len == 0) {
+                    alloc.free(next);
+                    cc.chain = "";
+                } else {
+                    cc.chain = next;
+                }
+            }
+            continue;
+        }
+
+        if (current_chain) |*ch| {
+            if (std.mem.eql(u8, key, "name")) {
+                const next = try unquote(alloc, value);
+                if (ch.name.len > 0) alloc.free(ch.name);
+                ch.name = next;
+            } else if (std.mem.eql(u8, key, "chain_id")) {
+                ch.chain_id = try parseU64(value);
+            } else if (std.mem.eql(u8, key, "rpc_url")) {
+                const next = try unquote(alloc, value);
+                if (ch.rpc_url.len > 0) alloc.free(ch.rpc_url);
+                ch.rpc_url = next;
+            } else if (std.mem.eql(u8, key, "ws_url")) {
+                const next = try unquote(alloc, value);
+                if (ch.ws_url) |wu| alloc.free(wu);
+                ch.ws_url = next;
             }
             continue;
         }
@@ -920,6 +1024,9 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
                     global.chain = try unquote(alloc, value);
                 } else if (std.mem.eql(u8, key, "track_blocks")) {
                     global.track_blocks = parseBool(value);
+                } else if (std.mem.eql(u8, key, "schema_path")) {
+                    alloc.free(global.schema_path);
+                    global.schema_path = try unquote(alloc, value);
                 }
             },
             .rpc => {
@@ -960,6 +1067,8 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
                     database.wal_mode = parseBool(value);
                 } else if (std.mem.eql(u8, key, "busy_timeout_ms")) {
                     database.busy_timeout_ms = try parseU32(value);
+                } else if (std.mem.eql(u8, key, "log_cache")) {
+                    database.log_cache = parseBool(value);
                 }
             },
             .http => {
@@ -995,6 +1104,10 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
                     http.rate_limit_rps = try parseU32(value);
                 } else if (std.mem.eql(u8, key, "rate_limit_burst")) {
                     http.rate_limit_burst = try parseU32(value);
+                } else if (std.mem.eql(u8, key, "api_token")) {
+                    const next = try unquote(alloc, value);
+                    alloc.free(http.api_token);
+                    http.api_token = next;
                 }
             },
             .graphql => {
@@ -1029,6 +1142,22 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
     }
     if (current_contract) |cc| {
         try contracts.append(alloc, cc);
+    }
+    if (current_chain) |ch| {
+        try chains.append(alloc, ch);
+        current_chain = null;
+    }
+    if (chains.items.len == 0) {
+        const synth = try syntheticChain(alloc, global.chain, rpc.url, rpc.ws_url);
+        chains.append(alloc, synth) catch |err| {
+            synth.deinit(alloc);
+            return err;
+        };
+    }
+    const final_chains = try chains.toOwnedSlice(alloc);
+    errdefer {
+        for (final_chains) |*ch| ch.deinit(alloc);
+        alloc.free(final_chains);
     }
     if (current_query) |cq| {
         try queries.append(alloc, cq);
@@ -1078,6 +1207,7 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
         .http = http,
         .graphql = graphql,
         .database = database,
+        .chains = final_chains,
         .contracts = final_contracts,
         .queries = final_queries,
         .dashboards = final_dashboards,
@@ -1158,6 +1288,24 @@ pub fn validate(cfg: *const Config) !void {
             errors += 1;
         }
     }
+    for (cfg.chains, 0..) |ch, i| {
+        if (ch.name.len == 0) {
+            log.err("配置错误: 链名不能为空", .{});
+            errors += 1;
+        } else {
+            for (cfg.chains[0..i]) |prev| {
+                if (std.mem.eql(u8, prev.name, ch.name)) {
+                    log.err("配置错误: 链名 '{s}' 重复", .{ch.name});
+                    errors += 1;
+                    break;
+                }
+            }
+        }
+        if (ch.rpc_url.len == 0) {
+            log.err("配置错误: 链 {s} 的 rpc_url 不能为空", .{ch.name});
+            errors += 1;
+        }
+    }
     if (cfg.database.db_name.len == 0) {
         log.err("配置错误: database.db_name 不能为空", .{});
         errors += 1;
@@ -1170,6 +1318,19 @@ pub fn validate(cfg: *const Config) !void {
         if (contract.name.len == 0) {
             log.err("配置错误: 合约名不能为空", .{});
             errors += 1;
+        }
+        if (contract.chain.len > 0) {
+            var known = false;
+            for (cfg.chains) |ch| {
+                if (std.mem.eql(u8, ch.name, contract.chain)) {
+                    known = true;
+                    break;
+                }
+            }
+            if (!known) {
+                log.err("配置错误: 合约 {s} 的 chain '{s}' 未在链配置中定义", .{ contract.name, contract.chain });
+                errors += 1;
+            }
         }
         if (contract.address.len == 0) {
             log.err("配置错误: 合约 {s} 的 address 不能为空", .{contract.name});
@@ -1808,6 +1969,21 @@ test "config: cors=true 的 cfg deinit 不崩溃（回归：释放静态字面�
     var cfg = try loadFromString(alloc, toml);
     defer cfg.deinit(alloc);
     try std.testing.expectEqualStrings("*", cfg.http.cors_origins[0]);
+    try std.testing.expectEqualStrings("", cfg.http.api_token);
+}
+
+test "config 解析 http.api_token" {
+    const alloc = std.testing.allocator;
+    const toml =
+        \\[http]
+        \\api_token = "s3cret"
+        \\
+        \\[rpc]
+        \\url = "https://example.com"
+    ;
+    var cfg = try loadFromString(alloc, toml);
+    defer cfg.deinit(alloc);
+    try std.testing.expectEqualStrings("s3cret", cfg.http.api_token);
 }
 
 test "config 解析 [[templates]]" {
@@ -2129,6 +2305,168 @@ test "config validate: 模板缺少 name / abi_path 被拒" {
     var no_abi = try loadTemplateFixture(alloc, "", "abi_path = \"\"\n");
     defer no_abi.deinit(alloc);
     try std.testing.expectError(error.InvalidConfig, validate(&no_abi));
+}
+
+test "config: 无 [[chains]] 时用 global.chain 与 rpc 合成一条链" {
+    const alloc = std.testing.allocator;
+    const toml =
+        \\[global]
+        \\chain = "bsc"
+        \\
+        \\[rpc]
+        \\url = "https://bsc.example.com"
+        \\ws_url = "wss://bsc.example.com/ws"
+        \\
+        \\[[contracts]]
+        \\name = "dai"
+        \\address = "0x1111111111111111111111111111111111111111"
+        \\abi_path = "./a.abi"
+        \\from_block = 1
+        \\events = ["Transfer"]
+    ;
+    var cfg = try loadFromString(alloc, toml);
+    defer cfg.deinit(alloc);
+    try validate(&cfg);
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.chains.len);
+    try std.testing.expectEqualStrings(cfg.global.chain, cfg.chains[0].name);
+    try std.testing.expectEqualStrings("bsc", cfg.chains[0].name);
+    try std.testing.expectEqual(@as(u64, 0), cfg.chains[0].chain_id);
+    try std.testing.expectEqualStrings(cfg.rpc.url, cfg.chains[0].rpc_url);
+    try std.testing.expectEqualStrings("wss://bsc.example.com/ws", cfg.chains[0].ws_url.?);
+    // 合成条目是独立副本，deinit 不能把 rpc/global 的内存再释放一次
+    try std.testing.expect(cfg.chains[0].name.ptr != cfg.global.chain.ptr);
+    try std.testing.expect(cfg.chains[0].rpc_url.ptr != cfg.rpc.url.ptr);
+    try std.testing.expect(cfg.chains[0].ws_url.?.ptr != cfg.rpc.ws_url.?.ptr);
+    try std.testing.expectEqualStrings("", cfg.contracts[0].chain);
+}
+
+test "config: 解析两条 [[chains]]" {
+    const alloc = std.testing.allocator;
+    const toml =
+        \\[global]
+        \\chain = "ignored"
+        \\
+        \\[rpc]
+        \\url = "https://fallback.example.com"
+        \\
+        \\[[chains]]
+        \\name = "ethereum"
+        \\chain_id = 1
+        \\rpc_url = "https://eth.example.com"
+        \\ws_url = "wss://eth.example.com/ws"
+        \\
+        \\[[chains]]
+        \\name = "bsc"
+        \\chain_id = 56
+        \\rpc_url = "https://bsc.example.com"
+        \\
+        \\[[contracts]]
+        \\name = "dai"
+        \\chain = "ethereum"
+        \\address = "0x1111111111111111111111111111111111111111"
+        \\abi_path = "./a.abi"
+        \\from_block = 1
+        \\events = ["Transfer"]
+    ;
+    var cfg = try loadFromString(alloc, toml);
+    defer cfg.deinit(alloc);
+    try validate(&cfg);
+
+    try std.testing.expectEqual(@as(usize, 2), cfg.chains.len);
+    try std.testing.expectEqualStrings("ethereum", cfg.chains[0].name);
+    try std.testing.expectEqual(@as(u64, 1), cfg.chains[0].chain_id);
+    try std.testing.expectEqualStrings("https://eth.example.com", cfg.chains[0].rpc_url);
+    try std.testing.expectEqualStrings("wss://eth.example.com/ws", cfg.chains[0].ws_url.?);
+    try std.testing.expectEqualStrings("bsc", cfg.chains[1].name);
+    try std.testing.expectEqual(@as(u64, 56), cfg.chains[1].chain_id);
+    try std.testing.expectEqualStrings("https://bsc.example.com", cfg.chains[1].rpc_url);
+    try std.testing.expect(cfg.chains[1].ws_url == null);
+    // 有 [[chains]] 时不以 [rpc]/[global] 再合成一条，但旧字段仍保留
+    try std.testing.expectEqualStrings("https://fallback.example.com", cfg.rpc.url);
+    try std.testing.expectEqualStrings("ignored", cfg.global.chain);
+    try std.testing.expectEqualStrings("ethereum", cfg.contracts[0].chain);
+}
+
+test "config validate: 合约 chain 必须指向已定义的链" {
+    const alloc = std.testing.allocator;
+    const toml =
+        \\[rpc]
+        \\url = "https://fallback.example.com"
+        \\
+        \\[[chains]]
+        \\name = "ethereum"
+        \\chain_id = 1
+        \\rpc_url = "https://eth.example.com"
+        \\
+        \\[[contracts]]
+        \\name = "dai"
+        \\chain = "nope"
+        \\address = "0x1111111111111111111111111111111111111111"
+        \\abi_path = "./a.abi"
+        \\from_block = 1
+        \\events = ["Transfer"]
+    ;
+    var cfg = try loadFromString(alloc, toml);
+    defer cfg.deinit(alloc);
+    try std.testing.expectEqualStrings("nope", cfg.contracts[0].chain);
+    try std.testing.expectError(error.InvalidConfig, validate(&cfg));
+}
+
+test "config: chains deinit 不泄漏" {
+    const alloc = std.testing.allocator;
+
+    const legacy =
+        \\[global]
+        \\chain = "polygon"
+        \\
+        \\[rpc]
+        \\url = "https://polygon.example.com"
+        \\ws_url = "wss://polygon.example.com/ws"
+        \\
+        \\[[contracts]]
+        \\name = "dai"
+        \\address = "0x1111111111111111111111111111111111111111"
+        \\abi_path = "./a.abi"
+        \\events = ["Transfer"]
+    ;
+    var legacy_cfg = try loadFromString(alloc, legacy);
+    legacy_cfg.deinit(alloc);
+
+    const multi =
+        \\[rpc]
+        \\url = "https://fallback.example.com"
+        \\
+        \\[[chains]]
+        \\name = "ethereum"
+        \\chain_id = 1
+        \\rpc_url = "https://eth.example.com"
+        \\ws_url = "wss://eth.example.com/ws"
+        \\
+        \\[[chains]]
+        \\name = "bsc"
+        \\chain_id = 56
+        \\rpc_url = "https://bsc.example.com"
+        \\ws_url = "wss://bsc.example.com/ws"
+        \\
+        \\[[contracts]]
+        \\name = "dai"
+        \\chain = "bsc"
+        \\address = "0x1111111111111111111111111111111111111111"
+        \\abi_path = "./a.abi"
+        \\events = ["Transfer"]
+    ;
+    var multi_cfg = try loadFromString(alloc, multi);
+    multi_cfg.deinit(alloc);
+
+    // 解析中途失败时，正在拼装的 current_chain 也必须释放
+    const bad =
+        \\[[chains]]
+        \\name = "ethereum"
+        \\rpc_url = "https://eth.example.com"
+        \\chain_id = nope
+    ;
+    try std.testing.expectError(error.InvalidCharacter, loadFromString(alloc, bad));
 }
 
 test "config validate: 模板名不得与合约名重复（事件表前缀冲突）" {

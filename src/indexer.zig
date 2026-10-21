@@ -6,6 +6,8 @@ const db = @import("db.zig");
 const abi = @import("abi.zig");
 const utils = @import("utils.zig");
 const log = @import("log.zig");
+const chain_pipeline = @import("chain_pipeline.zig");
+const log_cache_mod = @import("log_cache.zig");
 
 /// 单个合约的索引器状态
 pub const IndexerState = enum(u8) {
@@ -15,14 +17,19 @@ pub const IndexerState = enum(u8) {
     replaying,
 };
 
-/// Callback invoked after a factory contract event is successfully recorded.
+/// 工厂事件回调。返回 false 表示发现没有落库（建子索引器或写入
+/// template_addresses 失败），调用方应记死信并重试。非创建事件、已发现、
+/// 地址非法都返回 true。
 pub const FactoryCallback = *const fn (
     ctx: *anyopaque,
     factory_idx: usize,
     event_name: []const u8,
     fields: []const db.DecodedField,
     block_number: u64,
-) void;
+) bool;
+
+/// 父索引器回滚到 `fork_block`（含）之后调用。工厂用它停掉已作废的子索引器。
+pub const ReorgHook = *const fn (ctx: *anyopaque, chain: []const u8, fork_block: u64) void;
 
 pub const EventHookCallback = *const fn (
     ctx: ?*anyopaque,
@@ -36,7 +43,7 @@ pub const EventHookCallback = *const fn (
     /// 投影表要靠它给出可跳区块浏览器的稳定主键。
     tx_hash: []const u8,
     log_index: u64,
-) void;
+) bool;
 
 /// 模板模式下一个待补扫的 clone：发现区块起，补扫到"探测时的游标"为止。
 pub const PendingBackfill = struct { address: []const u8, from_block: u64 };
@@ -83,6 +90,16 @@ pub const TemplateAddressSet = struct {
             return false;
         };
         return true;
+    }
+
+    /// 撤销刚刚 `add` 进 pending、但还没成功落库的地址。只动 pending。
+    pub fn dropPending(self: *TemplateAddressSet, address: []const u8) void {
+        for (self.pending_list.items, 0..) |p, i| {
+            if (!std.mem.eql(u8, p.address, address)) continue;
+            const removed = self.pending_list.orderedRemove(i);
+            self.alloc.free(removed.address);
+            return;
+        }
     }
 
     /// 已知地址总数（live + 待补扫 pending）。
@@ -177,6 +194,67 @@ fn nextBackfillChunk(from: u64, batch_size: u64, to_exclusive: u64) ?[2]u64 {
     const batch = clampBatchSize(batch_size);
     if (from >= to_exclusive) return null;
     return .{ from, @min(from +| (batch - 1), backfillLast(to_exclusive)) };
+}
+
+/// 游标是下一待扫块。实时日志跳到更后面时，中间这段闭区间要先用 HTTP 补上。
+/// 同一块或更早的日志没有缺口。
+fn liveLogGap(cursor: u64, block_number: u64) ?[2]u64 {
+    if (block_number <= cursor) return null;
+    return .{ cursor, block_number - 1 };
+}
+
+/// 等 `eth_subscribe` 回执时丢掉的推送，最高块要按闭区间补扫（含游标所在的尖块）。
+/// 只补到尖块之前的话，同块后到的日志会把断点推过去，丢掉的那条不会再被拉到。
+fn droppedLiveRescan(cursor: u64, dropped_hi: ?u64) ?[2]u64 {
+    const hi = dropped_hi orelse return null;
+    if (hi < cursor) return null;
+    return .{ cursor, hi };
+}
+
+/// 这条实时日志要不要把断点推到 `block_number`。游标已经超过该块时返回 null：
+/// 同块后续日志和重连迟到的旧日志不能把 `last_synced_block` 拉回去，也不必再要一次区块 hash。
+fn liveSyncedBlock(cursor: u64, block_number: u64) ?u64 {
+    if (block_number < cursor) return null;
+    return block_number;
+}
+
+/// 游标已经超过节点链尖时不用补。相等时链尖这一块还没扫过，断线重连要扫它。
+fn bridgeNeedsScan(cursor: u64, latest: u64) bool {
+    return cursor <= latest;
+}
+
+/// 扫完这一块（含）之后要写下的断点：下一次要扫的块。
+/// 和退出时直接保存内存游标是同一个数，重启不会把刚扫完的块再要一次。
+fn cursorAfterBlock(done_block: u64) u64 {
+    return done_block +| 1;
+}
+
+/// 缺口补扫的下一段闭区间终点。`batch_size == 0` 按 1 块推进。
+fn nextLiveChunkEnd(from: u64, batch_size: u64, to_block: u64) ?u64 {
+    if (from > to_block) return null;
+    return inclusiveChunkEnd(from, batch_size, to_block);
+}
+
+/// 主循环这一跳的闭区间终点。`batch_size == 1` 时终点就是 `from`，只扫一块。
+fn inclusiveChunkEnd(from: u64, batch_size: u64, tip: u64) u64 {
+    return @min(from +| (clampBatchSize(batch_size) - 1), tip);
+}
+
+/// 模板实时订阅按 `max_addresses_per_request` 切块，每块一路 `eth_subscribe`。
+/// 没有 live 地址时继续等。
+const TemplateWsFit = enum { subscribe, wait };
+
+fn templateSubscriptionFit(live_count: usize, max_addresses: u32) TemplateWsFit {
+    _ = max_addresses;
+    if (live_count == 0) return .wait;
+    return .subscribe;
+}
+
+fn subscriptionChunkCount(live_count: usize, max_addresses: u32) usize {
+    var n: usize = 0;
+    var index: usize = 0;
+    while (addressChunkAt(live_count, max_addresses, index)) |_| : (index += 1) n += 1;
+    return n;
 }
 
 /// 批次大小下限夹紧：`block_batch_size = 0` 视为逐块（1），绝不退化为 0。
@@ -296,6 +374,8 @@ pub const Indexer = struct {
     chain: []const u8,
     factory_ctx: ?*anyopaque,
     factory_callback: ?FactoryCallback,
+    reorg_hook_ctx: ?*anyopaque = null,
+    reorg_hook: ?ReorgHook = null,
     /// 本索引器作为发现源时，挂在其上的工厂规则下标（可多条：一个发现源可以
     /// 有多条规则，各有 creation_event / child_address_field / 目标模板）。
     factory_idxs: std.ArrayListUnmanaged(usize) = .empty,
@@ -322,6 +402,12 @@ pub const Indexer = struct {
     /// 主 sweep 单次 `eth_getLogs` 携带的最大 clone 地址数（见 setMaxAddressesPerRequest）。
     /// 默认 `default_max_addresses_per_request`；测试用的结构体字面量省略该字段即取默认值。
     max_addresses_per_request: u32 = default_max_addresses_per_request,
+    /// 重放上界（含）。0 表示一直重放到链尖。只在索引线程里读写。
+    replay_limit: u64 = 0,
+    /// 死信退避用的当前时间（毫秒）。测试注入；省略时用墙钟，重启后仍遵守 `retry_after`。
+    dead_letter_now_ms: ?i64 = null,
+    /// 模板 live 地址或待补扫队列发生变化。WSS 读循环用它决定要不要拆掉当前订阅。
+    live_addr_gen: std.atomic.Value(u64) = .init(0),
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -401,6 +487,11 @@ pub const Indexer = struct {
         self.event_callback = cb;
     }
 
+    pub fn setReorgHook(self: *Indexer, ctx: *anyopaque, hook: ReorgHook) void {
+        self.reorg_hook_ctx = ctx;
+        self.reorg_hook = hook;
+    }
+
     /// 开启后事件回调携带链上区块时间戳（含惰性 RPC + 缓存）；默认关闭零开销。
     pub fn setEventTimestampsEnabled(self: *Indexer, enabled: bool) void {
         self.event_ts_needed = enabled;
@@ -473,25 +564,30 @@ pub const Indexer = struct {
 
     /// 登记一个新发现的 clone 地址（线程安全，可被工厂线程调用）。
     /// 入口统一归一化为小写 hex（携转约束 3：template_addresses 主键精确 TEXT 比较）。
-    /// 新地址先入内存 pending，再落库；落库失败只告警、不阻断发现（内存集合仍可用）。
-    pub fn discoverAddress(self: *Indexer, address: []const u8, from_block: u64) void {
-        if (!self.template_mode) return;
+    /// 返回 false 表示新地址没能写入 template_addresses：pending 已撤销，调用方应重试。
+    /// 已在集合里、非法地址、非模板模式都返回 true。
+    pub fn discoverAddress(self: *Indexer, address: []const u8, from_block: u64) bool {
+        if (!self.template_mode) return true;
 
         var lower_buf: [42]u8 = undefined;
         const normalized = normalizeHexAddress(&lower_buf, address) orelse {
             log.warn("模板 {s}: 忽略非法 clone 地址: {s}", .{ self.contract.name, address });
-            return;
+            return true;
         };
 
         self.lockTemplateSet();
         defer self.unlockTemplateSet();
 
-        if (!self.template_set.add(normalized, from_block)) return; // 已存在，幂等
+        if (!self.template_set.add(normalized, from_block)) return true; // 已存在，幂等
 
         // 持锁落库：保证补扫完成前的 markTemplateAddressBackfilled 不会作用于尚不存在的行。
         self.database.addTemplateAddress(self.contract.name, normalized, from_block) catch |e| {
-            log.warn("模板 {s}: clone 地址落库失败 {s}: {any}（内存集合仍生效，重启后可能丢失）", .{ self.contract.name, normalized, e });
+            log.warn("模板 {s}: clone 地址落库失败 {s}: {any}", .{ self.contract.name, normalized, e });
+            self.template_set.dropPending(normalized);
+            return false;
         };
+        self.noteLiveAddressesChanged();
+        return true;
     }
 
     /// 当前已知的 clone 地址总数（live + 待补扫），用于状态/指标展示。
@@ -524,21 +620,50 @@ pub const Indexer = struct {
         log.info("模板 {s}: 从库恢复 {d} 个 clone 地址", .{ self.contract.name, self.template_set.count() });
     }
 
-    /// 解析区块时间戳（惰性拉取 + 缓存）；失败或未开启返回 0。
+    /// 区间被节点拒绝时把批次减半，最小到 1。已经是单块则不再缩小。
+    fn shrinkBatch(self: *Indexer) bool {
+        if (self.batch_size <= 1) return false;
+        const new_batch = @max(self.batch_size / 2, 1);
+        log.warn("RPC 区间超限，batch_size {} → {}", .{ self.batch_size, new_batch });
+        self.batch_size = new_batch;
+        return true;
+    }
+
+    /// 解析区块时间戳。顺序：内存、blocks 表、节点。节点结果写回 blocks 表，重放不再按块打 RPC。
+    /// 失败或未开启返回 0。
     fn resolveBlockTimestamp(self: *Indexer, block_number: u64) u64 {
         if (!self.event_ts_needed) return 0;
         if (self.block_ts_cache.get(block_number)) |ts| return ts;
+        if (self.database.getBlockTimestamp(self.chain, block_number) catch null) |ts| {
+            self.rememberBlockTimestamp(block_number, ts);
+            return ts;
+        }
         const block_data = (self.rpc.getBlockData(block_number) catch return 0) orelse return 0;
         defer {
             self.alloc.free(block_data.hash);
             self.alloc.free(block_data.miner);
             self.alloc.free(block_data.base_fee_per_gas);
         }
-        const ts = block_data.timestamp;
-        // 上限保护：缓存过大时整体清空（最坏回退为重新拉取）
+        self.database.upsertBlock(.{
+            .chain = self.chain,
+            .block_number = block_data.number,
+            .block_hash = block_data.hash,
+            .timestamp = block_data.timestamp,
+            .miner = block_data.miner,
+            .gas_used = block_data.gas_used,
+            .gas_limit = block_data.gas_limit,
+            .base_fee_per_gas = block_data.base_fee_per_gas,
+            .transaction_count = block_data.transaction_count,
+        }) catch |e| {
+            log.warn("区块 {d} 时间戳落库失败: {any}", .{ block_number, e });
+        };
+        self.rememberBlockTimestamp(block_data.number, block_data.timestamp);
+        return block_data.timestamp;
+    }
+
+    fn rememberBlockTimestamp(self: *Indexer, block_number: u64, ts: u64) void {
         if (self.block_ts_cache.count() > 4096) self.block_ts_cache.clearRetainingCapacity();
         self.block_ts_cache.put(self.alloc, block_number, ts) catch {};
-        return ts;
     }
 
     pub fn deinit(self: *Indexer) void {
@@ -587,18 +712,19 @@ pub const Indexer = struct {
             self.thread = null;
         }
 
-        // 删除各事件表在目标范围内的数据
-        for (self.contract.events) |evt_name| {
-            self.database.deleteEventLogsInRange(self.contract.name, evt_name, from_block, to_block) catch |e| {
-                log.warn("删除事件日志失败 {s}.{s}: {any}", .{ self.contract.name, evt_name, e });
-            };
-        }
+        // to_block 为 0 或小于起点：删到链尖。有上界时只删闭区间，后面的事件和投影留着。
+        // 删除和断点在同一个事务里：崩溃后重启从 from_block 继续，不会停在旧链尖。
+        const bounded = log_cache_mod.replayUpper(from_block, to_block);
+        const delete_to = bounded orelse std.math.maxInt(u64);
+        self.database.resetForReplay(self.stateKey(), self.contract.name, self.contract.events, from_block, delete_to) catch |e| {
+            log.err("重放清理失败，游标未改: {any}", .{e});
+            return e;
+        };
 
+        self.replay_limit = bounded orelse 0;
         self.state.store(.replaying, .monotonic);
         self.current_block.store(from_block, .monotonic);
         log.info("合约 {s} 开始重放，从区块 {}", .{ self.contract.name, from_block });
-
-        self.state.store(.running, .monotonic);
         self.thread = try std.Thread.spawn(.{}, Indexer.runLoop, .{self});
     }
 
@@ -615,6 +741,7 @@ pub const Indexer = struct {
     /// 核心同步循环
     fn runLoop(self: *Indexer) void {
         while (self.state.load(.monotonic) == .running or self.state.load(.monotonic) == .replaying) {
+            self.retryDeadLetters();
             const latest_block = self.rpc.getBlockNumber() catch |e| {
                 log.err("获取最新区块失败: {any}，{d}ms 后重试", .{ e, self.poll_interval_ms });
                 std.Io.sleep(self.rpc.io, std.Io.Duration.fromMilliseconds(self.poll_interval_ms), .real) catch {};
@@ -627,13 +754,32 @@ pub const Indexer = struct {
             if (self.template_mode) self.processPendingBackfills();
 
             const current = self.current_block.load(.monotonic);
+            if (self.replay_limit != 0 and current > self.replay_limit) {
+                self.replay_limit = 0;
+                if (self.state.load(.monotonic) == .replaying) {
+                    self.state.store(.running, .monotonic);
+                    log.info("合约 {s} 重放窗口完成", .{self.contract.name});
+                }
+            }
             if (current >= latest_block) {
-                // 模板模式的 WSS 订阅需要随地址集合变化重订阅（Task 8+），暂不启用。
-                if (!self.template_mode and self.hasWsConfig()) {
-                    log.info("合约 {s} 已追上 tip (#{d})，切换到 WSS 订阅模式", .{ self.contract.name, latest_block });
+                if (self.state.load(.monotonic) == .replaying) {
+                    self.replay_limit = 0;
+                    self.state.store(.running, .monotonic);
+                    log.info("合约 {s} 重放完成", .{self.contract.name});
+                }
+                // 有 live 地址就进 WSS，地址按块分成多路订阅。还没有地址时留在 HTTP 轮询里等。
+                // 新 clone 会把读循环打断，补扫后再订。
+                if (self.hasWsConfig() and (!self.template_mode or self.templateLiveFit() == .subscribe)) {
+                    log.info("{s} {s} 已追上 tip (#{d})，切换到 WSS 订阅模式", .{
+                        if (self.template_mode) "模板" else "合约",
+                        self.contract.name,
+                        latest_block,
+                    });
                     self.runLiveWs();
-                    // runLiveWs 仅在停止时返回
-                    break;
+                    const still = self.state.load(.monotonic);
+                    if (still != .running and still != .replaying) break;
+                    if (!self.template_mode) break;
+                    continue;
                 }
                 std.Io.sleep(self.rpc.io, std.Io.Duration.fromMilliseconds(self.poll_interval_ms), .real) catch {};
                 continue;
@@ -652,17 +798,14 @@ pub const Indexer = struct {
                 }
             }
 
-            const to_block = @min(current + self.batch_size, latest_block);
+            var to_block = inclusiveChunkEnd(current, self.batch_size, latest_block);
+            if (self.replay_limit != 0) to_block = @min(to_block, self.replay_limit);
             log.debug("同步 {s}: 区块 {} ~ {}", .{ self.contract.name, current, to_block });
 
             self.syncRange(current, to_block) catch |e| {
                 if (e == error.RpcLimitExceeded) {
-                    const new_batch = @max(self.batch_size / 2, 100);
-                    log.warn("RPC limit exceeded, reducing batch_size from {} to {}", .{ self.batch_size, new_batch });
-                    self.batch_size = new_batch;
-                    // 已经是最小批次仍超限，等待更长时间让 RPC 冷却
-                    if (self.batch_size == 100) {
-                        log.warn("已达最小批次 100，等待 10s 后重试", .{});
+                    if (!self.shrinkBatch()) {
+                        log.warn("单块仍超过 RPC 上限，等待 10s 后重试", .{});
                         std.Io.sleep(self.rpc.io, std.Io.Duration.fromSeconds(10), .real) catch {};
                     }
                     continue;
@@ -690,11 +833,11 @@ pub const Indexer = struct {
                 };
             }
 
-            self.current_block.store(to_block + 1, .monotonic);
+            self.current_block.store(cursorAfterBlock(to_block), .monotonic);
 
             self.database.upsertSyncState(.{
                 .contract_address = self.stateKey(),
-                .last_synced_block = to_block,
+                .last_synced_block = self.current_block.load(.monotonic),
                 .status = "running",
             }) catch |e| {
                 log.err("更新同步状态失败: {any}", .{e});
@@ -704,10 +847,6 @@ pub const Indexer = struct {
                 log.err("创建快照失败: {any}", .{e});
             };
 
-            if (self.state.load(.monotonic) == .replaying and to_block >= latest_block) {
-                self.state.store(.running, .monotonic);
-                log.info("合约 {s} 重放完成", .{self.contract.name});
-            }
         }
 
         self.database.upsertSyncState(.{
@@ -747,17 +886,18 @@ pub const Indexer = struct {
         self.alloc.free(topics);
     }
 
-    /// HTTP 追到 tip，用于切入/重连 WSS 前的 gap bridge
+    /// HTTP 追到 tip，用于切入/重连 WSS 前的 gap bridge。
+    /// 游标停在链尖时这一块还没扫过，断线重连必须把它算进去。
     fn bridgeToTip(self: *Indexer) !void {
         while (self.state.load(.monotonic) == .running or self.state.load(.monotonic) == .replaying) {
             const latest = try self.rpc.getBlockNumber();
             const current = self.current_block.load(.monotonic);
-            if (current >= latest) return;
+            if (!bridgeNeedsScan(current, latest)) return;
 
-            const to_block = @min(current + self.batch_size, latest);
+            const to_block = inclusiveChunkEnd(current, self.batch_size, latest);
             self.syncRange(current, to_block) catch |e| {
                 if (e == error.RpcLimitExceeded) {
-                    self.batch_size = @max(self.batch_size / 2, 100);
+                    if (!self.shrinkBatch()) return e;
                     continue;
                 }
                 return e;
@@ -770,23 +910,51 @@ pub const Indexer = struct {
                 }
             } else |_| {}
 
-            self.current_block.store(to_block + 1, .monotonic);
+            self.current_block.store(cursorAfterBlock(to_block), .monotonic);
             self.database.upsertSyncState(.{
                 .contract_address = self.stateKey(),
-                .last_synced_block = to_block,
+                .last_synced_block = self.current_block.load(.monotonic),
                 .status = "running",
             }) catch {};
         }
     }
 
-    fn advanceAfterLiveLog(self: *Indexer, block_number: u64) void {
-        const cur = self.current_block.load(.monotonic);
-        if (block_number + 1 > cur) {
-            self.current_block.store(block_number + 1, .monotonic);
+    /// 把 `[from_block, to_block]` 按批次补上。每段成功后游标前移，中途失败时已完成的段留在库里。
+    fn fillLiveGap(self: *Indexer, from_block: u64, to_block: u64) !void {
+        var from = from_block;
+        while (nextLiveChunkEnd(from, self.batch_size, to_block)) |end| {
+            const state = self.state.load(.monotonic);
+            if (state != .running and state != .replaying) return error.Stopped;
+            self.syncRange(from, end) catch |e| {
+                if (e == error.RpcLimitExceeded) {
+                    if (!self.shrinkBatch()) return e;
+                    continue;
+                }
+                return e;
+            };
+            if (self.rpc.getBlockHash(end)) |hash| {
+                defer if (hash) |h| self.alloc.free(h);
+                if (hash) |h| {
+                    self.database.upsertBlockHash(self.stateKey(), end, h) catch {};
+                }
+            } else |_| {}
+            self.current_block.store(cursorAfterBlock(end), .monotonic);
+            self.database.upsertSyncState(.{
+                .contract_address = self.stateKey(),
+                .last_synced_block = self.current_block.load(.monotonic),
+                .status = "running",
+            }) catch {};
+            from = end + 1;
         }
+    }
+
+    fn advanceAfterLiveLog(self: *Indexer, block_number: u64) void {
+        const synced = liveSyncedBlock(self.current_block.load(.monotonic), block_number) orelse return;
+        const next = cursorAfterBlock(synced);
+        self.current_block.store(next, .monotonic);
         self.database.upsertSyncState(.{
             .contract_address = self.stateKey(),
-            .last_synced_block = block_number,
+            .last_synced_block = next,
             .status = "running",
         }) catch |e| {
             log.warn("WSS 更新同步状态失败: {any}", .{e});
@@ -810,7 +978,7 @@ pub const Indexer = struct {
         self.current_block.store(block_number, .monotonic);
         self.database.upsertSyncState(.{
             .contract_address = self.stateKey(),
-            .last_synced_block = if (block_number > 0) block_number - 1 else 0,
+            .last_synced_block = block_number,
             .status = "running",
         }) catch {};
     }
@@ -826,9 +994,11 @@ pub const Indexer = struct {
             self.contract.name,
             self.contract.events,
             fork_block,
+            self.chain,
         ) catch |e| {
             log.err("回滚数据失败: {any}", .{e});
         };
+        self.block_ts_cache.clearRetainingCapacity();
         if (self.template_mode) {
             self.lockTemplateSet();
             defer self.unlockTemplateSet();
@@ -836,6 +1006,7 @@ pub const Indexer = struct {
                 log.warn("清理克隆地址记录失败: {any}", .{e});
             };
             self.template_set.removeFromBlock(fork_block);
+            _ = self.live_addr_gen.fetchAdd(1, .release);
 
             // 补偿并发插入：`rollbackFromBlock` 是多语句事务，工厂线程的
             // `addTemplateAddress`（单语句）若恰好落在同一事务里，回滚（失败时的
@@ -850,11 +1021,22 @@ pub const Indexer = struct {
                 };
             }
         }
+        // 模板锁已经放开。钩子里会停子索引器并再回滚，不能在持锁时调用。
+        if (self.reorg_hook) |hook| {
+            if (self.reorg_hook_ctx) |ctx| hook(ctx, self.chain, fork_block);
+        }
+    }
+
+    /// 回滚数据并把游标放到分叉点，下一次同步从该块重新拉。
+    pub fn applyReorg(self: *Indexer, fork_block: u64) void {
+        self.rollbackTo(fork_block);
+        self.current_block.store(fork_block, .monotonic);
     }
 
     /// Tip 阶段：WSS eth_subscribe(logs)，断线后 HTTP bridge + 重连
     fn runLiveWs(self: *Indexer) void {
         var session = ws_rpc.Session.init(self.alloc, self.rpc.io);
+        session.setReadTimeoutMs(ws_rpc.idleTimeoutMs(self.rpc.config.request_timeout_ms));
         self.ws_session = &session;
         defer {
             self.ws_session = null;
@@ -866,6 +1048,17 @@ pub const Indexer = struct {
         var last_reorg_check_ms: i64 = 0;
 
         while (self.state.load(.monotonic) == .running or self.state.load(.monotonic) == .replaying) {
+            if (self.template_mode) {
+                self.processPendingBackfills();
+                switch (self.templateLiveFit()) {
+                    .wait => {
+                        std.Io.sleep(self.rpc.io, std.Io.Duration.fromMilliseconds(self.poll_interval_ms), .real) catch {};
+                        continue;
+                    },
+                    .subscribe => {},
+                }
+            }
+
             self.bridgeToTip() catch |e| {
                 log.err("WSS bridge 失败: {any}", .{e});
                 std.Io.sleep(self.rpc.io, std.Io.Duration.fromMilliseconds(self.poll_interval_ms), .real) catch {};
@@ -890,20 +1083,25 @@ pub const Indexer = struct {
             };
             defer self.freeEventTopics(topics);
 
-            const addrs = [_][]const u8{self.contract.address};
-            const filter = eth_rpc.LogFilter{
-                .addresses = &addrs,
-                .topics = if (topics.len > 0) topics else null,
-            };
-            const filter_obj = self.rpc.formatSubscribeLogsFilter(filter) catch |e| {
-                log.err("格式化 WSS filter 失败: {any}", .{e});
+            const addrs = self.snapshotSubscribeAddresses() catch |e| {
+                log.err("准备 WSS 地址失败: {any}", .{e});
                 session.close();
                 session.detachConnection();
                 break;
             };
-            defer self.alloc.free(filter_obj);
-
-            _ = session.subscribeLogs(filter_obj) catch |e| {
+            defer self.freeSubscribeAddresses(addrs);
+            if (self.template_mode and templateSubscriptionFit(addrs.len, self.max_addresses_per_request) != .subscribe) {
+                session.close();
+                session.detachConnection();
+                continue;
+            }
+            // 订之前记下生成号。分块订阅期间若又发现新地址，订完后拆掉重来，避免半套地址停在链上。
+            const subscribed_gen = self.live_addr_gen.load(.acquire);
+            const topic_filter: ?[]const []const u8 = if (topics.len > 0) topics else null;
+            const chunks = self.subscribeAddressChunks(&session, addrs, topic_filter) catch |e| {
+                self.recoverDroppedLive(&session) catch |re| {
+                    log.warn("订阅失败后补扫漏日志失败: {any}", .{re});
+                };
                 reconnect_attempt += 1;
                 const backoff_ms = 500 * std.math.pow(u32, 2, @min(reconnect_attempt, 5));
                 log.warn("eth_subscribe 失败，{d}ms 后重试: {any}", .{ backoff_ms, e });
@@ -912,16 +1110,53 @@ pub const Indexer = struct {
                 std.Io.sleep(self.rpc.io, std.Io.Duration.fromMilliseconds(backoff_ms), .real) catch {};
                 continue;
             };
+            if (chunks == 0) {
+                session.close();
+                session.detachConnection();
+                continue;
+            }
+            self.recoverDroppedLive(&session) catch |e| {
+                reconnect_attempt += 1;
+                const backoff_ms = 500 * std.math.pow(u32, 2, @min(reconnect_attempt, 5));
+                log.warn("订阅期间漏日志补扫失败，{d}ms 后重试: {any}", .{ backoff_ms, e });
+                session.close();
+                session.detachConnection();
+                std.Io.sleep(self.rpc.io, std.Io.Duration.fromMilliseconds(backoff_ms), .real) catch {};
+                continue;
+            };
+
+            if (self.templateSubscriptionStale(subscribed_gen)) {
+                log.info("{s} {s} 订阅完成时地址集合已变化，重新订阅", .{
+                    if (self.template_mode) "模板" else "合约",
+                    self.contract.name,
+                });
+                session.unsubscribe();
+                session.close();
+                session.detachConnection();
+                continue;
+            }
 
             reconnect_attempt = 0;
-            log.info("合约 {s} WSS 订阅已激活", .{self.contract.name});
+            log.info("{s} {s} WSS 订阅已激活（{d} 个地址，{d} 路）", .{
+                if (self.template_mode) "模板" else "合约",
+                self.contract.name,
+                addrs.len,
+                chunks,
+            });
 
             // 二次 bridge：覆盖 subscribe 前后可能漏掉的块
             self.bridgeToTip() catch |e| {
                 log.warn("订阅后 bridge 失败: {any}", .{e});
             };
 
+            var address_changed = false;
             while (self.state.load(.monotonic) == .running or self.state.load(.monotonic) == .replaying) {
+                if (self.templateSubscriptionStale(subscribed_gen)) {
+                    log.info("模板 {s} 地址集合变化，重新订阅", .{self.contract.name});
+                    address_changed = true;
+                    break;
+                }
+                self.retryDeadLetters();
                 const event = session.readEvent() catch |e| {
                     log.warn("WSS 读事件失败: {any}，准备重连", .{e});
                     break;
@@ -935,24 +1170,33 @@ pub const Indexer = struct {
 
                         if (lg.removed) {
                             self.handleRemovedLog(lg.block_number);
+                            if (self.template_mode) {
+                                address_changed = true;
+                                break;
+                            }
                             continue;
+                        }
+                        if (self.templateSubscriptionStale(subscribed_gen)) {
+                            address_changed = true;
+                            break;
+                        }
+
+                        // 订阅可能跳块。先把游标到这条日志之间的块用 HTTP 补齐，再处理本条，
+                        // 否则中间块既不进缓存也不进事件表，重启后游标已经越过它们。
+                        if (liveLogGap(self.current_block.load(.monotonic), lg.block_number)) |gap| {
+                            self.fillLiveGap(gap[0], gap[1]) catch |e| {
+                                log.warn("WSS 缺口 {d}~{d} 补扫失败: {any}，重连后先补再重试这条日志", .{ gap[0], gap[1], e });
+                                self.recordFailedLog(lg, @errorName(e));
+                                break;
+                            };
                         }
 
                         self.processLog(lg) catch |e| {
                             log.warn("WSS 日志处理失败 (tx: {s}): {any}", .{ lg.transaction_hash, e });
-                            const topics_json = formatTopicsJson(self.alloc, lg.topics) catch continue;
-                            defer self.alloc.free(topics_json);
-                            self.database.insertRawLog(
-                                self.stateKey(),
-                                lg.block_number,
-                                lg.transaction_hash,
-                                lg.log_index,
-                                topics_json,
-                                lg.data,
-                                @errorName(e),
-                            ) catch {};
+                            self.recordFailedLog(lg, @errorName(e));
                             continue;
                         };
+                        self.rememberLiveLog(lg);
 
                         self.advanceAfterLiveLog(lg.block_number);
 
@@ -982,6 +1226,7 @@ pub const Indexer = struct {
             session.detachConnection();
 
             if (self.state.load(.monotonic) != .running and self.state.load(.monotonic) != .replaying) break;
+            if (address_changed or self.templateSubscriptionStale(subscribed_gen)) continue;
 
             reconnect_attempt += 1;
             const backoff_ms = 500 * std.math.pow(u32, 2, @min(reconnect_attempt, 5));
@@ -989,6 +1234,133 @@ pub const Indexer = struct {
             std.Io.sleep(self.rpc.io, std.Io.Duration.fromMilliseconds(backoff_ms), .real) catch {};
         }
     }
+
+fn topic0Allowed(filter: ?[]const []const u8, topics: []const []const u8) bool {
+    const want = filter orelse return true;
+    if (want.len == 0) return true;
+    if (topics.len == 0) return false;
+    for (want) |topic| {
+        if (std.ascii.eqlIgnoreCase(topic, topics[0])) return true;
+    }
+    return false;
+}
+
+fn sameHoles(a: []const log_cache_mod.BlockSpan, b: []const log_cache_mod.BlockSpan) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (x.from_block != y.from_block or x.to_block != y.to_block) return false;
+    }
+    return true;
+}
+
+fn rpcLogLess(_: void, a: eth_rpc.Log, b: eth_rpc.Log) bool {
+    return chain_pipeline.logBefore(a.block_number, a.log_index, b.block_number, b.log_index);
+}
+
+const LogPage = struct {
+    keep: usize,
+    end_block: u64,
+    truncated: bool,
+};
+
+/// 按区块排好后，页满时只留下最高区块之前的日志。那些块的日志已经齐了。
+fn cutLogPage(logs: []eth_rpc.Log, from_block: u64, to_block: u64) LogPage {
+    std.mem.sort(eth_rpc.Log, logs, {}, rpcLogLess);
+    var max_block = from_block;
+    for (logs) |lg| max_block = @max(max_block, lg.block_number);
+    const end = log_cache_mod.pageEnd(from_block, to_block, max_block, logs.len, log_cache_mod.getlogs_page_limit) orelse {
+        return .{ .keep = 0, .end_block = from_block, .truncated = true };
+    };
+    if (logs.len < log_cache_mod.getlogs_page_limit) {
+        return .{ .keep = logs.len, .end_block = end, .truncated = false };
+    }
+    var keep: usize = 0;
+    while (keep < logs.len and logs[keep].block_number <= end) : (keep += 1) {}
+    return .{ .keep = keep, .end_block = end, .truncated = true };
+}
+
+/// 单块的返回被节点截断、且这次带了多个地址时，返回对半拆的下标。
+/// 区间还不止一块时交给外层把区块批次缩小；只剩一个地址时拆无可拆。
+fn splitAddressCount(address_count: usize, from_block: u64, to_block: u64) ?usize {
+    if (from_block != to_block or address_count < 2) return null;
+    return address_count / 2;
+}
+
+/// 单块、地址已经拆尽，但一次请求里有多个事件时，按事件对半拆。
+/// 只剩一个事件时，改走 `eth_getBlockReceipts`，不再把同一请求重试下去。
+fn splitTopicCount(topic_count: usize, from_block: u64, to_block: u64) ?usize {
+    if (from_block != to_block or topic_count < 2) return null;
+    return topic_count / 2;
+}
+
+fn joinTopics(alloc: std.mem.Allocator, topics: []const []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(alloc);
+    for (topics, 0..) |topic, i| {
+        if (i > 0) try buf.append(alloc, ',');
+        try buf.appendSlice(alloc, topic);
+    }
+    return buf.toOwnedSlice(alloc);
+}
+
+fn splitTopics(alloc: std.mem.Allocator, topics: []const u8) ![]const []const u8 {
+    if (topics.len == 0) return alloc.alloc([]const u8, 0);
+    var n: usize = 1;
+    for (topics) |ch| {
+        if (ch == ',') n += 1;
+    }
+    const out = try alloc.alloc([]const u8, n);
+    var i: usize = 0;
+    var it = std.mem.splitScalar(u8, topics, ',');
+    while (it.next()) |part| {
+        if (i >= out.len) break;
+        out[i] = part;
+        i += 1;
+    }
+    return out;
+}
+
+fn chainLogsFromRpc(alloc: std.mem.Allocator, logs: []const eth_rpc.Log) ![]log_cache_mod.ChainLogIn {
+    const out = try alloc.alloc(log_cache_mod.ChainLogIn, logs.len);
+    var filled: usize = 0;
+    errdefer {
+        for (out[0..filled]) |row| alloc.free(row.topics);
+        alloc.free(out);
+    }
+    for (logs) |lg| {
+        out[filled] = .{
+            .address = lg.address,
+            .block_number = lg.block_number,
+            .tx_hash = lg.transaction_hash,
+            .log_index = lg.log_index,
+            .topics = try joinTopics(alloc, lg.topics),
+            .data = lg.data,
+        };
+        filled += 1;
+    }
+    return out;
+}
+
+fn freeChainLogInputs(alloc: std.mem.Allocator, rows: []log_cache_mod.ChainLogIn) void {
+    for (rows) |row| alloc.free(row.topics);
+    alloc.free(rows);
+}
+
+fn rememberLiveLog(self: *Indexer, lg: eth_rpc.Log) void {
+    if (!self.database.logCacheEnabled()) return;
+    const topics = joinTopics(self.alloc, lg.topics) catch return;
+    defer self.alloc.free(topics);
+    self.database.insertChainLog(self.chain, .{
+        .address = lg.address,
+        .block_number = lg.block_number,
+        .tx_hash = lg.transaction_hash,
+        .log_index = lg.log_index,
+        .topics = topics,
+        .data = lg.data,
+    }) catch |e| {
+        log.warn("原始日志缓存写入失败: {any}", .{e});
+    };
+}
 
     /// 同步指定区块范围。
     /// - 单合约模式：只过滤该合约地址
@@ -1010,9 +1382,8 @@ pub const Indexer = struct {
     /// getLogs 按地址过滤）。
     ///
     /// 但若前几块已落库、后面的块失败，整轮 `try` 中断后下一轮会重取整段，重复日志仍会到达
-    /// `processLog`。此时靠 `insertEventLog` 返回 false 把重复**静默跳过**：行不重复写，
-    /// 且跳过时**不**执行余额追踪、**不**触发 factory/event 回调与投影——所以既不会污染
-    /// raw_logs 死信表，也不会二次累加。
+    /// `processLog`。`insertEventLog` 返回 false 时不写第二行，也不跑余额追踪和事件回调，
+    /// 所以投影不会二次累加。工厂发现仍会再跑，并且必须幂等。
     fn syncRangeWithAddresses(
         self: *Indexer,
         addresses: []const []const u8,
@@ -1026,12 +1397,14 @@ pub const Indexer = struct {
 
         const topics = try self.buildEventTopics();
         defer self.freeEventTopics(topics);
+        const topics_key = try log_cache_mod.topicsKey(self.alloc, topics);
+        defer self.alloc.free(topics_key);
         const topics_opt: ?[]const []const u8 = if (topics.len > 0) topics else null;
 
         // 分块只影响"一次请求带多少地址"；区间边界（from/to）与单块路径完全一致。
         var chunk: usize = 0;
         while (addressChunkAt(addresses.len, self.max_addresses_per_request, chunk)) |b| : (chunk += 1) {
-            try self.syncRangeChunk(addresses[b[0]..b[1]], topics_opt, from_block, to_block);
+            try self.syncRangeChunk(addresses[b[0]..b[1]], topics_opt, topics_key, from_block, to_block);
         }
     }
 
@@ -1040,40 +1413,442 @@ pub const Indexer = struct {
         self: *Indexer,
         addresses: []const []const u8,
         topics: ?[]const []const u8,
+        topics_key: []const u8,
+        from_block: u64,
+        to_block: u64,
+    ) !void {
+        if (self.database.logCacheEnabled()) {
+            return self.syncRangeChunkCached(addresses, topics, topics_key, from_block, to_block);
+        }
+        return self.pullUncached(addresses, topics, from_block, to_block);
+    }
+
+    /// `eth_getLogs` 在这一块上已经拆无可拆。收据里带这一块的全部日志，再按地址和 topic0 留下要的。
+    fn loadBlockReceipts(
+        self: *Indexer,
+        addresses: []const []const u8,
+        topics: ?[]const []const u8,
+        block: u64,
+    ) ![]eth_rpc.Log {
+        log.warn("区块 {d} 的 eth_getLogs 被截断且无法再拆，改拉 eth_getBlockReceipts", .{block});
+        return self.rpc.getBlockReceiptLogs(block, addresses, topics);
+    }
+
+    fn consumeReceiptBlock(
+        self: *Indexer,
+        addresses: []const []const u8,
+        topics: ?[]const []const u8,
+        block: u64,
+    ) !void {
+        const via = try self.loadBlockReceipts(addresses, topics, block);
+        defer eth_rpc.freeLogs(self.alloc, via);
+        try self.processFetchedLogs(via);
+    }
+
+    fn storeReceiptBlock(
+        self: *Indexer,
+        addresses: []const []const u8,
+        topics: ?[]const []const u8,
+        topics_key: []const u8,
+        block: u64,
+    ) !void {
+        const via = try self.loadBlockReceipts(addresses, topics, block);
+        defer eth_rpc.freeLogs(self.alloc, via);
+        const stored = try chainLogsFromRpc(self.alloc, via);
+        defer freeChainLogInputs(self.alloc, stored);
+        try self.database.storeLogCacheBatch(self.chain, addresses, topics_key, block, block, stored);
+        try self.processFetchedLogs(via);
+    }
+
+    fn appendReceiptLogs(
+        self: *Indexer,
+        addresses: []const []const u8,
+        topics: ?[]const []const u8,
+        block: u64,
+        out: *std.ArrayList(eth_rpc.Log),
+    ) !void {
+        const via = try self.loadBlockReceipts(addresses, topics, block);
+        out.ensureUnusedCapacity(self.alloc, via.len) catch |e| {
+            eth_rpc.freeLogs(self.alloc, via);
+            return e;
+        };
+        for (via) |lg| out.appendAssumeCapacity(lg);
+        self.alloc.free(via);
+    }
+
+    /// 不走缓存的一次拉取。单块被截断且地址不止一个时对半再拉，避免游标停在这一块上。
+    fn pullUncached(
+        self: *Indexer,
+        addresses: []const []const u8,
+        topics: ?[]const []const u8,
         from_block: u64,
         to_block: u64,
     ) !void {
         const filter = makeLogFilter(addresses, topics, from_block, to_block) orelse return;
-
-        const logs = try self.rpc.getLogs(filter);
+        const logs = self.rpc.getLogs(filter) catch |e| {
+            if (e == error.RpcLimitExceeded and from_block == to_block) {
+                return self.consumeReceiptBlock(addresses, topics, from_block);
+            }
+            return e;
+        };
         defer eth_rpc.freeLogs(self.alloc, logs);
+        const page = cutLogPage(logs, from_block, to_block);
+        if (page.truncated and page.keep == 0) {
+            if (splitAddressCount(addresses.len, from_block, to_block)) |mid| {
+                log.warn("区块 {d} 日志达到节点上限，{d} 个地址拆成两段再拉", .{ from_block, addresses.len });
+                try self.pullUncached(addresses[0..mid], topics, from_block, to_block);
+                try self.pullUncached(addresses[mid..], topics, from_block, to_block);
+                return;
+            }
+            if (topics) |list| {
+                if (splitTopicCount(list.len, from_block, to_block)) |mid| {
+                    log.warn("区块 {d} 日志达到节点上限，{d} 个事件拆成两段再拉", .{ from_block, list.len });
+                    var merged: std.ArrayList(eth_rpc.Log) = .empty;
+                    defer {
+                        for (merged.items) |lg| eth_rpc.freeLog(self.alloc, lg);
+                        merged.deinit(self.alloc);
+                    }
+                    try self.appendBlockLogs(addresses, list[0..mid], from_block, to_block, &merged);
+                    try self.appendBlockLogs(addresses, list[mid..], from_block, to_block, &merged);
+                    try self.processFetchedLogs(merged.items);
+                    return;
+                }
+            }
+            if (from_block == to_block) return self.consumeReceiptBlock(addresses, topics, from_block);
+            return error.RpcLimitExceeded;
+        }
+        try self.processFetchedLogs(logs[0..page.keep]);
+        if (page.truncated) {
+            log.warn("eth_getLogs 返回 {d} 条，只确认到区块 {d}，其余下轮再要", .{ logs.len, page.end_block });
+            return error.RpcLimitExceeded;
+        }
+    }
 
+    /// 把这一段的日志追加进 `out`，调用方再按 log index 排序后统一处理。
+    /// 事件对半拆开时不能各自落库：缓存覆盖键是整组事件，先标覆盖会把没拉到的事件当成已经齐了。
+    fn appendBlockLogs(
+        self: *Indexer,
+        addresses: []const []const u8,
+        topics: ?[]const []const u8,
+        from_block: u64,
+        to_block: u64,
+        out: *std.ArrayList(eth_rpc.Log),
+    ) !void {
+        const filter = makeLogFilter(addresses, topics, from_block, to_block) orelse return;
+        const logs = self.rpc.getLogs(filter) catch |e| {
+            if (e == error.RpcLimitExceeded and from_block == to_block) {
+                return self.appendReceiptLogs(addresses, topics, from_block, out);
+            }
+            return e;
+        };
+        const page = cutLogPage(logs, from_block, to_block);
+        if (page.truncated and page.keep == 0) {
+            eth_rpc.freeLogs(self.alloc, logs);
+            if (splitAddressCount(addresses.len, from_block, to_block)) |mid| {
+                try self.appendBlockLogs(addresses[0..mid], topics, from_block, to_block, out);
+                try self.appendBlockLogs(addresses[mid..], topics, from_block, to_block, out);
+                return;
+            }
+            const list = topics orelse {
+                if (from_block == to_block) return self.appendReceiptLogs(addresses, null, from_block, out);
+                return error.RpcLimitExceeded;
+            };
+            if (splitTopicCount(list.len, from_block, to_block)) |mid| {
+                try self.appendBlockLogs(addresses, list[0..mid], from_block, to_block, out);
+                try self.appendBlockLogs(addresses, list[mid..], from_block, to_block, out);
+                return;
+            }
+            if (from_block == to_block) return self.appendReceiptLogs(addresses, list, from_block, out);
+            return error.RpcLimitExceeded;
+        }
+        self.takeKeptLogs(logs, page.keep, out) catch |e| {
+            eth_rpc.freeLogs(self.alloc, logs);
+            return e;
+        };
+        if (page.truncated) return error.RpcLimitExceeded;
+    }
+
+    /// 成功后 `logs[0..keep]` 的所有权转到 `out`，其余释放。失败时不动 `logs`。
+    fn takeKeptLogs(self: *Indexer, logs: []eth_rpc.Log, keep: usize, out: *std.ArrayList(eth_rpc.Log)) !void {
+        try out.ensureUnusedCapacity(self.alloc, keep);
+        for (logs[0..keep]) |lg| out.appendAssumeCapacity(lg);
+        for (logs[keep..]) |lg| eth_rpc.freeLog(self.alloc, lg);
+        self.alloc.free(logs);
+    }
+
+    /// 缺口相同的地址合成一组，一组一次 eth_getLogs。全冷的块只有一个缺口，仍是一次请求。
+    fn syncRangeChunkCached(
+        self: *Indexer,
+        addresses: []const []const u8,
+        topics: ?[]const []const u8,
+        topics_key: []const u8,
+        from_block: u64,
+        to_block: u64,
+    ) !void {
+        const Group = struct {
+            holes: []log_cache_mod.BlockSpan,
+            addrs: std.ArrayList([]const u8),
+        };
+        var groups: std.ArrayList(Group) = .empty;
+        defer {
+            for (groups.items) |*g| {
+                self.alloc.free(g.holes);
+                g.addrs.deinit(self.alloc);
+            }
+            groups.deinit(self.alloc);
+        }
+
+        for (addresses) |address| {
+            const holes = try self.database.uncoveredLogRanges(self.chain, address, topics_key, from_block, to_block);
+            var placed = false;
+            for (groups.items) |*g| {
+                if (!sameHoles(g.holes, holes)) continue;
+                g.addrs.append(self.alloc, address) catch |e| {
+                    self.alloc.free(holes);
+                    return e;
+                };
+                placed = true;
+                break;
+            }
+            if (placed) {
+                self.alloc.free(holes);
+                continue;
+            }
+            var addrs: std.ArrayList([]const u8) = .empty;
+            addrs.append(self.alloc, address) catch |e| {
+                self.alloc.free(holes);
+                return e;
+            };
+            groups.append(self.alloc, .{ .holes = holes, .addrs = addrs }) catch |e| {
+                addrs.deinit(self.alloc);
+                self.alloc.free(holes);
+                return e;
+            };
+        }
+
+        for (groups.items) |g| {
+            try self.syncHoleGroup(g.addrs.items, g.holes, topics, topics_key, from_block, to_block);
+        }
+    }
+
+    fn syncHoleGroup(
+        self: *Indexer,
+        addresses: []const []const u8,
+        holes: []const log_cache_mod.BlockSpan,
+        topics: ?[]const []const u8,
+        topics_key: []const u8,
+        from_block: u64,
+        to_block: u64,
+    ) !void {
+        var cursor = from_block;
+        for (holes) |hole| {
+            if (hole.from_block > cursor) {
+                try self.replayCachedAddresses(addresses, topics, cursor, hole.from_block - 1);
+            }
+            try self.fetchStoreProcess(addresses, topics, topics_key, hole.from_block, hole.to_block);
+            if (hole.to_block == std.math.maxInt(u64)) return;
+            cursor = hole.to_block + 1;
+        }
+        if (cursor <= to_block) try self.replayCachedAddresses(addresses, topics, cursor, to_block);
+    }
+
+    fn fetchStoreProcess(
+        self: *Indexer,
+        addresses: []const []const u8,
+        topics: ?[]const []const u8,
+        topics_key: []const u8,
+        from_block: u64,
+        to_block: u64,
+    ) !void {
+        const filter = makeLogFilter(addresses, topics, from_block, to_block) orelse return;
+        const logs = self.rpc.getLogs(filter) catch |e| {
+            if (e == error.RpcLimitExceeded and from_block == to_block) {
+                return self.storeReceiptBlock(addresses, topics, topics_key, from_block);
+            }
+            return e;
+        };
+        defer eth_rpc.freeLogs(self.alloc, logs);
+        const page = cutLogPage(logs, from_block, to_block);
+        if (page.truncated and page.keep == 0) {
+            if (splitAddressCount(addresses.len, from_block, to_block)) |mid| {
+                log.warn("区块 {d} 日志达到节点上限，{d} 个地址拆成两段再拉", .{ from_block, addresses.len });
+                try self.fetchStoreProcess(addresses[0..mid], topics, topics_key, from_block, to_block);
+                try self.fetchStoreProcess(addresses[mid..], topics, topics_key, from_block, to_block);
+                return;
+            }
+            if (topics) |list| {
+                if (splitTopicCount(list.len, from_block, to_block)) |mid| {
+                    log.warn("区块 {d} 日志达到节点上限，{d} 个事件拆成两段再拉", .{ from_block, list.len });
+                    var merged: std.ArrayList(eth_rpc.Log) = .empty;
+                    defer {
+                        for (merged.items) |lg| eth_rpc.freeLog(self.alloc, lg);
+                        merged.deinit(self.alloc);
+                    }
+                    try self.appendBlockLogs(addresses, list[0..mid], from_block, to_block, &merged);
+                    try self.appendBlockLogs(addresses, list[mid..], from_block, to_block, &merged);
+                    const stored = try chainLogsFromRpc(self.alloc, merged.items);
+                    defer freeChainLogInputs(self.alloc, stored);
+                    try self.database.storeLogCacheBatch(self.chain, addresses, topics_key, from_block, to_block, stored);
+                    try self.processFetchedLogs(merged.items);
+                    return;
+                }
+            }
+            if (from_block == to_block) return self.storeReceiptBlock(addresses, topics, topics_key, from_block);
+            return error.RpcLimitExceeded;
+        }
+        const kept = logs[0..page.keep];
+        const stored = try chainLogsFromRpc(self.alloc, kept);
+        defer freeChainLogInputs(self.alloc, stored);
+        try self.database.storeLogCacheBatch(self.chain, addresses, topics_key, from_block, page.end_block, stored);
+        try self.processFetchedLogs(kept);
+        if (page.truncated) {
+            log.warn("eth_getLogs 返回 {d} 条，只确认到区块 {d}，其余下轮再要", .{ logs.len, page.end_block });
+            return error.RpcLimitExceeded;
+        }
+    }
+
+    fn replayCachedAddresses(self: *Indexer, addresses: []const []const u8, topics_filter: ?[]const []const u8, from_block: u64, to_block: u64) !void {
+        var all: std.ArrayList(log_cache_mod.ChainLogRow) = .empty;
+        errdefer {
+            for (all.items) |*row| {
+                self.alloc.free(row.address);
+                self.alloc.free(row.tx_hash);
+                self.alloc.free(row.topics);
+                self.alloc.free(row.data);
+            }
+            all.deinit(self.alloc);
+        }
+        for (addresses) |address| {
+            const rows = try self.database.loadChainLogs(self.chain, address, from_block, to_block);
+            all.appendSlice(self.alloc, rows) catch |e| {
+                self.database.freeChainLogs(rows);
+                return e;
+            };
+            self.alloc.free(rows);
+        }
+        const slice = try all.toOwnedSlice(self.alloc);
+        defer self.database.freeChainLogs(slice);
+        std.mem.sort(log_cache_mod.ChainLogRow, slice, {}, struct {
+            fn less(_: void, a: log_cache_mod.ChainLogRow, b: log_cache_mod.ChainLogRow) bool {
+                if (a.block_number != b.block_number) return a.block_number < b.block_number;
+                return a.log_index < b.log_index;
+            }
+        }.less);
+        for (slice) |row| {
+            const topics = try splitTopics(self.alloc, row.topics);
+            defer self.alloc.free(topics);
+            if (!topic0Allowed(topics_filter, topics)) continue;
+            const cached_log: eth_rpc.Log = .{
+                .address = row.address,
+                .topics = topics,
+                .data = row.data,
+                .block_number = row.block_number,
+                .transaction_hash = row.tx_hash,
+                .log_index = row.log_index,
+            };
+            self.processLog(cached_log) catch |e| {
+                log.warn("缓存日志处理失败 (tx: {s}): {any}", .{ row.tx_hash, e });
+                self.recordFailedLog(cached_log, @errorName(e));
+            };
+        }
+    }
+
+    fn processFetchedLogs(self: *Indexer, logs: []eth_rpc.Log) !void {
         if (logs.len == 0) return;
 
-        log.info("合约 {s} 获取到 {d} 条日志 ({}~{})", .{ self.contract.name, logs.len, from_block, to_block });
+        // 节点返回的顺序不保证是链上顺序。先按区块和块内 log index 排好再写库，
+        // 同一批里的投影才能按发生顺序累加。
+        std.mem.sort(eth_rpc.Log, logs, {}, rpcLogLess);
+
+        log.info("合约 {s} 获取到 {d} 条日志", .{ self.contract.name, logs.len });
 
         for (logs) |lg| {
             self.processLog(lg) catch |e| {
                 log.warn("日志处理失败 (tx: {s}): {any}", .{ lg.transaction_hash, e });
-                // 写入 raw_logs 死信表，避免静默丢弃
-                const topics_json = formatTopicsJson(self.alloc, lg.topics) catch |fmt_err| {
-                    log.warn("topics JSON 构建失败: {any}", .{fmt_err});
-                    continue;
-                };
-                defer self.alloc.free(topics_json);
+                self.recordFailedLog(lg, @errorName(e));
+            };
+        }
+    }
 
-                self.database.insertRawLog(
-                    self.stateKey(),
-                    lg.block_number,
-                    lg.transaction_hash,
-                    lg.log_index,
-                    topics_json,
-                    lg.data,
-                    @errorName(e),
-                ) catch |db_err| {
-                    log.err("raw_logs 写入失败 (tx: {s}): {any}", .{ lg.transaction_hash, db_err });
-                };
+    /// 处理失败的日志写入死信。同一 `(合约, tx, log_index)` 只留一行，下一轮 `retryDeadLetters` 再跑。
+    fn recordFailedLog(self: *Indexer, lg: eth_rpc.Log, reason: []const u8) void {
+        const topics_json = formatTopicsJson(self.alloc, lg.topics) catch |fmt_err| {
+            log.warn("topics JSON 构建失败: {any}", .{fmt_err});
+            return;
+        };
+        defer self.alloc.free(topics_json);
+        self.database.insertRawLog(
+            self.stateKey(),
+            lg.block_number,
+            lg.transaction_hash,
+            lg.log_index,
+            topics_json,
+            lg.data,
+            reason,
+            lg.address,
+        ) catch |db_err| {
+            log.err("raw_logs 写入失败 (tx: {s}): {any}", .{ lg.transaction_hash, db_err });
+        };
+    }
+
+    /// 每轮最多重放这么多条死信，避免坏日志占满同步循环。
+    const raw_log_retry_batch: u64 = 16;
+
+    /// 失败次数翻倍等待：第 0 次失败后 1s，然后 2s、4s，封顶 256s。
+    fn deadLetterDelayMs(attempts_before: i64) i64 {
+        const capped: i64 = if (attempts_before <= 0) 0 else @min(attempts_before, 8);
+        const shift: u6 = @intCast(capped);
+        return @as(i64, 1000) << shift;
+    }
+
+    /// 墙钟毫秒。不用 `std.Io.Timestamp`：重试测试里的 RPC `io` 是 `undefined`。
+    fn wallTimeMs() i64 {
+        var ts: std.c.timespec = undefined;
+        if (std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts) != 0) return 0;
+        const sec: i64 = @intCast(ts.sec);
+        const nsec: i64 = @intCast(ts.nsec);
+        return sec * 1000 + @divTrunc(nsec, 1_000_000);
+    }
+
+    fn deadLetterNow(self: *Indexer) i64 {
+        return self.dead_letter_now_ms orelse wallTimeMs();
+    }
+
+    /// 把到期的 `raw_logs` 再送进 `processLog`。成功就删掉；失败则 attempts+1 并写下一次 `retry_after`。
+    fn retryDeadLetters(self: *Indexer) void {
+        if (self.database.backend_type == .rocksdb) return;
+        const now = self.deadLetterNow();
+        const rows = self.database.listRawLogs(self.stateKey(), raw_log_retry_batch, now) catch |e| {
+            log.warn("读取 raw_logs 失败: {any}", .{e});
+            return;
+        };
+        defer self.database.freeRawLogs(rows);
+        for (rows) |row| {
+            const retry_after = now + deadLetterDelayMs(row.attempts);
+            const topics = parseTopicsJson(self.alloc, row.topics) catch |e| {
+                log.warn("raw_logs topics 解析失败 (tx: {s}): {any}", .{ row.tx_hash, e });
+                self.database.bumpRawLogAttempt(row.id, retry_after) catch {};
                 continue;
+            };
+            defer {
+                for (topics) |t| self.alloc.free(t);
+                self.alloc.free(topics);
+            }
+            const address = if (row.log_address.len > 0) row.log_address else self.contract.address;
+            self.processLog(.{
+                .address = address,
+                .topics = topics,
+                .data = row.data,
+                .block_number = row.block_number,
+                .transaction_hash = row.tx_hash,
+                .log_index = row.log_index,
+            }) catch |e| {
+                log.warn("死信重试失败 (tx: {s}): {any}", .{ row.tx_hash, e });
+                self.database.bumpRawLogAttempt(row.id, retry_after) catch {};
+                continue;
+            };
+            self.database.deleteRawLog(row.id) catch |e| {
+                log.warn("删除 raw_logs 失败 (tx: {s}): {any}", .{ row.tx_hash, e });
             };
         }
     }
@@ -1082,7 +1857,7 @@ pub const Indexer = struct {
     /// 逐个 pending：区间 = `computeBackfillRange(发现块, 当前游标)`；补扫成功（或该区间已被
     /// 主 sweep 覆盖、无需补扫）后标记 backfilled → 并入 live，由主 sweep 接管后续区块。
     /// 失败则保持 pending、下一轮重试——边界重叠产生的重复日志由 `insertEventLog` 返回
-    /// false 静默跳过（不落第二行、不跑回调），因此补扫与主 sweep 不会重复投影。
+    /// false 跳过余额和事件回调（不落第二行），工厂发现仍会再跑一次且必须幂等。
     fn processPendingBackfills(self: *Indexer) void {
         const pending = self.snapshotPending() catch |e| {
             log.warn("模板 {s}: 补扫队列快照失败: {any}", .{ self.contract.name, e });
@@ -1100,9 +1875,9 @@ pub const Indexer = struct {
             if (range[0] < range[1]) {
                 self.backfillRange(p.address, range[0], range[1]) catch |e| {
                     if (e == error.RpcLimitExceeded) {
-                        const new_batch = @max(self.batch_size / 2, 100);
-                        log.warn("模板 {s}: 补扫触发 RPC limit，batch_size {} → {}", .{ self.contract.name, self.batch_size, new_batch });
-                        self.batch_size = new_batch;
+                        if (!self.shrinkBatch()) {
+                            log.warn("模板 {s}: 单块补扫仍超过 RPC 上限", .{self.contract.name});
+                        }
                     } else {
                         log.warn("模板 {s}: 补扫 {s} 失败 ({d}~{d}): {any}，保持 pending 下轮重试", .{ self.contract.name, p.address, range[0], range[1], e });
                     }
@@ -1135,6 +1910,95 @@ pub const Indexer = struct {
         self.lockTemplateSet();
         defer self.unlockTemplateSet();
         self.template_set.markBackfilled(address);
+        self.bumpLiveAddresses();
+    }
+
+    fn bumpLiveAddresses(self: *Indexer) void {
+        _ = self.live_addr_gen.fetchAdd(1, .release);
+    }
+
+    /// 工厂线程发现了新地址。生成号变化，并打断正在堵着的 WSS 读，好让索引线程先补扫再重订。
+    fn noteLiveAddressesChanged(self: *Indexer) void {
+        self.bumpLiveAddresses();
+        if (self.ws_session) |s| s.interrupt();
+    }
+
+    fn templateLiveFit(self: *Indexer) TemplateWsFit {
+        if (!self.template_mode) return .subscribe;
+        self.lockTemplateSet();
+        defer self.unlockTemplateSet();
+        return templateSubscriptionFit(self.template_set.live.items.len, self.max_addresses_per_request);
+    }
+
+    fn templateSubscriptionStale(self: *Indexer, subscribed_gen: u64) bool {
+        if (!self.template_mode) return false;
+        if (self.live_addr_gen.load(.acquire) != subscribed_gen) return true;
+        self.lockTemplateSet();
+        defer self.unlockTemplateSet();
+        return self.template_set.pending().len != 0;
+    }
+
+    /// 回执等待期间记下的最高块，用 HTTP 按闭区间补上。失败时保留块号，下次再补。
+    fn recoverDroppedLive(self: *Indexer, session: *ws_rpc.Session) !void {
+        const span = droppedLiveRescan(self.current_block.load(.monotonic), session.dropped_live_hi) orelse {
+            session.dropped_live_hi = null;
+            return;
+        };
+        try self.fillLiveGap(span[0], span[1]);
+        session.dropped_live_hi = null;
+    }
+
+    /// 按 `max_addresses_per_request` 把地址切成互不相交的块，每块一路 `eth_subscribe`。
+    /// 任一块失败就返回错误，调用方关掉整条连接后重订，不留下半套订阅。
+    fn subscribeAddressChunks(
+        self: *Indexer,
+        session: *ws_rpc.Session,
+        addrs: []const []const u8,
+        topics: ?[]const []const u8,
+    ) !usize {
+        var n: usize = 0;
+        var index: usize = 0;
+        while (addressChunkAt(addrs.len, self.max_addresses_per_request, index)) |span| : (index += 1) {
+            const slice = addrs[span[0]..span[1]];
+            if (slice.len == 0) continue;
+            const filter = eth_rpc.LogFilter{
+                .addresses = slice,
+                .topics = topics,
+            };
+            const filter_obj = try self.rpc.formatSubscribeLogsFilter(filter);
+            defer self.alloc.free(filter_obj);
+            _ = try session.subscribeLogs(filter_obj);
+            n += 1;
+        }
+        return n;
+    }
+
+    fn snapshotSubscribeAddresses(self: *Indexer) ![][]const u8 {
+        if (!self.template_mode) {
+            const out = try self.alloc.alloc([]const u8, 1);
+            errdefer self.alloc.free(out);
+            out[0] = try self.alloc.dupe(u8, self.contract.address);
+            return out;
+        }
+        self.lockTemplateSet();
+        defer self.unlockTemplateSet();
+        const src = self.template_set.live.items;
+        const out = try self.alloc.alloc([]const u8, src.len);
+        var filled: usize = 0;
+        errdefer {
+            for (out[0..filled]) |a| self.alloc.free(a);
+            self.alloc.free(out);
+        }
+        for (src) |a| {
+            out[filled] = try self.alloc.dupe(u8, a);
+            filled += 1;
+        }
+        return out;
+    }
+
+    fn freeSubscribeAddresses(self: *Indexer, addrs: [][]const u8) void {
+        for (addrs) |a| self.alloc.free(a);
+        self.alloc.free(addrs);
     }
 
     /// 在锁内快照 pending 队列（`discoverAddress` 可能从工厂线程并发追加），
@@ -1229,8 +2093,22 @@ pub const Indexer = struct {
 
                     // 去重判定：`insertEventLog` 返回 false 表示该
                     // `(contract_address, tx_hash, log_index)` 已存在（分块 getLogs 局部失败后
-                    // 重取整段时必然出现）。此时必须**整体早退**：不写 raw_logs（它不是"未静默
-                    // 丢弃的日志"）、不跑余额追踪、不触发 factory/event 回调——否则投影会二次累加。
+                    // 重取整段时必然出现）。余额追踪和事件回调必须跳过，否则投影会二次累加。
+                    // 工厂发现仍要跑：事件提交之后、发现落库之前进程可能退出，重启重取该块时
+                    // insert 返回 false，不跑工厂这条 clone 就永远不会进 template_addresses。
+                    //
+                    // 有回调时，事件行和回调里的投影写在同一个事务里。回调返回 false 则整段回滚，
+                    // 调用方把原始日志写入 raw_logs，下一轮重试才能再次进入回调。工厂在提交之后
+                    // 调用，避免持有写锁再去拿 template_mutex（rollbackTo 的锁序相反）。
+                    const block_ts = if (self.event_callback != null) self.resolveBlockTimestamp(lg.block_number) else 0;
+                    const guard_txn = self.event_callback != null and self.database.backend_type != .rocksdb;
+                    var txn_open = false;
+                    if (guard_txn) {
+                        try self.database.beginWrite();
+                        txn_open = true;
+                    }
+                    errdefer if (txn_open) self.database.rollbackWrite();
+
                     const inserted = try self.database.insertEventLog(
                         self.contract.name,
                         evt.name,
@@ -1244,7 +2122,10 @@ pub const Indexer = struct {
                         source_address,
                     );
                     if (!inserted) {
+                        if (txn_open) self.database.rollbackWrite();
+                        txn_open = false;
                         log.debug("跳过重复日志 {s}.{s} @ 区块 {}（tx: {s}, log_index: {}）", .{ self.contract.name, evt.name, lg.block_number, lg.transaction_hash, lg.log_index });
+                        if (!self.dispatchFactory(evt.name, db_fields.items, lg.block_number)) return error.FactoryFailed;
                         return;
                     }
 
@@ -1254,21 +2135,11 @@ pub const Indexer = struct {
 
                     log.debug("已写入 {s}.{s} @ 区块 {}", .{ self.contract.name, evt.name, lg.block_number });
 
-                    if (self.factory_callback) |cb| {
-                        if (self.factory_ctx) |fctx| {
-                            // 一个发现源可以挂多条规则（各有 creation_event /
-                            // child_address_field / 目标模板），逐条喂给工厂管理器。
-                            for (self.factory_idxs.items) |fi| {
-                                cb(fctx, fi, evt.name, db_fields.items, lg.block_number);
-                            }
-                        }
-                    }
                     if (self.event_callback) |cb| {
-                        const block_ts = self.resolveBlockTimestamp(lg.block_number);
                         // 事件来源地址：模板模式下是该事件所属的 clone；单合约模式下
                         // getLogs 只过滤 contract.address，故 lg.address 即 contract.address
                         // （与上方 insertEventLog 同一条不变量，共用同一归一化结果）。
-                        cb(
+                        const ok = cb(
                             self.event_callback_ctx,
                             self.contract.name,
                             evt.name,
@@ -1279,7 +2150,13 @@ pub const Indexer = struct {
                             lg.transaction_hash,
                             lg.log_index,
                         );
+                        if (!ok) return error.HandlerFailed;
                     }
+                    if (txn_open) {
+                        try self.database.commitWrite();
+                        txn_open = false;
+                    }
+                    if (!self.dispatchFactory(evt.name, db_fields.items, lg.block_number)) return error.FactoryFailed;
                     return;
                 }
             }
@@ -1289,9 +2166,22 @@ pub const Indexer = struct {
         return error.AbiMismatch;
     }
 
+    /// 把本条日志喂给挂在这个发现源上的全部工厂规则。没有工厂时返回 true。
+    fn dispatchFactory(self: *Indexer, event_name: []const u8, fields: []const db.DecodedField, block_number: u64) bool {
+        const cb = self.factory_callback orelse return true;
+        const fctx = self.factory_ctx orelse return true;
+        for (self.factory_idxs.items) |fi| {
+            if (!cb(fctx, fi, event_name, fields, block_number)) return false;
+        }
+        return true;
+    }
+
     /// 自动追踪 ERC-20 / Token 的 Transfer 事件，更新 account_states 表余额。
     /// `contract_address` 是日志来源地址（模板模式下区分各 clone 的余额）。
     fn trackTokenTransferState(self: *Indexer, contract_address: []const u8, fields: []const db.DecodedField, block_number: u64) void {
+        // 余额是累加值，没有按区块的历史。重放会先删事件再插入，若这里再加减一次就会算重。
+        // 重放期间保持原余额；新块在回到 .running 之后照常记。
+        if (self.state.load(.monotonic) == .replaying) return;
         var from_addr: ?[]const u8 = null;
         var to_addr: ?[]const u8 = null;
         var val_str: ?[]const u8 = null;
@@ -1439,11 +2329,50 @@ pub const Indexer = struct {
         return try buf.toOwnedSlice(alloc);
     }
 
+    /// 解析 `formatTopicsJson` 写出的 `["0x..","0x.."]`。调用方释放每个元素和切片本身。
+    fn parseTopicsJson(alloc: std.mem.Allocator, json: []const u8) ![][]u8 {
+        var list: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (list.items) |t| alloc.free(t);
+            list.deinit(alloc);
+        }
+        var i: usize = 0;
+        while (i < json.len) {
+            if (json[i] != '"') {
+                i += 1;
+                continue;
+            }
+            i += 1;
+            var buf: std.ArrayList(u8) = .empty;
+            errdefer buf.deinit(alloc);
+            while (i < json.len and json[i] != '"') {
+                if (json[i] == '\\' and i + 1 < json.len) {
+                    try buf.append(alloc, json[i + 1]);
+                    i += 2;
+                } else {
+                    try buf.append(alloc, json[i]);
+                    i += 1;
+                }
+            }
+            if (i < json.len and json[i] == '"') i += 1;
+            try list.append(alloc, try buf.toOwnedSlice(alloc));
+        }
+        return try list.toOwnedSlice(alloc);
+    }
+
+    /// 未写 `max_reorg_depth` 时用这个深度。写成 0 才是关闭检测。
+    /// 模板索引器和工厂子合约的配置里没有这个字段，省略不能等于不检测。
+    pub const default_reorg_depth: u32 = 64;
+
+    fn effectiveReorgDepth(configured: ?u32) u32 {
+        return configured orelse default_reorg_depth;
+    }
+
     /// 检测链重组并执行回滚。
     /// 返回应该恢复到的区块号（即 fork_point）。
     /// 如果没有检测到重组，返回传入的 block_number（表示无需回滚）。
     fn detectAndHandleReorg(self: *Indexer, block_number: u64) !u64 {
-        const reorg_depth = self.contract.max_reorg_depth orelse return block_number;
+        const reorg_depth = effectiveReorgDepth(self.contract.max_reorg_depth);
         if (reorg_depth == 0) return block_number;
 
         // 获取 RPC 上的当前 hash
@@ -1462,8 +2391,8 @@ pub const Indexer = struct {
         defer if (local_hash) |h| self.alloc.free(h);
         if (local_hash == null) return block_number; // 没有历史记录，无法检测
 
-        // hash 一致，无重组
-        if (std.mem.eql(u8, rpc_hash.?, local_hash.?)) return block_number;
+        // hash 一致，无重组。节点有时改大小写，按十六进制比较。
+        if (std.ascii.eqlIgnoreCase(rpc_hash.?, local_hash.?)) return block_number;
 
         // hash 不一致，发生重组。向后扫描找到分叉点
         log.warn("区块 {d} hash 不匹配: rpc={s}, local={s}", .{ block_number, rpc_hash.?, local_hash.? });
@@ -1479,7 +2408,7 @@ pub const Indexer = struct {
             defer if (scan_local) |h| self.alloc.free(h);
             if (scan_local == null) continue;
 
-            if (std.mem.eql(u8, scan_rpc.?, scan_local.?)) {
+            if (std.ascii.eqlIgnoreCase(scan_rpc.?, scan_local.?)) {
                 // 找到匹配点，fork_point = scan_block + 1
                 const fork_point = scan_block + 1;
                 log.warn("找到分叉点 @ 区块 {d}，回滚到 {d}", .{ scan_block, fork_point });
@@ -1499,6 +2428,71 @@ pub const Indexer = struct {
 // ============================================================================
 // 单元测试
 // ============================================================================
+
+test "未配置重组深度时用默认值，0 表示关闭" {
+    try std.testing.expectEqual(Indexer.default_reorg_depth, Indexer.effectiveReorgDepth(null));
+    try std.testing.expectEqual(@as(u32, 0), Indexer.effectiveReorgDepth(0));
+    try std.testing.expectEqual(@as(u32, 20), Indexer.effectiveReorgDepth(20));
+}
+
+test "WSS 跳块时中间区间要先补，同块和更早的日志没有缺口" {
+    try std.testing.expect(liveLogGap(100, 100) == null);
+    try std.testing.expect(liveLogGap(101, 100) == null);
+    try std.testing.expect(droppedLiveRescan(100, null) == null);
+    try std.testing.expect(droppedLiveRescan(101, 100) == null);
+    const tip = droppedLiveRescan(100, 100).?;
+    try std.testing.expectEqual(@as(u64, 100), tip[0]);
+    try std.testing.expectEqual(@as(u64, 100), tip[1]);
+    const ahead = droppedLiveRescan(100, 105).?;
+    try std.testing.expectEqual(@as(u64, 100), ahead[0]);
+    try std.testing.expectEqual(@as(u64, 105), ahead[1]);
+    const gap = liveLogGap(100, 105).?;
+    try std.testing.expectEqual(@as(u64, 100), gap[0]);
+    try std.testing.expectEqual(@as(u64, 104), gap[1]);
+    try std.testing.expectEqual(@as(u64, 101), nextLiveChunkEnd(100, 2, 104).?);
+    try std.testing.expectEqual(@as(u64, 104), nextLiveChunkEnd(103, 2, 104).?);
+    try std.testing.expect(bridgeNeedsScan(100, 100));
+    try std.testing.expect(bridgeNeedsScan(100, 105));
+    try std.testing.expect(!bridgeNeedsScan(101, 100));
+    try std.testing.expectEqual(@as(u64, 100), inclusiveChunkEnd(100, 1, 200));
+    try std.testing.expect(templateSubscriptionFit(0, 200) == .wait);
+    try std.testing.expect(templateSubscriptionFit(1, 200) == .subscribe);
+    try std.testing.expect(templateSubscriptionFit(200, 200) == .subscribe);
+    try std.testing.expect(templateSubscriptionFit(201, 200) == .subscribe);
+    try std.testing.expectEqual(@as(usize, 0), subscriptionChunkCount(0, 200));
+    try std.testing.expectEqual(@as(usize, 1), subscriptionChunkCount(1, 200));
+    try std.testing.expectEqual(@as(usize, 1), subscriptionChunkCount(200, 200));
+    try std.testing.expectEqual(@as(usize, 2), subscriptionChunkCount(201, 200));
+    try std.testing.expectEqual(@as(usize, 3), subscriptionChunkCount(401, 200));
+    try std.testing.expectEqual(inclusiveChunkEnd(100, 50, 200), nextLiveChunkEnd(100, 50, 200).?);
+    try std.testing.expectEqual(@as(u64, 200), inclusiveChunkEnd(190, 50, 200));
+    try std.testing.expect(nextLiveChunkEnd(105, 2, 104) == null);
+    try std.testing.expectEqual(@as(u64, 100), nextLiveChunkEnd(100, 0, 104).?);
+    try std.testing.expectEqual(@as(u64, 100), liveSyncedBlock(100, 100).?);
+    try std.testing.expectEqual(@as(u64, 105), liveSyncedBlock(100, 105).?);
+    try std.testing.expect(liveSyncedBlock(101, 100) == null);
+    try std.testing.expect(liveSyncedBlock(105, 90) == null);
+    try std.testing.expectEqual(@as(u64, 101), cursorAfterBlock(100));
+    try std.testing.expectEqual(std.math.maxInt(u64), cursorAfterBlock(std.math.maxInt(u64)));
+}
+
+test "单块日志被截断时按地址对半拆" {
+    try std.testing.expectEqual(@as(usize, 2), Indexer.splitAddressCount(4, 5, 5).?);
+    try std.testing.expectEqual(@as(usize, 1), Indexer.splitAddressCount(3, 8, 8).?);
+    try std.testing.expect(Indexer.splitAddressCount(1, 5, 5) == null);
+    try std.testing.expect(Indexer.splitAddressCount(4, 5, 9) == null);
+    try std.testing.expectEqual(@as(usize, 2), Indexer.splitTopicCount(4, 5, 5).?);
+    try std.testing.expectEqual(@as(usize, 1), Indexer.splitTopicCount(3, 8, 8).?);
+    try std.testing.expect(Indexer.splitTopicCount(1, 5, 5) == null);
+    try std.testing.expect(Indexer.splitTopicCount(4, 1, 9) == null);
+}
+
+test "缓存重放只认当前事件的 topic0" {
+    try std.testing.expect(Indexer.topic0Allowed(null, &.{"0xAA"}));
+    try std.testing.expect(Indexer.topic0Allowed(&.{"0xaa"}, &.{ "0xAA", "0x01" }));
+    try std.testing.expect(!Indexer.topic0Allowed(&.{"0xbb"}, &.{"0xAA"}));
+    try std.testing.expect(!Indexer.topic0Allowed(&.{"0xaa"}, &.{}));
+}
 
 test "formatTopicsJson" {
     const alloc = std.testing.allocator;
@@ -2047,8 +3041,8 @@ test "template 模板模式 API 接线（真实调用，杜绝惰性分析漏编
     try std.testing.expectEqual(@as(usize, 0), idx.templateAddressCount());
 
     // discoverAddress：入口归一化 + 幂等 + 落库
-    idx.discoverAddress("0xAbCdEf0123456789AbCdEf0123456789AbCdEf01", 100);
-    idx.discoverAddress("0xabcdef0123456789abcdef0123456789abcdef01", 100); // 归一化后同地址 → 幂等
+    try std.testing.expect(idx.discoverAddress("0xAbCdEf0123456789AbCdEf0123456789AbCdEf01", 100));
+    try std.testing.expect(idx.discoverAddress("0xabcdef0123456789abcdef0123456789abcdef01", 100)); // 归一化后同地址 → 幂等
     try std.testing.expectEqual(@as(usize, 1), idx.templateAddressCount());
     {
         const list = try database.listTemplateAddresses("curve");
@@ -2112,11 +3106,12 @@ test "事件回调携带日志来源地址（真实 processLog 路径）" {
         addr: *?[]const u8,
         event: *?[]const u8,
         count: *u32,
-        fn cb(ctx: ?*anyopaque, _: []const u8, event_name: []const u8, _: []const db.DecodedField, _: u64, _: u64, contract_address: []const u8, _: []const u8, _: u64) void {
+        fn cb(ctx: ?*anyopaque, _: []const u8, event_name: []const u8, _: []const db.DecodedField, _: u64, _: u64, contract_address: []const u8, _: []const u8, _: u64) bool {
             const self_ptr: *@This() = @ptrCast(@alignCast(ctx.?));
             self_ptr.addr.* = contract_address;
             self_ptr.event.* = event_name;
             self_ptr.count.* += 1;
+            return true;
         }
     };
     var ctx = Ctx{ .addr = &seen_addr, .event = &seen_event, .count = &cb_count };
@@ -2165,6 +3160,311 @@ test "事件回调携带日志来源地址（真实 processLog 路径）" {
     const raw_rows = try database.ponderQuery("SELECT COUNT(*) AS n FROM raw_logs;", &.{});
     defer database.freeQueryRows(raw_rows);
     try std.testing.expectEqual(@as(i64, 0), raw_rows[0].values[0].integer);
+}
+
+test "回调失败回滚事件与投影，死信重试后重新写入" {
+    const alloc = std.testing.allocator;
+    const db_cfg = db.DatabaseConfig{ .db_type = "sqlite", .db_name = ":memory:", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var database = try db.Client.init(alloc, &db_cfg);
+    defer database.deinit();
+    try database.migrate();
+    _ = try database.ponderExec("CREATE TABLE proj_note (block_number INTEGER, n INTEGER);", &.{});
+
+    var rpc_cfg = config.RpcConfig{ .url = "", .retry_count = 0, .retry_delay_ms = 0, .request_timeout_ms = 0, .max_concurrent = 0 };
+    var rpc = eth_rpc.Client.init(alloc, undefined, &rpc_cfg);
+    defer rpc.deinit();
+
+    const contract = config.ContractConfig{
+        .name = "curve",
+        .address = "0xSINGLE",
+        .abi_path = "",
+        .from_block = 0,
+        .events = &.{"CurveCreated"},
+        .start_block = null,
+        .block_batch_size = null,
+        .poll_interval_ms = null,
+        .max_reorg_depth = null,
+        .filters = &.{},
+    };
+    const inputs = try alloc.alloc(abi.AbiEventInput, 1);
+    inputs[0] = .{ .name = try alloc.dupe(u8, "curve"), .type = try alloc.dupe(u8, "uint256"), .indexed = false };
+    const events = try alloc.alloc(abi.AbiEvent, 1);
+    events[0] = .{ .name = try alloc.dupe(u8, "CurveCreated"), .inputs = inputs, .signature = std.mem.zeroes([32]u8) };
+    var ac = abi.AbiContract{ .events = events, .functions = try alloc.alloc(abi.AbiFunction, 0) };
+    try database.autoMigrateContract("curve", &ac, &.{"CurveCreated"}, "0xSINGLE");
+
+    var idx = testIndexerWithDb(alloc, &database, &rpc, &contract);
+    defer idx.deinit();
+    idx.abi_contract = ac;
+
+    var calls: u32 = 0;
+    const Ctx = struct {
+        database: *db.Client,
+        calls: *u32,
+        fn cb(ctx: ?*anyopaque, _: []const u8, _: []const u8, _: []const db.DecodedField, block_number: u64, _: u64, _: []const u8, _: []const u8, _: u64) bool {
+            const self_ptr: *@This() = @ptrCast(@alignCast(ctx.?));
+            self_ptr.calls.* += 1;
+            _ = self_ptr.database.ponderExec("INSERT INTO proj_note (block_number, n) VALUES (?, ?);", &.{
+                .{ .integer = @intCast(block_number) },
+                .{ .integer = 1 },
+            }) catch return false;
+            return self_ptr.calls.* > 1;
+        }
+    };
+    var ctx = Ctx{ .database = &database, .calls = &calls };
+    idx.setEventCallback(&ctx, Ctx.cb);
+
+    var topic0_buf: [66]u8 = undefined;
+    @memset(&topic0_buf, '0');
+    topic0_buf[0] = '0';
+    topic0_buf[1] = 'x';
+    var data_buf: [66]u8 = undefined;
+    @memset(&data_buf, '0');
+    data_buf[0] = '0';
+    data_buf[1] = 'x';
+    data_buf[65] = '7';
+    var topics = [_][]const u8{&topic0_buf};
+    var logs = [_]eth_rpc.Log{.{
+        .address = "0xSINGLE",
+        .topics = &topics,
+        .data = &data_buf,
+        .block_number = 7,
+        .transaction_hash = "0xtx",
+        .log_index = 0,
+    }};
+    try idx.processFetchedLogs(&logs);
+
+    const evt_fail = try database.ponderQuery("SELECT COUNT(*) AS n FROM event_curve_CurveCreated;", &.{});
+    defer database.freeQueryRows(evt_fail);
+    try std.testing.expectEqual(@as(i64, 0), evt_fail[0].values[0].integer);
+    const proj_fail = try database.ponderQuery("SELECT COUNT(*) AS n FROM proj_note;", &.{});
+    defer database.freeQueryRows(proj_fail);
+    try std.testing.expectEqual(@as(i64, 0), proj_fail[0].values[0].integer);
+    const raw_fail = try database.ponderQuery("SELECT COUNT(*) AS n FROM raw_logs;", &.{});
+    defer database.freeQueryRows(raw_fail);
+    try std.testing.expectEqual(@as(i64, 1), raw_fail[0].values[0].integer);
+
+    idx.retryDeadLetters();
+
+    const evt_ok = try database.ponderQuery("SELECT COUNT(*) AS n FROM event_curve_CurveCreated;", &.{});
+    defer database.freeQueryRows(evt_ok);
+    try std.testing.expectEqual(@as(i64, 1), evt_ok[0].values[0].integer);
+    const proj_ok = try database.ponderQuery("SELECT COUNT(*) AS n FROM proj_note;", &.{});
+    defer database.freeQueryRows(proj_ok);
+    try std.testing.expectEqual(@as(i64, 1), proj_ok[0].values[0].integer);
+    const raw_ok = try database.ponderQuery("SELECT COUNT(*) AS n FROM raw_logs;", &.{});
+    defer database.freeQueryRows(raw_ok);
+    try std.testing.expectEqual(@as(i64, 0), raw_ok[0].values[0].integer);
+    try std.testing.expectEqual(@as(u32, 2), calls);
+}
+
+test "重复日志仍跑工厂发现，失败记死信后重试" {
+    const alloc = std.testing.allocator;
+    const db_cfg = db.DatabaseConfig{ .db_type = "sqlite", .db_name = ":memory:", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var database = try db.Client.init(alloc, &db_cfg);
+    defer database.deinit();
+    try database.migrate();
+
+    var rpc_cfg = config.RpcConfig{ .url = "", .retry_count = 0, .retry_delay_ms = 0, .request_timeout_ms = 0, .max_concurrent = 0 };
+    var rpc = eth_rpc.Client.init(alloc, undefined, &rpc_cfg);
+    defer rpc.deinit();
+
+    const contract = config.ContractConfig{
+        .name = "curve",
+        .address = "0xSINGLE",
+        .abi_path = "",
+        .from_block = 0,
+        .events = &.{"CurveCreated"},
+        .start_block = null,
+        .block_batch_size = null,
+        .poll_interval_ms = null,
+        .max_reorg_depth = null,
+        .filters = &.{},
+    };
+    const inputs = try alloc.alloc(abi.AbiEventInput, 1);
+    inputs[0] = .{ .name = try alloc.dupe(u8, "curve"), .type = try alloc.dupe(u8, "uint256"), .indexed = false };
+    const events = try alloc.alloc(abi.AbiEvent, 1);
+    events[0] = .{ .name = try alloc.dupe(u8, "CurveCreated"), .inputs = inputs, .signature = std.mem.zeroes([32]u8) };
+    var ac = abi.AbiContract{ .events = events, .functions = try alloc.alloc(abi.AbiFunction, 0) };
+    try database.autoMigrateContract("curve", &ac, &.{"CurveCreated"}, "0xSINGLE");
+
+    var idx = testIndexerWithDb(alloc, &database, &rpc, &contract);
+    defer idx.deinit();
+    idx.abi_contract = ac;
+
+    var event_calls: u32 = 0;
+    const Ev = struct {
+        calls: *u32,
+        fn cb(ctx: ?*anyopaque, _: []const u8, _: []const u8, _: []const db.DecodedField, _: u64, _: u64, _: []const u8, _: []const u8, _: u64) bool {
+            const self_ptr: *@This() = @ptrCast(@alignCast(ctx.?));
+            self_ptr.calls.* += 1;
+            return true;
+        }
+    };
+    var ev = Ev{ .calls = &event_calls };
+    idx.setEventCallback(&ev, Ev.cb);
+
+    var factory_calls: u32 = 0;
+    const Fac = struct {
+        calls: *u32,
+        fn cb(ctx: *anyopaque, _: usize, _: []const u8, _: []const db.DecodedField, _: u64) bool {
+            const self_ptr: *@This() = @ptrCast(@alignCast(ctx));
+            self_ptr.calls.* += 1;
+            return self_ptr.calls.* > 1;
+        }
+    };
+    var fac = Fac{ .calls = &factory_calls };
+    idx.factory_ctx = &fac;
+    idx.factory_callback = Fac.cb;
+    try idx.factory_idxs.append(alloc, 0);
+
+    var topic0_buf: [66]u8 = undefined;
+    @memset(&topic0_buf, '0');
+    topic0_buf[0] = '0';
+    topic0_buf[1] = 'x';
+    var data_buf: [66]u8 = undefined;
+    @memset(&data_buf, '0');
+    data_buf[0] = '0';
+    data_buf[1] = 'x';
+    data_buf[65] = '7';
+    var topics = [_][]const u8{&topic0_buf};
+    var logs = [_]eth_rpc.Log{.{
+        .address = "0xSINGLE",
+        .topics = &topics,
+        .data = &data_buf,
+        .block_number = 7,
+        .transaction_hash = "0xtx",
+        .log_index = 0,
+    }};
+    try idx.processFetchedLogs(&logs);
+
+    const evt_kept = try database.ponderQuery("SELECT COUNT(*) AS n FROM event_curve_CurveCreated;", &.{});
+    defer database.freeQueryRows(evt_kept);
+    try std.testing.expectEqual(@as(i64, 1), evt_kept[0].values[0].integer);
+    const raw_fail = try database.ponderQuery("SELECT COUNT(*) AS n FROM raw_logs;", &.{});
+    defer database.freeQueryRows(raw_fail);
+    try std.testing.expectEqual(@as(i64, 1), raw_fail[0].values[0].integer);
+    try std.testing.expectEqual(@as(u32, 1), event_calls);
+    try std.testing.expectEqual(@as(u32, 1), factory_calls);
+
+    idx.retryDeadLetters();
+
+    const evt_still = try database.ponderQuery("SELECT COUNT(*) AS n FROM event_curve_CurveCreated;", &.{});
+    defer database.freeQueryRows(evt_still);
+    const raw_ok = try database.ponderQuery("SELECT COUNT(*) AS n FROM raw_logs;", &.{});
+    defer database.freeQueryRows(raw_ok);
+    try std.testing.expectEqual(@as(i64, 0), raw_ok[0].values[0].integer);
+    try std.testing.expectEqual(@as(i64, 1), evt_still[0].values[0].integer);
+    try std.testing.expectEqual(@as(u32, 1), event_calls);
+    try std.testing.expectEqual(@as(u32, 2), factory_calls);
+}
+
+test "死信退避间隔按尝试次数翻倍，256 秒封顶" {
+    try std.testing.expectEqual(@as(i64, 1_000), Indexer.deadLetterDelayMs(0));
+    try std.testing.expectEqual(@as(i64, 1_000), Indexer.deadLetterDelayMs(-3));
+    try std.testing.expectEqual(@as(i64, 2_000), Indexer.deadLetterDelayMs(1));
+    try std.testing.expectEqual(@as(i64, 256_000), Indexer.deadLetterDelayMs(8));
+    try std.testing.expectEqual(@as(i64, 256_000), Indexer.deadLetterDelayMs(40));
+}
+
+test "死信退避：未到时间不再重试" {
+    const alloc = std.testing.allocator;
+    const db_cfg = db.DatabaseConfig{ .db_type = "sqlite", .db_name = ":memory:", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var database = try db.Client.init(alloc, &db_cfg);
+    defer database.deinit();
+    try database.migrate();
+
+    var rpc_cfg = config.RpcConfig{ .url = "", .retry_count = 0, .retry_delay_ms = 0, .request_timeout_ms = 0, .max_concurrent = 0 };
+    var rpc = eth_rpc.Client.init(alloc, undefined, &rpc_cfg);
+    defer rpc.deinit();
+
+    const contract = config.ContractConfig{
+        .name = "curve",
+        .address = "0xSINGLE",
+        .abi_path = "",
+        .from_block = 0,
+        .events = &.{},
+        .start_block = null,
+        .block_batch_size = null,
+        .poll_interval_ms = null,
+        .max_reorg_depth = null,
+        .filters = &.{},
+    };
+    var idx = testIndexerWithDb(alloc, &database, &rpc, &contract);
+    defer idx.deinit();
+    idx.dead_letter_now_ms = 10_000;
+    try database.insertRawLog(idx.stateKey(), 1, "0xpoison", 0, "not-json", "0x", "handler_failed", "0xSINGLE");
+
+    const readBackoff = struct {
+        fn read(client: *db.Client) !struct { attempts: i64, retry_after: i64 } {
+            const rows = try client.ponderQuery("SELECT attempts, retry_after FROM raw_logs;", &.{});
+            defer client.freeQueryRows(rows);
+            return .{
+                .attempts = rows[0].values[0].integer,
+                .retry_after = rows[0].values[1].integer,
+            };
+        }
+    }.read;
+
+    idx.retryDeadLetters();
+    const first = try readBackoff(&database);
+    try std.testing.expectEqual(@as(i64, 1), first.attempts);
+    try std.testing.expectEqual(@as(i64, 11_000), first.retry_after);
+
+    idx.retryDeadLetters();
+    const waiting = try readBackoff(&database);
+    try std.testing.expectEqual(@as(i64, 1), waiting.attempts);
+    try std.testing.expectEqual(@as(i64, 11_000), waiting.retry_after);
+
+    idx.dead_letter_now_ms = 11_000;
+    idx.retryDeadLetters();
+    const second = try readBackoff(&database);
+    try std.testing.expectEqual(@as(i64, 2), second.attempts);
+    try std.testing.expectEqual(@as(i64, 13_000), second.retry_after);
+}
+
+test "clone 落库失败撤销 pending，表恢复后可以再发现" {
+    const alloc = std.testing.allocator;
+    const db_cfg = db.DatabaseConfig{ .db_type = "sqlite", .db_name = ":memory:", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var database = try db.Client.init(alloc, &db_cfg);
+    defer database.deinit();
+    try database.migrate();
+
+    var rpc_cfg = config.RpcConfig{ .url = "", .retry_count = 0, .retry_delay_ms = 0, .request_timeout_ms = 0, .max_concurrent = 0 };
+    var rpc = eth_rpc.Client.init(alloc, undefined, &rpc_cfg);
+    defer rpc.deinit();
+
+    const contract = config.ContractConfig{
+        .name = "curve",
+        .address = "",
+        .abi_path = "",
+        .from_block = 0,
+        .events = &.{},
+        .start_block = null,
+        .block_batch_size = null,
+        .poll_interval_ms = null,
+        .max_reorg_depth = null,
+        .filters = &.{},
+    };
+    var idx = testIndexerWithDb(alloc, &database, &rpc, &contract);
+    defer idx.deinit();
+    idx.setTemplateMode(true);
+
+    _ = try database.ponderExec("DROP TABLE template_addresses;", &.{});
+    const addr = "0xAbCdEf0123456789AbCdEf0123456789AbCdEf01";
+    try std.testing.expect(!idx.discoverAddress(addr, 100));
+    try std.testing.expectEqual(@as(usize, 0), idx.templateAddressCount());
+
+    try database.migrate();
+    try std.testing.expect(idx.discoverAddress(addr, 100));
+    try std.testing.expectEqual(@as(usize, 1), idx.templateAddressCount());
+    const list = try database.listTemplateAddresses("curve");
+    defer {
+        for (list) |item| alloc.free(item.address);
+        alloc.free(list);
+    }
+    try std.testing.expectEqual(@as(usize, 1), list.len);
+    try std.testing.expectEqualStrings("0xabcdef0123456789abcdef0123456789abcdef01", list[0].address);
 }
 
 // 同一形态不变量（Task 12）：事件行 / 回调里的来源地址与 discoverAddress 落
@@ -2227,11 +3527,12 @@ test "processLog 落库地址归一化：与 discoverAddress 同形态（精确�
     const Ctx = struct {
         buf: *[42]u8,
         len: *usize,
-        fn cb(ctx: ?*anyopaque, _: []const u8, _: []const u8, _: []const db.DecodedField, _: u64, _: u64, contract_address: []const u8, _: []const u8, _: u64) void {
+        fn cb(ctx: ?*anyopaque, _: []const u8, _: []const u8, _: []const db.DecodedField, _: u64, _: u64, contract_address: []const u8, _: []const u8, _: u64) bool {
             const p: *@This() = @ptrCast(@alignCast(ctx.?));
             const n = @min(contract_address.len, p.buf.len);
             @memcpy(p.buf[0..n], contract_address[0..n]);
             p.len.* = n;
+            return true;
         }
     };
     var ctx = Ctx{ .buf = &seen_buf, .len = &seen_len };
@@ -2291,7 +3592,7 @@ test "rollbackTo 把仍存活的 clone 地址幂等补回（被回滚吞掉的�
 
     // 工厂线程发现 clone：插入恰好落在回滚已开启的事务里
     _ = try database.ponderExec("BEGIN;", &.{});
-    idx.discoverAddress(live, 100);
+    try std.testing.expect(idx.discoverAddress(live, 100));
     // 回滚 → 同一连接上的插入被一起丢弃（内存集合仍认为该 clone 存活）
     _ = try database.ponderExec("ROLLBACK;", &.{});
 
@@ -2309,7 +3610,7 @@ test "rollbackTo 把仍存活的 clone 地址幂等补回（被回滚吞掉的�
     try std.testing.expectEqual(@as(usize, 1), idx.templateAddressCount());
 
     // fork 之后发现的 clone：回滚应当作废它，且补偿逻辑不得把它复活
-    idx.discoverAddress(after_fork, 300);
+    try std.testing.expect(idx.discoverAddress(after_fork, 300));
 
     idx.rollbackTo(200);
 

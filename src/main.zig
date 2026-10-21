@@ -14,6 +14,9 @@ const abi = @import("abi.zig");
 const script_engine = @import("script_engine.zig");
 const js_engine = @import("js_engine.zig");
 const eb = @import("event_bus.zig");
+const webhook = @import("webhook.zig");
+const chain_clients = @import("chain_clients.zig");
+const user_schema = @import("user_schema.zig");
 
 var g_running = std.atomic.Value(bool).init(true);
 
@@ -61,13 +64,13 @@ const TemplateRegistry = struct {
     }
 
     /// 工厂发现的 clone 地址 → 对应模板索引器的动态地址集合。
-    fn onDiscovery(ctx: *anyopaque, template_name: []const u8, address: []const u8, from_block: u64) void {
+    fn onDiscovery(ctx: *anyopaque, template_name: []const u8, address: []const u8, from_block: u64) bool {
         const self: *TemplateRegistry = @ptrCast(@alignCast(ctx));
         const idx = self.find(template_name) orelse {
             log.err("模板分发表: 未找到模板 {s}（工厂发现 clone {s}），已忽略", .{ template_name, address });
-            return;
+            return false;
         };
-        idx.discoverAddress(address, from_block);
+        return idx.discoverAddress(address, from_block);
     }
 };
 
@@ -92,6 +95,7 @@ fn associateFactorySources(
             if (!is_source) continue;
             idx.factory_ctx = factory_manager;
             idx.factory_callback = factory.FactoryManager.onFactoryEventCallback;
+            idx.setReorgHook(factory_manager, factory.FactoryManager.onReorgCallback);
             try idx.factory_idxs.append(alloc, fi);
             log.info("工厂 {s}: 已关联到索引器 {s}", .{ fc.name, idx.contract.name });
         }
@@ -127,6 +131,14 @@ fn checkTemplateBackendSupport(cfg: *const config.Config) !void {
     }
 }
 
+fn checkLogCacheBackend(cfg: *const config.Config) !void {
+    if (!cfg.database.log_cache) return;
+    if (std.mem.eql(u8, cfg.database.db_type, "rocksdb")) {
+        log.err("配置错误: database.log_cache 不支持 rocksdb（原始日志缓存仅 SQLite/PostgreSQL）", .{});
+        return error.UnsupportedOperation;
+    }
+}
+
 /// 启动序列：**先**做启动期校验，**再**启动索引器（携转约束 2 的唯一落点）。
 /// main 里没有任何其它 `Indexer.start()` 路径，所以"RocksDB + [[templates]] 必须在
 /// 第一个 start() 之前失败"由结构保证，而不是靠某一行代码的位置。
@@ -139,6 +151,7 @@ fn validateThenStartIndexers(
     indexer_count: usize,
 ) !void {
     try checkTemplateBackendSupport(cfg);
+    try checkLogCacheBackend(cfg);
     var i: usize = 0;
     while (i < indexer_count) : (i += 1) try start_one(ctx, i);
 }
@@ -262,6 +275,7 @@ pub fn main(init: std.process.Init) !void {
 
     // 启动期 fail-fast：RocksDB 没有 template_addresses（携转约束 2）
     try checkTemplateBackendSupport(&cfg);
+    try checkLogCacheBackend(&cfg);
 
     // 3. ABI 存在性检查（缺失即失败，见 ensureAbiFiles）+ 自动获取 ABI + 自动发现事件
     try ensureAbiFiles(init.io, &cfg);
@@ -280,16 +294,32 @@ pub fn main(init: std.process.Init) !void {
     try database.migrate();
     log.info("数据库初始化完成", .{});
 
-    // 6. RPC 客户端
-    var rpc = eth_rpc.Client.init(alloc, init.io, &cfg.rpc);
-    defer rpc.deinit();
-    log.info("RPC 客户端已初始化", .{});
+    var user_tables: []user_schema.Table = &.{};
+    defer if (user_tables.len > 0) user_schema.deinitTables(alloc, user_tables);
+    if (cfg.global.schema_path.len > 0) {
+        const schema_src = std.Io.Dir.cwd().readFileAlloc(init.io, cfg.global.schema_path, alloc, .limited(1024 * 1024)) catch |e| {
+            log.err("用户表定义读取失败 {s}: {any}", .{ cfg.global.schema_path, e });
+            return e;
+        };
+        defer alloc.free(schema_src);
+        user_tables = user_schema.apply(alloc, &database, schema_src) catch |e| {
+            log.err("用户表创建失败 {s}: {any}", .{ cfg.global.schema_path, e });
+            return e;
+        };
+        log.info("用户表已创建: {d} 张（{s}）", .{ user_tables.len, cfg.global.schema_path });
+    }
 
-    const latest_block = rpc.getBlockNumber() catch |e| blk: {
-        log.warn("RPC 连接测试失败: {any}，继续启动", .{e});
-        break :blk 0;
-    };
-    if (latest_block > 0) log.info("RPC 连接成功，最新区块: {d}", .{latest_block});
+    // 6. 每条链一个 RPC 客户端。与 [rpc] 端点相同的链沿用故障转移列表。
+    var rpc_pool = try chain_clients.Pool.init(alloc, init.io, &cfg);
+    defer rpc_pool.deinit();
+    for (cfg.chains, rpc_pool.clients) |ch, *client| {
+        log.info("链 {s}: {s}", .{ ch.name, client.config.url });
+        const latest_block = client.getBlockNumber() catch |e| {
+            log.warn("链 {s} RPC 连接测试失败: {any}，继续启动", .{ ch.name, e });
+            continue;
+        };
+        if (latest_block > 0) log.info("链 {s} 连接成功，最新区块: {d}", .{ ch.name, latest_block });
+    }
 
     // 7. 初始化索引器
     // 模板的合成 ContractConfig 必须比索引器活得久（Indexer 只存指针），故在 indexers
@@ -306,15 +336,16 @@ pub fn main(init: std.process.Init) !void {
     defer indexer_ptrs.deinit(alloc);
 
     for (cfg.contracts, 0..) |_, i| {
+        const contract_chain = resolved.contracts[i].chain;
         const idx = try indexer.Indexer.init(
             alloc,
             init.io,
-            &rpc,
+            try rpc_pool.client(cfg.chains, contract_chain),
             &database,
             &resolved.contracts[i],
             cfg.global.snapshot_interval,
             cfg.global.track_blocks,
-            cfg.global.chain,
+            try chain_clients.resolvedName(cfg.chains, contract_chain),
             null,
             null,
         );
@@ -352,12 +383,12 @@ pub fn main(init: std.process.Init) !void {
             var idx = try indexer.Indexer.init(
                 alloc,
                 init.io,
-                &rpc,
+                try rpc_pool.client(cfg.chains, ""),
                 &database,
                 tc,
                 cfg.global.snapshot_interval,
                 cfg.global.track_blocks,
-                cfg.global.chain,
+                try chain_clients.resolvedName(cfg.chains, ""),
                 null,
                 null,
             );
@@ -379,17 +410,21 @@ pub fn main(init: std.process.Init) !void {
 
     for (indexers.items) |*idx| try indexer_ptrs.append(alloc, idx);
 
-    // 工厂合约管理
+    // 工厂合约管理。
+    // 这个 defer 比下面的索引器清理注册得早，退出时更晚执行：先 join 父索引器
+    // （发现回调还在用工厂），再 join 子索引器。database / rpc 的 defer 更早，
+    // 连接在子线程写下 stopped 断点之后才释放。
     var factory_manager: ?factory.FactoryManager = null;
+    defer if (factory_manager) |*fm| fm.deinit();
     if (cfg.factories.len > 0) {
         factory_manager = try factory.FactoryManager.init(
             alloc,
             init.io,
-            &rpc,
+            try rpc_pool.client(cfg.chains, ""),
             &database,
             cfg.factories,
             cfg.global.snapshot_interval,
-            cfg.global.chain,
+            try chain_clients.resolvedName(cfg.chains, ""),
             cfg.global.track_blocks,
         );
 
@@ -401,6 +436,7 @@ pub fn main(init: std.process.Init) !void {
             factory_manager.?.setTemplateHook(&template_registry, TemplateRegistry.onDiscovery);
             log.info("模板分发表: 已注册 {d} 个模板，工厂发现将喂入对应模板", .{cfg.templates.len});
         }
+        if (factory_manager) |*fm| try fm.resumeChildren(cfg.contracts);
     }
 
     // 自动扫描与挂载 Handler 动态脚本
@@ -414,6 +450,9 @@ pub fn main(init: std.process.Init) !void {
     var event_bus = eb.EventBus.init(alloc);
     defer event_bus.deinit();
 
+    var webhook_mgr = try webhook.Manager.init(alloc, init.io, webhook.default_db_path);
+    defer webhook_mgr.deinit();
+
     // 索引器清理：晚于引擎/总线注册 → LIFO 下**先** stop+join 全部索引器线程，
     // 之后才释放 script_eng/js_eng/event_bus。顺序颠倒会让仍在跑的回调读到已释放的
     // ScriptEngine.rules（0xaa 段错误），典型触发是 start() 之后的任何启动失败
@@ -425,6 +464,7 @@ pub fn main(init: std.process.Init) !void {
 
     // ponder.db 必须在加载 handler 前注入：脚本顶层常以 ponder.db 建投影表
     js_eng.setDb(&database);
+    script_eng.setWebhook(webhook_mgr);
     script_eng.loadDirectory("./handlers") catch {};
     script_eng.loadDirectory("./examples/handlers") catch {};
     js_eng.loadDirectory("./handlers") catch {};
@@ -445,13 +485,15 @@ pub fn main(init: std.process.Init) !void {
             contract_address: []const u8,
             tx_hash: []const u8,
             log_index: u64,
-        ) void {
+        ) bool {
             if (ctx_ptr) |ptr| {
                 const self_ptr: *@This() = @ptrCast(@alignCast(ptr));
                 self_ptr.script_eng.processEvent(contract_name, event_name, fields, block_number);
-                self_ptr.js_eng.handleEvent(contract_name, event_name, fields, block_number, block_timestamp, contract_address, tx_hash, log_index);
-                self_ptr.bus.publish(contract_name, event_name, contract_address, fields, block_number, block_timestamp, tx_hash, log_index);
+                const ok = self_ptr.js_eng.handleEvent(contract_name, event_name, fields, block_number, block_timestamp, contract_address, tx_hash, log_index);
+                if (ok) self_ptr.bus.publish(contract_name, event_name, contract_address, fields, block_number, block_timestamp, tx_hash, log_index);
+                return ok;
             }
+            return true;
         }
     };
     var combined_hook: CombinedHook = .{
@@ -478,6 +520,7 @@ pub fn main(init: std.process.Init) !void {
     try validateThenStartIndexers(&cfg, &starter, IndexerStarter.startOne, indexers.items.len);
 
     var server = http_server.Server.init(alloc, init.io, &cfg.http, &database, &query_cache, indexer_ptrs.items, cfg.queries, cfg.dashboards, &event_bus, js_eng);
+    server.setUserTables(user_tables);
     defer server.deinit();
     server.start() catch |e| {
         // 端口占用 / host 非法在这里只留一行 Zig 的错误返回栈（error: AddressInUse），
@@ -486,19 +529,28 @@ pub fn main(init: std.process.Init) !void {
         return e;
     };
 
-    // GraphQL server (optional)
+    // GraphQL server (optional)。这个 defer 比 database.deinit 晚注册，退出时先
+    // join：listen 还在用数据库。zgraphql 的 accept 要靠 shutdown + 一次连接才会返回。
     var graphql_shutdown = std.atomic.Value(bool).init(false);
-    var graphql_thread: ?std.Thread = null;
+    var graphql_service: ?graphql.Service = null;
+    defer if (graphql_service) |*svc| svc.stop(init.io);
     if (cfg.graphql.enabled) {
         const gql_ctx = graphql.Context{
             .database = &database,
             .indexers = indexer_ptrs.items,
             .chain = cfg.global.chain,
             .shutdown_flag = &graphql_shutdown,
-            .rpc = &rpc,
+            .rpc = try rpc_pool.client(cfg.chains, ""),
         };
-        graphql_thread = graphql.start(alloc, &cfg.graphql, gql_ctx) catch null;
-        if (graphql_thread == null) {
+        graphql_service = graphql.start(alloc, &cfg.graphql, gql_ctx, cfg.http.api_token) catch null;
+        if (graphql_service) |*svc| {
+            var wait: u32 = 0;
+            while (wait < 50 and !svc.poke(init.io)) : (wait += 1) {
+                std.Io.sleep(init.io, .fromMilliseconds(20), .awake) catch {};
+            }
+            // listen 会换成自己的 SIGTERM 处理。接上之后装回，主循环才看得到终止信号。
+            setupSignals();
+        } else {
             log.warn("GraphQL 服务启动失败", .{});
         }
     }
@@ -541,14 +593,23 @@ fn cmdCheck(alloc: std.mem.Allocator, io: std.Io, config_path: []const u8) !void
     };
     defer cfg.deinit(alloc);
     log.info("✓ [1/4] 配置文件格式校验通过: {s}", .{config_path});
-
-    var rpc = eth_rpc.Client.init(alloc, io, &cfg.rpc);
-    defer rpc.deinit();
-    const block_num = rpc.getBlockNumber() catch |err| {
-        log.err("✗ [2/4] RPC 节点连接失败 ({s}): {any}", .{ cfg.rpc.url, err });
+    checkLogCacheBackend(&cfg) catch |err| {
+        log.err("✗ [1/4] 原始日志缓存配置无效: {any}", .{err});
         return error.CheckFailed;
     };
-    log.info("✓ [2/4] RPC 节点连接正常, 当前最新区块: {d}", .{block_num});
+
+    var rpc_pool = chain_clients.Pool.init(alloc, io, &cfg) catch |err| {
+        log.err("✗ [2/4] RPC 客户端初始化失败: {any}", .{err});
+        return error.CheckFailed;
+    };
+    defer rpc_pool.deinit();
+    for (cfg.chains, rpc_pool.clients) |ch, *client| {
+        const block_num = client.getBlockNumber() catch |err| {
+            log.err("✗ [2/4] 链 {s} RPC 节点连接失败 ({s}): {any}", .{ ch.name, ch.rpc_url, err });
+            return error.CheckFailed;
+        };
+        log.info("✓ [2/4] 链 {s} 连接正常, 当前最新区块: {d}", .{ ch.name, block_num });
+    }
 
     var database = db.Client.init(alloc, &cfg.database) catch |err| {
         log.err("✗ [3/4] 数据库初始化失败: {any}", .{err});
@@ -1031,7 +1092,7 @@ test "模板分发表: 工厂发现经 hook 喂入对应模板的地址集合" {
     defer registry.deinit(alloc);
     try registry.register(alloc, "curve", &idx);
 
-    TemplateRegistry.onDiscovery(&registry, "curve", "0xAbCdEf0123456789AbCdEf0123456789AbCdEf01", 4242);
+    try std.testing.expect(TemplateRegistry.onDiscovery(&registry, "curve", "0xAbCdEf0123456789AbCdEf0123456789AbCdEf01", 4242));
     try std.testing.expectEqual(@as(usize, 1), idx.templateAddressCount());
     {
         const list = try database.listTemplateAddresses("curve");
@@ -1045,7 +1106,7 @@ test "模板分发表: 工厂发现经 hook 喂入对应模板的地址集合" {
     }
 
     // 未注册的模板名：告警后忽略，不得崩溃或串到别的模板
-    TemplateRegistry.onDiscovery(&registry, "ghost", "0xAbCdEf0123456789AbCdEf0123456789AbCdEf01", 1);
+    try std.testing.expect(!TemplateRegistry.onDiscovery(&registry, "ghost", "0xAbCdEf0123456789AbCdEf0123456789AbCdEf01", 1));
     try std.testing.expectEqual(@as(usize, 1), idx.templateAddressCount());
 }
 
@@ -1138,7 +1199,7 @@ test "工厂发现源为模板（from_template）：clone 事件喂入第二个�
     // 等价于 indexer.zig 里对 factory_idxs 的分发：curve 的日志里出现 Paired
     const fields = [_]db.DecodedField{.{ .name = "pair", .value = "0xAbCdEf0123456789AbCdEf0123456789AbCdEf01" }};
     for (indexers[0].factory_idxs.items) |fi| {
-        factory.FactoryManager.onFactoryEventCallback(indexers[0].factory_ctx.?, fi, "Paired", &fields, 7000);
+        try std.testing.expect(factory.FactoryManager.onFactoryEventCallback(indexers[0].factory_ctx.?, fi, "Paired", &fields, 7000));
     }
 
     try std.testing.expectEqual(@as(usize, 1), indexers[1].templateAddressCount());
@@ -1156,7 +1217,7 @@ test "工厂发现源为模板（from_template）：clone 事件喂入第二个�
 
     // 事件名不匹配 creation_event（Paired）→ 不得误喂
     for (indexers[0].factory_idxs.items) |fi| {
-        factory.FactoryManager.onFactoryEventCallback(indexers[0].factory_ctx.?, fi, "Buy", &fields, 7100);
+        try std.testing.expect(factory.FactoryManager.onFactoryEventCallback(indexers[0].factory_ctx.?, fi, "Buy", &fields, 7100));
     }
     try std.testing.expectEqual(@as(usize, 1), indexers[1].templateAddressCount());
 }

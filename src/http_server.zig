@@ -10,11 +10,195 @@ const dashboard = @import("dashboard.zig");
 const eb = @import("event_bus.zig");
 const js_engine = @import("js_engine.zig");
 const abi = @import("abi.zig");
+const auth = @import("auth.zig");
+const user_schema = @import("user_schema.zig");
 
 const build_options = @import("build_options");
 
 const MAX_CONCURRENT_CONNECTIONS = 256;
 const MAX_BODY_SIZE = 1024 * 1024; // 1 MB
+
+/// `0` 表示这一方向不限时。单测传入 undefined io 时必须走这条，不能碰时钟。
+fn httpIoTimeout(ms: u32) std.Io.Timeout {
+    if (ms == 0) return .none;
+    return .{
+        .duration = .{
+            .raw = .fromMilliseconds(@as(i64, ms)),
+            .clock = .awake,
+        },
+    };
+}
+
+/// 连接线程自己的超时。和 RPC、WSS 的 threadlocal 分开，避免互相清掉。
+threadlocal var http_io_inner: std.Io = undefined;
+threadlocal var http_io_read_timeout: std.Io.Timeout = .none;
+threadlocal var http_io_write_timeout: std.Io.Timeout = .none;
+
+fn installHttpIoTimeouts(base: std.Io, vtable_slot: *std.Io.VTable, read_ms: u32, write_ms: u32) std.Io {
+    const read_to = httpIoTimeout(read_ms);
+    const write_to = httpIoTimeout(write_ms);
+    if (read_to == .none and write_to == .none) return base;
+    http_io_inner = base;
+    http_io_read_timeout = read_to;
+    http_io_write_timeout = write_to;
+    vtable_slot.* = base.vtable.*;
+    vtable_slot.operate = httpTimedNetOperate;
+    return .{ .userdata = base.userdata, .vtable = vtable_slot };
+}
+
+fn httpTimedNetOperate(userdata: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+    const inner = std.Io{ .userdata = userdata, .vtable = http_io_inner.vtable };
+    switch (operation) {
+        .net_write => |o| {
+            if (http_io_write_timeout == .none) return inner.operate(operation);
+            return .{ .net_write = timedNetWrite(o, http_io_write_timeout) };
+        },
+        else => {},
+    }
+    const timeout: std.Io.Timeout = switch (operation) {
+        .net_read, .net_receive => http_io_read_timeout,
+        .net_send => http_io_write_timeout,
+        else => return inner.operate(operation),
+    };
+    if (timeout == .none) return inner.operate(operation);
+    return inner.operateTimeout(operation, timeout) catch |err| switch (err) {
+        error.Timeout => return httpNetTimeoutResult(operation),
+        error.ConcurrencyUnavailable => return inner.operate(operation),
+        else => |e| return e,
+    };
+}
+
+/// `poll(POLLOUT)` 只保证发送缓冲区还有空位，阻塞 `sendmsg` 写大块时仍会等满整个块。
+/// 这里用 `MSG_DONTWAIT` 先写能进缓冲区的部分，满了再按剩余时间 `poll`。
+fn timedNetWrite(o: std.Io.Operation.NetWrite, timeout: std.Io.Timeout) std.Io.Operation.NetWrite.Error!usize {
+    const wait_ms: i64 = switch (timeout) {
+        .duration => |d| @max(0, d.raw.toMilliseconds()),
+        else => 0,
+    };
+    const chunk = firstNetWriteChunk(o);
+    if (chunk.len == 0) return 0;
+
+    const deadline = monoMs() + wait_ms;
+    const flags: u32 = std.c.MSG.DONTWAIT | std.c.MSG.NOSIGNAL;
+    const old_fl = std.c.fcntl(o.socket_handle, std.c.F.GETFL, @as(c_int, 0));
+    const nb_bit: c_int = @bitCast(std.c.O{ .NONBLOCK = true });
+    if (old_fl >= 0 and (old_fl & nb_bit) == 0) {
+        _ = std.c.fcntl(o.socket_handle, std.c.F.SETFL, old_fl | nb_bit);
+    }
+    defer if (old_fl >= 0 and (old_fl & nb_bit) == 0) {
+        _ = std.c.fcntl(o.socket_handle, std.c.F.SETFL, old_fl);
+    };
+    while (true) {
+        const rc = std.c.send(o.socket_handle, chunk.ptr, chunk.len, flags);
+        switch (std.c.errno(rc)) {
+            .SUCCESS => return @intCast(rc),
+            .INTR => continue,
+            .AGAIN => {
+                const remain = deadline - monoMs();
+                if (remain <= 0) return error.ConnectionTimedOut;
+                var pfd = [1]std.c.pollfd{.{
+                    .fd = o.socket_handle,
+                    .events = std.c.POLL.OUT | std.c.POLL.ERR,
+                    .revents = 0,
+                }};
+                const poll_ms: c_int = @intCast(@min(remain, @as(i64, std.math.maxInt(c_int))));
+                const prc = std.c.poll(&pfd, 1, poll_ms);
+                switch (std.c.errno(prc)) {
+                    .SUCCESS => if (prc == 0) return error.ConnectionTimedOut,
+                    .INTR => continue,
+                    else => return error.Unexpected,
+                }
+            },
+            .CONNRESET => return error.ConnectionResetByPeer,
+            .PIPE, .NOTCONN => return error.SocketUnconnected,
+            .TIMEDOUT => return error.ConnectionTimedOut,
+            .NOBUFS, .NOMEM => return error.SystemResources,
+            .NETDOWN => return error.NetworkDown,
+            .NETUNREACH => return error.NetworkUnreachable,
+            .HOSTUNREACH => return error.HostUnreachable,
+            else => return error.Unexpected,
+        }
+    }
+}
+
+fn firstNetWriteChunk(o: std.Io.Operation.NetWrite) []const u8 {
+    if (o.header.len > 0) return o.header;
+    if (o.data.len == 0) return &.{};
+    for (o.data[0 .. o.data.len - 1]) |bytes| {
+        if (bytes.len > 0) return bytes;
+    }
+    if (o.splat == 0) return &.{};
+    return o.data[o.data.len - 1];
+}
+
+fn httpNetTimeoutResult(operation: std.Io.Operation) std.Io.Operation.Result {
+    return switch (operation) {
+        .net_read => .{ .net_read = error.ConnectionTimedOut },
+        .net_write => .{ .net_write = error.ConnectionTimedOut },
+        .net_receive => .{ .net_receive = .{ error.ConnectionTimedOut, 0 } },
+        .net_send => .{ .net_send = .{ error.ConnectionTimedOut, 0 } },
+        else => unreachable,
+    };
+}
+
+fn monoMs() i64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
+}
+
+fn pkParam(table: user_schema.Table, pk: []const u8) db.SqlValue {
+    for (table.columns) |col| {
+        if (!col.primary_key) continue;
+        if (std.mem.eql(u8, col.sql_type, "INTEGER")) {
+            if (std.fmt.parseInt(i64, pk, 10)) |n| return .{ .integer = n } else |_| {}
+        }
+        break;
+    }
+    return .{ .text = pk };
+}
+
+fn appendJsonString(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), s: []const u8) !void {
+    try buf.append(alloc, '"');
+    for (s) |c| switch (c) {
+        '"' => try buf.appendSlice(alloc, "\\\""),
+        '\\' => try buf.appendSlice(alloc, "\\\\"),
+        '\n' => try buf.appendSlice(alloc, "\\n"),
+        '\r' => try buf.appendSlice(alloc, "\\r"),
+        '\t' => try buf.appendSlice(alloc, "\\t"),
+        else => if (c < 0x20) {
+            try buf.print(alloc, "\\u{x:0>4}", .{c});
+        } else {
+            try buf.append(alloc, c);
+        },
+    };
+    try buf.append(alloc, '"');
+}
+
+fn appendSqlJson(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), value: db.SqlValue) !void {
+    switch (value) {
+        .null => try buf.appendSlice(alloc, "null"),
+        .integer => |n| try buf.print(alloc, "{d}", .{n}),
+        .float => |n| try buf.print(alloc, "{d}", .{n}),
+        .text => |t| try appendJsonString(alloc, buf, t),
+        .blob => |b| {
+            try buf.append(alloc, '"');
+            for (b) |byte| try buf.print(alloc, "{x:0>2}", .{byte});
+            try buf.append(alloc, '"');
+        },
+    }
+}
+
+fn appendQueryRowJson(alloc: std.mem.Allocator, buf: *std.ArrayList(u8), row: db.QueryRow) !void {
+    try buf.append(alloc, '{');
+    for (row.names, row.values, 0..) |name, value, i| {
+        if (i > 0) try buf.append(alloc, ',');
+        try appendJsonString(alloc, buf, name);
+        try buf.append(alloc, ':');
+        try appendSqlJson(alloc, buf, value);
+    }
+    try buf.append(alloc, '}');
+}
 
 /// URL 解码查询参数值（调用者负责释放返回值）
 fn urlDecodeAlloc(alloc: std.mem.Allocator, input: []const u8) std.mem.Allocator.Error![]u8 {
@@ -190,6 +374,7 @@ pub const Server = struct {
     dashboards: []const config.DashboardConfig,
     event_bus: *eb.EventBus,
     js: ?*js_engine.JsEngine,
+    user_tables: []const user_schema.Table = &.{},
     listen_socket: ?std.Io.net.Server,
     thread: ?std.Thread,
     running: std.atomic.Value(bool),
@@ -221,6 +406,7 @@ pub const Server = struct {
             .dashboards = dashboards,
             .event_bus = bus,
             .js = js,
+            .user_tables = &.{},
             .listen_socket = null,
             .thread = null,
             .running = std.atomic.Value(bool).init(false),
@@ -246,6 +432,10 @@ pub const Server = struct {
         }
     }
 
+    pub fn setUserTables(self: *Server, tables: []const user_schema.Table) void {
+        self.user_tables = tables;
+    }
+
     pub fn start(self: *Server) !void {
         if (self.running.load(.monotonic)) return;
 
@@ -257,6 +447,9 @@ pub const Server = struct {
         self.running.store(true, .monotonic);
         self.thread = try std.Thread.spawn(.{}, Server.runLoop, .{self});
         log.info("HTTP 服务已启动: http://{s}:{d}", .{ self.config.host, self.config.port });
+        if (self.config.api_token.len > 0) {
+            log.info("HTTP 鉴权已启用（GET /health 与 CORS 预检除外）", .{});
+        }
     }
 
     pub fn stop(self: *Server) void {
@@ -306,10 +499,14 @@ pub const Server = struct {
     fn handleConnection(self: *Server, stream: std.Io.net.Stream) void {
         defer stream.close(self.io);
 
+        // 空闲连接停在读请求上，慢客户端停在写响应上。0 保持原来的阻塞读写真。
+        var timed_vtable: std.Io.VTable = undefined;
+        const conn_io = installHttpIoTimeouts(self.io, &timed_vtable, self.config.read_timeout_ms, self.config.write_timeout_ms);
+
         var read_buf: [65536]u8 = undefined;
         var write_buf: [65536]u8 = undefined;
-        var stream_reader = stream.reader(self.io, &read_buf);
-        var stream_writer = stream.writer(self.io, &write_buf);
+        var stream_reader = stream.reader(conn_io, &read_buf);
+        var stream_writer = stream.writer(conn_io, &write_buf);
         var http_server = std.http.Server.init(&stream_reader.interface, &stream_writer.interface);
 
         while (self.running.load(.monotonic)) {
@@ -408,9 +605,15 @@ pub const Server = struct {
             }
         }
 
-        // CORS 预检请求
+        // CORS 预检请求（浏览器预检不带 Authorization）
         if (method == .OPTIONS) {
             try self.sendCorsResponse(request, .no_content);
+            return;
+        }
+
+        const path_end = std.mem.indexOfScalar(u8, target, '?') orelse target.len;
+        if (!auth.routeAllowed(self.config.api_token, false, target[0..path_end], request.head_buffer)) {
+            try self.sendJson(request, "{\"error\":\"Unauthorized\"}", .unauthorized);
             return;
         }
 
@@ -429,6 +632,8 @@ pub const Server = struct {
             try self.handleHealth(request);
         } else if (method == .GET and std.mem.eql(u8, target, "/sync_state")) {
             try self.handleSyncState(request);
+        } else if (method == .GET and std.mem.startsWith(u8, target, "/user/")) {
+            try self.handleUser(request);
         } else if (method == .GET and std.mem.startsWith(u8, target, "/events/")) {
             try self.handleEvents(request);
         } else if (method == .GET and std.mem.eql(u8, target, "/contracts")) {
@@ -478,7 +683,7 @@ pub const Server = struct {
             .extra_headers = &.{
                 .{ .name = "Access-Control-Allow-Origin", .value = origin },
                 .{ .name = "Access-Control-Allow-Methods", .value = "GET, POST, OPTIONS" },
-                .{ .name = "Access-Control-Allow-Headers", .value = "Content-Type" },
+                .{ .name = "Access-Control-Allow-Headers", .value = "Content-Type, Authorization" },
             },
         });
     }
@@ -674,6 +879,59 @@ pub const Server = struct {
         try self.sendJson(request, list.items, .ok);
     }
 
+    fn handleUser(self: *Server, request: *std.http.Server.Request) !void {
+        const target = request.head.target;
+        const path_end = std.mem.indexOfScalar(u8, target, '?') orelse target.len;
+        const path = target[0..path_end];
+        const prefix = "/user/";
+        if (path.len <= prefix.len or !std.mem.startsWith(u8, path, prefix)) {
+            try self.sendJson(request, "{\"error\":\"invalid path, use /user/:table/:pk\"}", .bad_request);
+            return;
+        }
+        const rest = path[prefix.len..];
+        const slash = std.mem.indexOfScalar(u8, rest, '/') orelse {
+            try self.sendJson(request, "{\"error\":\"invalid path, use /user/:table/:pk\"}", .bad_request);
+            return;
+        };
+        const table_name = rest[0..slash];
+        const pk_raw = rest[slash + 1 ..];
+        if (table_name.len == 0 or pk_raw.len == 0 or std.mem.indexOfScalar(u8, pk_raw, '/') != null) {
+            try self.sendJson(request, "{\"error\":\"invalid path, use /user/:table/:pk\"}", .bad_request);
+            return;
+        }
+        const table = user_schema.find(self.user_tables, table_name) orelse {
+            try self.sendJson(request, "{\"error\":\"Not Found\"}", .not_found);
+            return;
+        };
+        const pk = urlDecodeAlloc(self.alloc, pk_raw) catch {
+            try self.sendJson(request, "{\"error\":\"invalid pk\"}", .bad_request);
+            return;
+        };
+        defer self.alloc.free(pk);
+
+        const sql = user_schema.selectByPkSql(self.alloc, table.*) catch {
+            try self.sendJson(request, "{\"error\":\"table has no primary key\"}", .bad_request);
+            return;
+        };
+        defer self.alloc.free(sql);
+
+        const rows = self.database.ponderQuery(sql, &.{pkParam(table.*, pk)}) catch |e| {
+            log.warn("用户表 {s} 查询失败: {any}", .{ table_name, e });
+            try self.sendJson(request, "{\"error\":\"query execution failed\"}", .internal_server_error);
+            return;
+        };
+        defer self.database.freeQueryRows(rows);
+        if (rows.len == 0) {
+            try self.sendJson(request, "{\"error\":\"Not Found\"}", .not_found);
+            return;
+        }
+
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(self.alloc);
+        try appendQueryRowJson(self.alloc, &buf, rows[0]);
+        try self.sendJson(request, buf.items, .ok);
+    }
+
     fn handleSchema(self: *Server, request: *std.http.Server.Request) !void {
         var buf: std.Io.Writer.Allocating = .init(self.alloc);
         defer buf.deinit();
@@ -688,6 +946,7 @@ pub const Server = struct {
         try buf.writer.writeAll("{\"path\":\"/version\",\"method\":\"GET\",\"description\":\"版本信息\"},");
         try buf.writer.writeAll("{\"path\":\"/queries/:name\",\"method\":\"GET\",\"description\":\"执行自定义 SQL 查询\"},");
         try buf.writer.writeAll("{\"path\":\"/stream\",\"method\":\"GET\",\"description\":\"Server-Sent Events (SSE) 实时事件推流\"},");
+        try buf.writer.writeAll("{\"path\":\"/user/:table/:pk\",\"method\":\"GET\",\"description\":\"按主键查询 user_ 表\"},");
         try buf.writer.writeAll("{\"path\":\"/events/:contract/:event\",\"method\":\"GET\",\"description\":\"查询事件日志\",\"params\":[");
         try buf.writer.writeAll("{\"name\":\"block_from\",\"type\":\"integer\",\"optional\":true,\"description\":\"起始区块\"},");
         try buf.writer.writeAll("{\"name\":\"block_to\",\"type\":\"integer\",\"optional\":true,\"description\":\"结束区块\"},");
@@ -745,8 +1004,11 @@ pub const Server = struct {
             "zponder_cache_bytes {d}\n" ++
             "# HELP zponder_indexers 索引器数量\n" ++
             "# TYPE zponder_indexers gauge\n" ++
-            "zponder_indexers {d}\n",
-            .{ stats.count, stats.total_bytes, self.indexers.len },
+            "zponder_indexers {d}\n" ++
+            "# HELP zponder_dead_letters raw_logs 中尚未处理的日志数\n" ++
+            "# TYPE zponder_dead_letters gauge\n" ++
+            "zponder_dead_letters {d}\n",
+            .{ stats.count, stats.total_bytes, self.indexers.len, self.database.countRawLogs() catch 0 },
         );
 
         // RPC 请求/错误计数（所有索引器共享同一 RPC 客户端）
@@ -812,7 +1074,7 @@ pub const Server = struct {
 
         const cache_stats = self.cache.stats();
 
-        try buf.writer.writeAll("{\"status\":\"ok\",\"indexers\":[");
+        try buf.writer.print("{{\"status\":\"ok\",\"dead_letters\":{d},\"indexers\":[", .{self.database.countRawLogs() catch 0});
         for (self.indexers, 0..) |idx, i| {
             if (i > 0) try buf.writer.writeByte(',');
             const status_str = switch (idx.getStatus()) {
@@ -1228,6 +1490,118 @@ fn extractOriginHeader(head_buffer: []const u8) []const u8 {
 // ============================================================================
 // 单元测试
 // ============================================================================
+
+test "HTTP 读写超时为 0 时保持关闭" {
+    try std.testing.expect(httpIoTimeout(0) == .none);
+    switch (httpIoTimeout(200)) {
+        .duration => |d| try std.testing.expectEqual(@as(i64, 200), d.raw.toMilliseconds()),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "HTTP 读超时切断只连接不发请求的客户端" {
+    const alloc = std.testing.allocator;
+    var backend = std.Io.Threaded.init(alloc, .{});
+    defer backend.deinit();
+    const io = backend.io();
+
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try addr.listen(io, .{});
+    defer server.deinit(io);
+
+    var cfg = config.HttpConfig{
+        .host = "127.0.0.1",
+        .port = 0,
+        .read_timeout_ms = 200,
+        .write_timeout_ms = 200,
+        .max_body_size = 1024,
+        .cors_origins = &.{},
+        .rate_limit_rps = null,
+        .rate_limit_burst = null,
+        .api_token = "",
+    };
+    var srv: Server = undefined;
+    srv.io = io;
+    srv.config = &cfg;
+    srv.running = std.atomic.Value(bool).init(true);
+
+    var done = std.atomic.Value(bool).init(false);
+    const worker = try std.Thread.spawn(.{}, struct {
+        fn run(listen: *std.Io.net.Server, http: *Server, flag: *std.atomic.Value(bool)) void {
+            const stream = listen.accept(http.io) catch {
+                flag.store(true, .release);
+                return;
+            };
+            http.handleConnection(stream);
+            flag.store(true, .release);
+        }
+    }.run, .{ &server, &srv, &done });
+
+    const client_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(server.socket.address.getPort()) };
+    const client = try client_addr.connect(io, .{ .mode = .stream });
+    const started = monoMs();
+    while (!done.load(.acquire) and monoMs() - started < 3000) {
+        std.Io.sleep(io, .fromMilliseconds(20), .awake) catch {};
+    }
+    const elapsed = monoMs() - started;
+    client.close(io);
+    worker.join();
+    try std.testing.expect(done.load(.acquire));
+    try std.testing.expect(elapsed >= 100);
+    try std.testing.expect(elapsed < 2000);
+}
+
+test "HTTP 写超时切断不读取响应的对端" {
+    const alloc = std.testing.allocator;
+    var backend = std.Io.Threaded.init(alloc, .{});
+    defer backend.deinit();
+    const io = backend.io();
+
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try addr.listen(io, .{});
+    var release = std.atomic.Value(bool).init(false);
+    const holder = try std.Thread.spawn(.{}, struct {
+        fn run(listen: *std.Io.net.Server, io_: std.Io, release_: *std.atomic.Value(bool)) void {
+            const stream = listen.accept(io_) catch return;
+            defer stream.close(io_);
+            var waited_ms: u32 = 0;
+            while (!release_.load(.acquire) and waited_ms < 3000) : (waited_ms += 20) {
+                std.Io.sleep(io_, .fromMilliseconds(20), .awake) catch return;
+            }
+        }
+    }.run, .{ &server, io, &release });
+    defer {
+        release.store(true, .release);
+        server.deinit(io);
+        holder.join();
+    }
+
+    const client_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(server.socket.address.getPort()) };
+    const client = try client_addr.connect(io, .{ .mode = .stream });
+    defer client.close(io);
+
+    var timed_vtable: std.Io.VTable = undefined;
+    const conn_io = installHttpIoTimeouts(io, &timed_vtable, 0, 200);
+    var sndbuf: c_int = 16384;
+    _ = std.c.setsockopt(client.socket.handle, std.c.SOL.SOCKET, std.c.SO.SNDBUF, &sndbuf, @sizeOf(c_int));
+    var write_buf: [4096]u8 = undefined;
+    var stream_writer = client.writer(conn_io, &write_buf);
+    var chunk: [262144]u8 = undefined;
+    @memset(&chunk, 'a');
+
+    const started = monoMs();
+    var saw_err = false;
+    for (0..128) |_| {
+        stream_writer.interface.writeAll(&chunk) catch {
+            saw_err = true;
+            break;
+        };
+    }
+    const elapsed = monoMs() - started;
+    try std.testing.expect(saw_err);
+    try std.testing.expect(elapsed >= 100);
+    try std.testing.expect(elapsed < 2000);
+}
 
 test "urlDecodeAlloc basic" {
     const alloc = std.testing.allocator;

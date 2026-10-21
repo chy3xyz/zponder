@@ -1,0 +1,45 @@
+name: test
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+# 与发版相同的构建开关：不链接 librocksdb / libpq，只依赖 sqlite3。
+permissions:
+  contents: read
+
+env:
+  ZIG_VERSION: "0.17.0"
+
+jobs:
+  test:
+    name: zig build test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        run: |
+          TRIPLET="zig-x86_64-linux"
+          URL="https://ziglang.org/download/${ZIG_VERSION}/${TRIPLET}-${ZIG_VERSION}.tar.xz"
+          curl -fsSL "$URL" -o zig.tar.xz
+          tar -xJf zig.tar.xz
+          ZIG_DIR="$GITHUB_WORKSPACE/${TRIPLET}-${ZIG_VERSION}"
+          echo "$ZIG_DIR" >> "$GITHUB_PATH"
+          "$ZIG_DIR/zig" version
+
+      - name: Install deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libsqlite3-dev
+
+      # 冷缓存要拉 build.zig.zon 里的 zgraphql，GitHub 偶发 HttpConnectionClosing。
+      - name: Test
+        run: |
+          for i in 1 2 3; do
+            if zig build test -Drocksdb=false -Dpostgres=false; then exit 0; fi
+            echo "::warning::第 $i 次测试失败（多为依赖拉取网络抖动），10 秒后重试"
+            sleep 10
+          done
+          echo "::error::连续 3 次测试失败"; exit 1

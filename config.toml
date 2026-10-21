@@ -5,6 +5,9 @@ log_file = "./logs/indexer.log"
 snapshot_interval = 3600        # 快照周期（秒），0 表示不开启
 etherscan_api_key = ""          # 区块浏览器 API Key（自动获取 ABI）
 chain = "ethereum"              # ethereum | bsc | polygon
+# schema_path = "schema.zp"     # 可选：用户表定义。启动时建 user_* 表，GET /user/:table/:pk 按主键查询
+# 多链时写 [[chains]]（name / chain_id / rpc_url / ws_url）。不写则用上面的 chain 和 [rpc] 合成一条。
+# 合约上的 chain = "名字" 选择端点；留空用第一条。模板和工厂目前走第一条链。
 
 # RPC 配置
 [rpc]
@@ -19,6 +22,8 @@ retry_count = 3             # 重试次数
 [database]
 type = "sqlite"             # sqlite | rocksdb | postgresql
 db_name = "eth_indexer.db"  # SQLite: .db 文件; RocksDB: 目录; PostgreSQL: 连接串
+# log_cache = true            # 原始日志写到旁边的 eth_indexer.sync.db；PostgreSQL 用 schema sync。RocksDB 不支持。
+log_cache = true
 # PostgreSQL 连接串示例: "host=localhost port=5432 dbname=zponder user=postgres"
 max_connections = 10        # 最大连接数 (仅 SQLite)
 
@@ -27,6 +32,7 @@ max_connections = 10        # 最大连接数 (仅 SQLite)
 port = 8080
 host = "0.0.0.0"
 cors = true                 # 是否允许跨域
+# api_token = ""            # 非空时，除 GET /health 与 CORS 预检外，REST 与 GraphQL 都要带 Authorization: Bearer <token>
 
 # GraphQL 服务配置（可选）
 # [graphql]

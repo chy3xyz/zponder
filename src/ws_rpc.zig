@@ -94,6 +94,48 @@ pub const ReadEvent = union(enum) {
     closed,
 };
 
+/// 实时订阅可以长时间没有日志，不能沿用 HTTP 的 `request_timeout_ms`。
+/// HTTP 超时关掉时这里也关掉：单测传入 undefined io，安装超时会去读时钟。
+pub const idle_timeout_ms: u32 = 120_000;
+
+pub fn idleTimeoutMs(request_timeout_ms: u32) u32 {
+    if (request_timeout_ms == 0) return 0;
+    return idle_timeout_ms;
+}
+
+threadlocal var ws_io_inner: std.Io = undefined;
+threadlocal var ws_io_timeout: std.Io.Timeout = .none;
+
+fn wsTimedNetOperate(userdata: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+    const inner = std.Io{ .userdata = userdata, .vtable = ws_io_inner.vtable };
+    switch (operation) {
+        .net_read, .net_write, .net_receive, .net_send => {},
+        else => return inner.operate(operation),
+    }
+    if (ws_io_timeout == .none) return inner.operate(operation);
+    return inner.operateTimeout(operation, ws_io_timeout) catch |err| switch (err) {
+        error.Timeout => return wsNetTimeoutResult(operation),
+        error.ConcurrencyUnavailable => return inner.operate(operation),
+        else => |e| return e,
+    };
+}
+
+fn wsNetTimeoutResult(operation: std.Io.Operation) std.Io.Operation.Result {
+    return switch (operation) {
+        .net_read => .{ .net_read = error.ConnectionTimedOut },
+        .net_write => .{ .net_write = error.ConnectionTimedOut },
+        .net_receive => .{ .net_receive = .{ error.ConnectionTimedOut, 0 } },
+        .net_send => .{ .net_send = .{ error.ConnectionTimedOut, 0 } },
+        else => unreachable,
+    };
+}
+
+fn monoMs() i64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
+}
+
 /// Long-lived WSS/WS JSON-RPC session for log subscriptions.
 pub const Session = struct {
     alloc: std.mem.Allocator,
@@ -101,7 +143,14 @@ pub const Session = struct {
     http: HttpClient,
     connection: ?*HttpClient.Connection = null,
     next_id: u64 = 1,
-    subscription_id: ?[]u8 = null,
+    /// 同一条连接上的多路 `eth_subscribe`。地址按块切开后每块一个 id。
+    subscription_ids: std.ArrayListUnmanaged([]u8) = .empty,
+    /// 等回执时已经推过来的日志最高块。索引线程用 HTTP 把 `[游标, 该块]` 补上后再读。
+    dropped_live_hi: ?u64 = null,
+    /// 半开连接上的读超时。`.none` 时不改 Io（单测的 undefined io 不能碰时钟）。
+    read_timeout: std.Io.Timeout = .none,
+    /// 连接上的 stream 持有这份 vtable 的指针，Session 不能在安装后再被移动。
+    timed_vtable: std.Io.VTable = undefined,
     /// Set by close() from another thread to unblock readers.
     closing: std.atomic.Value(bool) = .init(false),
     url_index: usize = 0,
@@ -117,11 +166,20 @@ pub const Session = struct {
     pub fn deinit(self: *Session) void {
         self.close();
         self.detachConnection();
+        self.clearSubscriptionIds();
+        self.subscription_ids.deinit(self.alloc);
         self.http.deinit();
     }
 
-    /// Signal close and unblock a blocked reader (safe from another thread).
-    /// Call detachConnection() from the owning thread to release the pool entry.
+    /// 关掉底层连接，让堵在 `readEvent` 里的索引线程返回。不释放订阅 id，
+    /// 清理仍由持有 Session 的那条线程做。
+    pub fn interrupt(self: *Session) void {
+        const conn = self.connection orelse return;
+        conn.stream_reader.stream.shutdown(self.io, .both) catch {};
+    }
+
+    /// 关掉底层连接，让堵在 `readEvent` 里的索引线程返回。
+    /// 不碰订阅 id：`stop` 会从别的线程调用这里，id 由持有 Session 的线程释放。
     pub fn close(self: *Session) void {
         self.closing.store(true, .monotonic);
         if (self.connection) |conn| {
@@ -129,10 +187,11 @@ pub const Session = struct {
             // Shutdown unblocks readers without double-close on later destroy().
             conn.stream_reader.stream.shutdown(self.io, .both) catch {};
         }
-        if (self.subscription_id) |sid| {
-            self.alloc.free(sid);
-            self.subscription_id = null;
-        }
+    }
+
+    fn clearSubscriptionIds(self: *Session) void {
+        for (self.subscription_ids.items) |sid| self.alloc.free(sid);
+        self.subscription_ids.clearRetainingCapacity();
     }
 
     pub fn detachConnection(self: *Session) void {
@@ -162,8 +221,10 @@ pub const Session = struct {
     /// Connect and complete WebSocket handshake to `url` (ws:// or wss://).
     pub fn connect(self: *Session, url: []const u8) !void {
         self.close();
+        self.clearSubscriptionIds();
         self.detachConnection();
         self.closing.store(false, .monotonic);
+        self.installReadTimeout();
 
         const uri = try std.Uri.parse(url);
         const protocol = HttpClient.Protocol.fromScheme(uri.scheme) orelse return error.UnsupportedUriScheme;
@@ -246,6 +307,35 @@ pub const Session = struct {
 
         self.connection = conn;
         log.info("WebSocket 已连接: {s}", .{url});
+    }
+
+    fn installReadTimeout(self: *Session) void {
+        if (self.read_timeout == .none) {
+            self.http.io = self.io;
+            ws_io_timeout = .none;
+            return;
+        }
+        self.timed_vtable = self.io.vtable.*;
+        self.timed_vtable.operate = wsTimedNetOperate;
+        ws_io_inner = self.io;
+        ws_io_timeout = self.read_timeout;
+        self.http.io = .{
+            .userdata = self.io.userdata,
+            .vtable = &self.timed_vtable,
+        };
+    }
+
+    pub fn setReadTimeoutMs(self: *Session, ms: u32) void {
+        if (ms == 0) {
+            self.read_timeout = .none;
+            return;
+        }
+        self.read_timeout = .{
+            .duration = .{
+                .raw = .fromMilliseconds(@as(i64, ms)),
+                .clock = .awake,
+            },
+        };
     }
 
     /// Connect using primary ws_url or failover ws_urls.
@@ -379,34 +469,46 @@ pub const Session = struct {
                     .float => |v| @intFromFloat(v),
                     else => null,
                 };
-                if (got_id == null or got_id.? != @as(i64, @intCast(id))) continue;
+                if (got_id == null or got_id.? != @as(i64, @intCast(id))) {
+                    self.observeHandshakePayload(frame.data);
+                    continue;
+                }
 
                 if (parsed.value.object.get("error")) |_| return error.SubscribeFailed;
                 const result = parsed.value.object.get("result") orelse return error.SubscribeFailed;
                 if (result != .string) return error.SubscribeFailed;
 
-                if (self.subscription_id) |old| self.alloc.free(old);
-                self.subscription_id = try self.alloc.dupe(u8, result.string);
-                log.info("eth_subscribe(logs) 成功, id={s}", .{self.subscription_id.?});
-                return self.subscription_id.?;
+                const copy = try self.alloc.dupe(u8, result.string);
+                errdefer self.alloc.free(copy);
+                try self.subscription_ids.append(self.alloc, copy);
+                log.info("eth_subscribe(logs) 成功, id={s}", .{copy});
+                return copy;
             }
-            // Ignore eth_subscription push while waiting for ack
+            // 前一路订阅已经在推日志。先记下块号，订完后按闭区间补扫，不能直接丢掉。
+            self.observeHandshakePayload(frame.data);
         }
     }
 
+    fn observeHandshakePayload(self: *Session, raw: []const u8) void {
+        const maybe = eth_rpc.parseSubscriptionNotification(self.alloc, raw) catch return;
+        const lg = maybe orelse return;
+        defer eth_rpc.freeLog(self.alloc, lg);
+        self.dropped_live_hi = if (self.dropped_live_hi) |hi| @max(hi, lg.block_number) else lg.block_number;
+    }
+
     pub fn unsubscribe(self: *Session) void {
-        const sid = self.subscription_id orelse return;
-        const id = self.next_id;
-        self.next_id += 1;
-        const req = std.fmt.allocPrint(
-            self.alloc,
-            "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"eth_unsubscribe\",\"params\":[\"{s}\"]}}",
-            .{ id, sid },
-        ) catch return;
-        defer self.alloc.free(req);
-        self.writeText(req) catch {};
-        self.alloc.free(sid);
-        self.subscription_id = null;
+        for (self.subscription_ids.items) |sid| {
+            const id = self.next_id;
+            self.next_id += 1;
+            const req = std.fmt.allocPrint(
+                self.alloc,
+                "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"eth_unsubscribe\",\"params\":[\"{s}\"]}}",
+                .{ id, sid },
+            ) catch continue;
+            defer self.alloc.free(req);
+            self.writeText(req) catch {};
+        }
+        self.clearSubscriptionIds();
     }
 
     /// Block until a log notification, ping handled, or close.
@@ -471,6 +573,69 @@ test "maskPayload roundtrip" {
     try std.testing.expect(!std.mem.eql(u8, &data, "Hello"));
     maskPayload(&mask, &data);
     try std.testing.expectEqualStrings("Hello", &data);
+}
+
+test "WSS 空闲超时不沿用 HTTP 的短超时" {
+    try std.testing.expectEqual(@as(u32, 0), idleTimeoutMs(0));
+    try std.testing.expectEqual(idle_timeout_ms, idleTimeoutMs(10_000));
+}
+
+test "WSS 读超时切断只接受不回应的握手" {
+    const alloc = std.testing.allocator;
+    var backend = std.Io.Threaded.init(alloc, .{});
+    defer backend.deinit();
+    const io = backend.io();
+
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try addr.listen(io, .{});
+    var release = std.atomic.Value(bool).init(false);
+    const holder = try std.Thread.spawn(.{}, struct {
+        fn run(listen: *std.Io.net.Server, io_: std.Io, release_: *std.atomic.Value(bool)) void {
+            const stream = listen.accept(io_) catch return;
+            defer stream.close(io_);
+            var waited_ms: u32 = 0;
+            while (!release_.load(.acquire) and waited_ms < 3000) : (waited_ms += 20) {
+                std.Io.sleep(io_, .fromMilliseconds(20), .awake) catch return;
+            }
+        }
+    }.run, .{ &server, io, &release });
+    defer {
+        release.store(true, .release);
+        server.deinit(io);
+        holder.join();
+    }
+
+    var url_buf: [64]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "ws://127.0.0.1:{d}", .{server.socket.address.getPort()}) catch unreachable;
+    var session = Session.init(alloc, io);
+    defer session.deinit();
+    session.setReadTimeoutMs(200);
+
+    const started = monoMs();
+    const result = session.connect(url);
+    const elapsed = monoMs() - started;
+    try std.testing.expect(elapsed < 2000);
+    if (result) |_| return error.TestUnexpectedResult else |err| switch (err) {
+        error.ReadFailed, error.WriteFailed => {},
+        else => return err,
+    }
+}
+
+test "等订阅回执时记下推送日志的最高块" {
+    var session = Session.init(std.testing.allocator, undefined);
+    defer session.subscription_ids.deinit(std.testing.allocator);
+    session.observeHandshakePayload(
+        \\{"jsonrpc":"2.0","id":1,"result":"0xsub"}
+    );
+    try std.testing.expect(session.dropped_live_hi == null);
+    session.observeHandshakePayload(
+        \\{"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":"0x1","result":{"address":"0xabc","topics":["0xt0"],"data":"0x","blockNumber":"0x10","transactionHash":"0xtx","logIndex":"0x0","removed":false}}}
+    );
+    try std.testing.expectEqual(@as(u64, 16), session.dropped_live_hi.?);
+    session.observeHandshakePayload(
+        \\{"jsonrpc":"2.0","method":"eth_subscription","params":{"subscription":"0x2","result":{"address":"0xdef","topics":[],"data":"0x","blockNumber":"0x12","transactionHash":"0xty","logIndex":"0x1","removed":false}}}
+    );
+    try std.testing.expectEqual(@as(u64, 18), session.dropped_live_hi.?);
 }
 
 test "encodeMaskedFrame text" {

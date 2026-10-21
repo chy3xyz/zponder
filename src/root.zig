@@ -22,8 +22,12 @@ pub const dashboard = @import("dashboard.zig");
 pub const graphql = @import("graphql.zig");
 pub const factory = @import("factory.zig");
 pub const webhook = @import("webhook.zig");
+pub const auth = @import("auth.zig");
 pub const script_engine = @import("script_engine.zig");
 pub const js_engine = @import("js_engine.zig");
+pub const user_schema = @import("user_schema.zig");
+pub const chain_clients = @import("chain_clients.zig");
+pub const log_cache = @import("log_cache.zig");
 
 test {
     _ = config;
@@ -43,6 +47,10 @@ test {
     _ = graphql;
     _ = factory;
     _ = webhook;
+    _ = auth;
     _ = script_engine;
     _ = js_engine;
+    _ = user_schema;
+    _ = chain_clients;
+    _ = log_cache;
 }

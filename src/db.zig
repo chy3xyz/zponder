@@ -6,6 +6,7 @@ const log = @import("log.zig");
 const utils = @import("utils.zig");
 const rocksdb = @import("rocksdb.zig");
 const pg = @import("pg.zig");
+const log_cache = @import("log_cache.zig");
 const build_options = @import("build_options");
 
 pub const DatabaseConfig = @import("config.zig").DatabaseConfig;
@@ -86,6 +87,11 @@ pub const Client = struct {
     rocks: ?rocksdb.Client,
     pgconn: ?pg.Client,
     cache: ?*cache.Cache = null,
+    /// 连接级写锁。BEGIN 作用于整条连接，多个索引器线程同时写时，后到的语句会卷进
+    /// 先到的事务。堆上分配，Client 按值返回时锁的地址不变。同一线程可重入。
+    write_mu: *std.c.pthread_mutex_t,
+    write_owner: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    write_depth: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     pub fn init(alloc: std.mem.Allocator, config: *const DatabaseConfig) !Client {
         if (std.mem.eql(u8, config.db_type, "sqlite")) {
@@ -125,6 +131,8 @@ pub const Client = struct {
         busy_pragma_buf[written.len] = 0;
         try checkPragma(db, busy_pragma_buf[0..written.len]);
 
+        if (config.log_cache) try attachLogCache(alloc, db, path);
+
         var read_db: ?*c.sqlite3 = null;
         if (!std.mem.eql(u8, path, ":memory:")) {
             const flags: c_int = c.SQLITE_OPEN_READONLY | c.SQLITE_OPEN_FULLMUTEX;
@@ -132,17 +140,26 @@ pub const Client = struct {
                 read_db = null;
             }
         }
-        return .{ .alloc = alloc, .config = config, .backend_type = .sqlite, .db = db, .read_db = read_db, .rocks = null, .pgconn = null };
+        const write_mu = createWriteMutex(alloc) catch |e| {
+            if (read_db) |rdb| _ = c.sqlite3_close(rdb);
+            _ = c.sqlite3_close(db);
+            return e;
+        };
+        return .{ .alloc = alloc, .config = config, .backend_type = .sqlite, .db = db, .read_db = read_db, .rocks = null, .pgconn = null, .write_mu = write_mu };
     }
 
     fn initRocksDB(alloc: std.mem.Allocator, config: *const DatabaseConfig) !Client {
+        if (config.log_cache) {
+            log.err("配置错误: database.log_cache 不支持 rocksdb（原始日志缓存仅 SQLite/PostgreSQL）", .{});
+            return error.UnsupportedOperation;
+        }
         if (!build_options.rocksdb) {
             log.err("此二进制未编译 RocksDB 后端（构建时用了 -Drocksdb=false）；请改用 sqlite/postgresql，或自行构建带 RocksDB 的二进制", .{});
             return error.RocksDbSupportNotCompiled;
         }
         const path = if (config.db_name.len > 0) config.db_name else "rocksdb_data";
         const rc = try rocksdb.Client.init(alloc, path);
-        return .{ .alloc = alloc, .config = config, .backend_type = .rocksdb, .db = null, .read_db = null, .rocks = rc, .pgconn = null };
+        return .{ .alloc = alloc, .config = config, .backend_type = .rocksdb, .db = null, .read_db = null, .rocks = rc, .pgconn = null, .write_mu = try createWriteMutex(alloc) };
     }
 
     fn initPostgreSQL(alloc: std.mem.Allocator, config: *const DatabaseConfig) !Client {
@@ -152,7 +169,33 @@ pub const Client = struct {
         }
         const conninfo = if (config.db_name.len > 0) config.db_name else "host=localhost port=5432 dbname=zponder";
         const conn = try pg.Client.init(alloc, conninfo);
-        return .{ .alloc = alloc, .config = config, .backend_type = .postgresql, .db = null, .read_db = null, .rocks = null, .pgconn = conn };
+        return .{ .alloc = alloc, .config = config, .backend_type = .postgresql, .db = null, .read_db = null, .rocks = null, .pgconn = conn, .write_mu = try createWriteMutex(alloc) };
+    }
+
+    pub fn logCacheEnabled(self: *const Client) bool {
+        return self.config.log_cache and self.backend_type != .rocksdb;
+    }
+
+    fn attachLogCache(alloc: std.mem.Allocator, db: ?*c.sqlite3, db_name: []const u8) !void {
+        const file_name = try log_cache.syncFileName(alloc, db_name);
+        defer alloc.free(file_name);
+        const escaped = try alloc.alloc(u8, file_name.len * 2);
+        defer alloc.free(escaped);
+        var n: usize = 0;
+        for (file_name) |ch| {
+            if (ch == '\'') {
+                escaped[n] = '\'';
+                n += 1;
+            }
+            escaped[n] = ch;
+            n += 1;
+        }
+        const sql = try std.fmt.allocPrint(alloc, "ATTACH DATABASE '{s}' AS sync;", .{escaped[0..n]});
+        defer alloc.free(sql);
+        const sql_z = try alloc.allocSentinel(u8, sql.len, 0);
+        defer alloc.free(sql_z);
+        @memcpy(sql_z, sql);
+        try checkPragma(db, sql_z);
     }
 
     pub fn getReadDb(self: *Client) ?*c.sqlite3 {
@@ -168,6 +211,13 @@ pub const Client = struct {
             .rocksdb => { if (self.rocks) |*r| { r.deinit(); self.rocks = null; } },
             .postgresql => { if (self.pgconn) |*p| { p.deinit(); self.pgconn = null; } },
         }
+        self.alloc.destroy(self.write_mu);
+    }
+
+    fn createWriteMutex(alloc: std.mem.Allocator) !*std.c.pthread_mutex_t {
+        const mu = try alloc.create(std.c.pthread_mutex_t);
+        mu.* = std.c.PTHREAD_MUTEX_INITIALIZER;
+        return mu;
     }
 
     pub fn setCache(self: *Client, cc: *cache.Cache) void {
@@ -175,6 +225,8 @@ pub const Client = struct {
     }
 
     pub fn migrate(self: *Client) !void {
+        self.guardEnter();
+        defer self.guardLeave();
         if (self.backend_type == .rocksdb) return;
         if (self.backend_type == .postgresql) return self.migratePG();
         const sql =
@@ -216,6 +268,9 @@ pub const Client = struct {
             \\  topics TEXT NOT NULL,
             \\  data TEXT NOT NULL,
             \\  reason TEXT NOT NULL DEFAULT 'abi_mismatch',
+            \\  log_address TEXT NOT NULL DEFAULT '',
+            \\  attempts INTEGER NOT NULL DEFAULT 0,
+            \\  retry_after INTEGER NOT NULL DEFAULT 0,
             \\  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             \\);
             \\CREATE INDEX IF NOT EXISTS idx_raw_logs ON raw_logs(contract_address, block_number);
@@ -264,6 +319,11 @@ pub const Client = struct {
             \\);
         ;
         try self.exec(sql);
+        try self.ensureRawLogColumns();
+        if (self.config.log_cache) {
+            try self.exec(log_cache.sqlite_ddl);
+            try self.ensureLogCacheTopicsKey();
+        }
     }
 
     pub fn autoMigrateContract(
@@ -273,6 +333,8 @@ pub const Client = struct {
         event_names: []const []const u8,
         contract_address: []const u8,
     ) !void {
+        self.guardEnter();
+        defer self.guardLeave();
         if (self.backend_type == .rocksdb) return;
         if (self.backend_type == .postgresql) return self.autoMigrateContractPG(contract_name, abi_contract, event_names, contract_address);
         for (event_names) |evt_name| {
@@ -287,6 +349,8 @@ pub const Client = struct {
     /// 幂等：列已存在且唯一键已更新时是空操作。SQLite 无法 ALTER 唯一约束，
     /// 因此需要重建表并搬数据（回填 contract_address）。
     pub fn migrateEventTableAddress(self: *Client, contract_name: []const u8, evt: *const abi.AbiEvent, contract_address: []const u8) !void {
+        self.guardEnter();
+        defer self.guardLeave();
         if (self.backend_type == .rocksdb) return;
         if (self.backend_type == .postgresql) return self.migrateEventTableAddressPG(contract_name, evt, contract_address);
 
@@ -494,18 +558,22 @@ pub const Client = struct {
         try self.exec(list.items);
     }
 
-    fn sanitizeColumnName(self: *Client, param_name: []const u8) ![]u8 {
+    pub fn eventColumnName(alloc: std.mem.Allocator, param_name: []const u8) ![]u8 {
         var buf = std.ArrayList(u8).empty;
-        defer buf.deinit(self.alloc);
-        try buf.appendSlice(self.alloc, "evt_");
+        defer buf.deinit(alloc);
+        try buf.appendSlice(alloc, "evt_");
         for (param_name) |ch| {
             if (std.ascii.isAlphanumeric(ch)) {
-                try buf.append(self.alloc, std.ascii.toLower(ch));
+                try buf.append(alloc, std.ascii.toLower(ch));
             } else {
-                try buf.append(self.alloc, '_');
+                try buf.append(alloc, '_');
             }
         }
-        return try self.alloc.dupe(u8, buf.items);
+        return try alloc.dupe(u8, buf.items);
+    }
+
+    fn sanitizeColumnName(self: *Client, param_name: []const u8) ![]u8 {
+        return eventColumnName(self.alloc, param_name);
     }
 
     // ========================================================================
@@ -526,6 +594,8 @@ pub const Client = struct {
         log_index: u64,
         contract_address: []const u8,
     ) !bool {
+        self.guardEnter();
+        defer self.guardLeave();
         if (self.backend_type == .rocksdb) return self.insertEventLogRocks(contract_name, event_name, fields, block_number, tx_hash, log_index, contract_address);
         if (self.backend_type == .postgresql) return self.insertEventLogPG(contract_name, event_name, fields, block_number, tx_hash, log_index, contract_address);
 
@@ -620,11 +690,21 @@ pub const Client = struct {
         topics: []const u8,
         data: []const u8,
         reason: []const u8,
+        log_address: []const u8,
     ) !void {
-        if (self.backend_type == .rocksdb) return self.insertRawLogRocks(contract_address, block_number, tx_hash, log_index, topics, data, reason);
-        if (self.backend_type == .postgresql) return self.insertRawLogPG(contract_address, block_number, tx_hash, log_index, topics, data, reason);
+        self.guardEnter();
+        defer self.guardLeave();
+        if (self.backend_type == .rocksdb) return self.insertRawLogRocks(contract_address, block_number, tx_hash, log_index, topics, data, reason, log_address);
+        if (self.backend_type == .postgresql) return self.insertRawLogPG(contract_address, block_number, tx_hash, log_index, topics, data, reason, log_address);
 
-        const sql = "INSERT INTO raw_logs (contract_address, block_number, tx_hash, log_index, topics, data, reason) VALUES (?, ?, ?, ?, ?, ?, ?);";
+        // 同一条日志反复失败只留一行，重试次数由 attempts 记。
+        const sql =
+            \\INSERT INTO raw_logs (contract_address, block_number, tx_hash, log_index, topics, data, reason, log_address)
+            \\SELECT ?, ?, ?, ?, ?, ?, ?, ?
+            \\WHERE NOT EXISTS (
+            \\  SELECT 1 FROM raw_logs WHERE contract_address = ? AND tx_hash = ? AND log_index = ?
+            \\);
+        ;
         var stmt: ?*c.sqlite3_stmt = null;
         const rc = c.sqlite3_prepare_v2(self.db, sql, @intCast(sql.len), &stmt, null);
         if (rc != c.SQLITE_OK) return error.PrepareFailed;
@@ -636,6 +716,10 @@ pub const Client = struct {
         if (c.sqlite3_bind_text(stmt, 5, topics.ptr, @intCast(topics.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.BindFailed;
         if (c.sqlite3_bind_text(stmt, 6, data.ptr, @intCast(data.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.BindFailed;
         if (c.sqlite3_bind_text(stmt, 7, reason.ptr, @intCast(reason.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.BindFailed;
+        if (c.sqlite3_bind_text(stmt, 8, log_address.ptr, @intCast(log_address.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.BindFailed;
+        if (c.sqlite3_bind_text(stmt, 9, contract_address.ptr, @intCast(contract_address.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.BindFailed;
+        if (c.sqlite3_bind_text(stmt, 10, tx_hash.ptr, @intCast(tx_hash.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.BindFailed;
+        if (c.sqlite3_bind_int64(stmt, 11, @intCast(log_index)) != c.SQLITE_OK) return error.BindFailed;
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.ExecFailed;
     }
 
@@ -648,6 +732,7 @@ pub const Client = struct {
         topics: []const u8,
         data: []const u8,
         reason: []const u8,
+        log_address: []const u8,
     ) !void {
         var key_buf: [256]u8 = undefined;
         const key = try std.fmt.bufPrint(&key_buf, "r:{s}:{d:0>20}:{s}:{d:0>20}", .{ contract_address, block_number, tx_hash, log_index });
@@ -659,10 +744,111 @@ pub const Client = struct {
         try utils.jsonEscapeString(&val_buf.writer, data);
         try val_buf.writer.print("\",\"reason\":\"", .{});
         try utils.jsonEscapeString(&val_buf.writer, reason);
+        try val_buf.writer.print("\",\"log_address\":\"", .{});
+        try utils.jsonEscapeString(&val_buf.writer, log_address);
         try val_buf.writer.writeAll("\"}");
         var vl = val_buf.toArrayList();
         defer vl.deinit(self.alloc);
         try self.rocks.?.put(key, vl.items);
+    }
+
+    /// 待重试的死信。`tx_hash` / `topics` / `data` / `log_address` 由调用方经 `freeRawLogs` 释放。
+    pub const RawLogRow = struct {
+        id: i64,
+        block_number: u64,
+        tx_hash: []u8,
+        log_index: u64,
+        topics: []u8,
+        data: []u8,
+        log_address: []u8,
+        attempts: i64,
+    };
+
+    pub fn listRawLogs(self: *Client, contract_key: []const u8, limit: u64, now_ms: i64) ![]RawLogRow {
+        self.guardEnter();
+        defer self.guardLeave();
+        if (self.backend_type == .rocksdb) return self.alloc.alloc(RawLogRow, 0);
+        const sql = if (self.backend_type == .postgresql)
+            "SELECT id, block_number, tx_hash, log_index, topics, data, log_address, attempts FROM raw_logs WHERE contract_address = $1 AND retry_after <= $2 ORDER BY attempts ASC, id ASC LIMIT $3;"
+        else
+            "SELECT id, block_number, tx_hash, log_index, topics, data, log_address, attempts FROM raw_logs WHERE contract_address = ? AND retry_after <= ? ORDER BY attempts ASC, id ASC LIMIT ?;";
+        const rows = try self.ponderQuery(sql, &.{
+            .{ .text = contract_key },
+            .{ .integer = now_ms },
+            .{ .integer = @intCast(limit) },
+        });
+        defer self.freeQueryRows(rows);
+        var out: std.ArrayList(RawLogRow) = .empty;
+        errdefer {
+            for (out.items) |row| freeRawLogRow(self.alloc, row);
+            out.deinit(self.alloc);
+        }
+        for (rows) |row| {
+            if (row.values.len < 8) continue;
+            const built = blk: {
+                const tx_hash = try dupeSqlText(self.alloc, row.values[2]);
+                errdefer self.alloc.free(tx_hash);
+                const topics = try dupeSqlText(self.alloc, row.values[4]);
+                errdefer self.alloc.free(topics);
+                const data = try dupeSqlText(self.alloc, row.values[5]);
+                errdefer self.alloc.free(data);
+                const log_address = try dupeSqlText(self.alloc, row.values[6]);
+                const block = sqlInt(row.values[1]);
+                const log_index = sqlInt(row.values[3]);
+                break :blk RawLogRow{
+                    .id = sqlInt(row.values[0]),
+                    .block_number = if (block > 0) @intCast(block) else 0,
+                    .tx_hash = tx_hash,
+                    .log_index = if (log_index > 0) @intCast(log_index) else 0,
+                    .topics = topics,
+                    .data = data,
+                    .log_address = log_address,
+                    .attempts = sqlInt(row.values[7]),
+                };
+            };
+            out.append(self.alloc, built) catch |e| {
+                freeRawLogRow(self.alloc, built);
+                return e;
+            };
+        }
+        return out.toOwnedSlice(self.alloc);
+    }
+
+    pub fn freeRawLogs(self: *Client, rows: []RawLogRow) void {
+        for (rows) |row| freeRawLogRow(self.alloc, row);
+        self.alloc.free(rows);
+    }
+
+    pub fn deleteRawLog(self: *Client, id: i64) !void {
+        self.guardEnter();
+        defer self.guardLeave();
+        if (self.backend_type == .rocksdb) return;
+        const sql = if (self.backend_type == .postgresql)
+            "DELETE FROM raw_logs WHERE id = $1;"
+        else
+            "DELETE FROM raw_logs WHERE id = ?;";
+        _ = try self.ponderExec(sql, &.{.{ .integer = id }});
+    }
+
+    pub fn bumpRawLogAttempt(self: *Client, id: i64, retry_after_ms: i64) !void {
+        self.guardEnter();
+        defer self.guardLeave();
+        if (self.backend_type == .rocksdb) return;
+        const sql = if (self.backend_type == .postgresql)
+            "UPDATE raw_logs SET attempts = attempts + 1, retry_after = $1 WHERE id = $2;"
+        else
+            "UPDATE raw_logs SET attempts = attempts + 1, retry_after = ? WHERE id = ?;";
+        _ = try self.ponderExec(sql, &.{ .{ .integer = retry_after_ms }, .{ .integer = id } });
+    }
+
+    pub fn countRawLogs(self: *Client) !i64 {
+        self.guardEnter();
+        defer self.guardLeave();
+        if (self.backend_type == .rocksdb) return 0;
+        const rows = try self.ponderQuery("SELECT COUNT(*) AS n FROM raw_logs;", &.{});
+        defer self.freeQueryRows(rows);
+        if (rows.len == 0 or rows[0].values.len == 0) return 0;
+        return sqlInt(rows[0].values[0]);
     }
 
     // ========================================================================
@@ -680,6 +866,8 @@ pub const Client = struct {
         offset: u32,
         order_desc: bool,
     ) ![]u8 {
+        self.guardEnter();
+        defer self.guardLeave();
         if (self.backend_type == .rocksdb) return self.queryEventLogsRocks(contract_name, event_name, block_from, block_to, tx_hash, address, limit, offset, order_desc);
         if (self.backend_type == .postgresql) return self.queryEventLogsPG(contract_name, event_name, block_from, block_to, tx_hash, address, limit, offset, order_desc);
 
@@ -809,6 +997,8 @@ pub const Client = struct {
     // sync_state
     // ========================================================================
     pub fn getSyncState(self: *Client, contract_address: []const u8) !?SyncState {
+        self.guardEnter();
+        defer self.guardLeave();
         if (self.backend_type == .rocksdb) return self.getSyncStateRocks(contract_address);
         if (self.backend_type == .postgresql) return self.getSyncStatePG(contract_address);
 
@@ -847,6 +1037,8 @@ pub const Client = struct {
     }
 
     pub fn upsertSyncState(self: *Client, state: SyncState) !void {
+        self.guardEnter();
+        defer self.guardLeave();
         if (self.backend_type == .rocksdb) return self.upsertSyncStateRocks(state);
         if (self.backend_type == .postgresql) return self.upsertSyncStatePG(state);
 
@@ -876,6 +1068,22 @@ pub const Client = struct {
         try self.rocks.?.put(key, val);
     }
 
+    pub fn deleteSyncState(self: *Client, contract_address: []const u8) !void {
+        if (self.backend_type == .rocksdb) {
+            self.guardEnter();
+            defer self.guardLeave();
+            var key_buf: [128]u8 = undefined;
+            const key = try std.fmt.bufPrint(&key_buf, "s:{s}", .{contract_address});
+            try self.rocks.?.delete(key);
+            return;
+        }
+        const sql = if (self.backend_type == .postgresql)
+            "DELETE FROM sync_state WHERE contract_address = $1;"
+        else
+            "DELETE FROM sync_state WHERE contract_address = ?;";
+        _ = try self.ponderExec(sql, &.{.{ .text = contract_address }});
+    }
+
     // ========================================================================
     // template_addresses：模板模式下动态发现的 clone 地址集合
     // 表由 Client.migrate() 建（SQLite / PostgreSQL），RocksDB 未实现。
@@ -886,6 +1094,8 @@ pub const Client = struct {
     /// ON CONFLICT(template, address) DO NOTHING：同一地址重复发现不覆盖已有
     /// from_block/backfilled 进度。落库失败向上返回，由调用方决定是否阻断。
     pub fn addTemplateAddress(self: *Client, template: []const u8, address: []const u8, from_block: u64) !void {
+        self.guardEnter();
+        defer self.guardLeave();
         if (self.backend_type == .rocksdb) return error.UnsupportedOperation;
         const sql = if (self.backend_type == .postgresql)
             "INSERT INTO template_addresses (template, address, from_block) VALUES ($1, $2, $3) ON CONFLICT(template, address) DO NOTHING;"
@@ -900,6 +1110,8 @@ pub const Client = struct {
     /// 内存约定同 getSyncState：返回堆数组，调用方负责释放——
     /// `for (list) |item| alloc.free(item.address);` 之后 `alloc.free(list)`。
     pub fn listTemplateAddresses(self: *Client, template: []const u8) ![]TemplateAddress {
+        self.guardEnter();
+        defer self.guardLeave();
         if (self.backend_type == .rocksdb) return error.UnsupportedOperation;
         const sql = if (self.backend_type == .postgresql)
             "SELECT address, from_block, backfilled FROM template_addresses WHERE template = $1 ORDER BY from_block, address;"
@@ -939,6 +1151,8 @@ pub const Client = struct {
 
     /// 标记某 clone 的历史区间已回填完成。
     pub fn markTemplateAddressBackfilled(self: *Client, template: []const u8, address: []const u8) !void {
+        self.guardEnter();
+        defer self.guardLeave();
         if (self.backend_type == .rocksdb) return error.UnsupportedOperation;
         const sql = if (self.backend_type == .postgresql)
             "UPDATE template_addresses SET backfilled = 1 WHERE template = $1 AND address = $2;"
@@ -949,6 +1163,8 @@ pub const Client = struct {
 
     /// reorg 回滚：删除该模板中 from_block >= 给定块的 clone 地址。
     pub fn deleteTemplateAddressesFromBlock(self: *Client, template: []const u8, from_block: u64) !void {
+        self.guardEnter();
+        defer self.guardLeave();
         if (self.backend_type == .rocksdb) return error.UnsupportedOperation;
         const sql = if (self.backend_type == .postgresql)
             "DELETE FROM template_addresses WHERE template = $1 AND from_block >= $2;"
@@ -961,6 +1177,8 @@ pub const Client = struct {
     // account_states
     // ========================================================================
     pub fn upsertAccountState(self: *Client, state: AccountState) !void {
+        self.guardEnter();
+        defer self.guardLeave();
         if (self.backend_type == .rocksdb) return self.upsertAccountStateRocks(state);
         if (self.backend_type == .postgresql) return self.upsertAccountStatePG(state);
 
@@ -992,6 +1210,8 @@ pub const Client = struct {
     }
 
     pub fn getAccountBalance(self: *Client, contract_address: []const u8, account_address: []const u8) !?[]const u8 {
+        self.guardEnter();
+        defer self.guardLeave();
         if (self.backend_type == .rocksdb) return self.getAccountBalanceRocks(contract_address, account_address);
         if (self.backend_type == .postgresql) return self.getAccountBalancePG(contract_address, account_address);
 
@@ -1033,17 +1253,26 @@ pub const Client = struct {
         from_block: u64,
         to_block: u64,
     ) !void {
+        self.guardEnter();
+        defer self.guardLeave();
         if (self.backend_type == .rocksdb) return self.deleteEventLogsInRangeRocks(contract_name, event_name, from_block, to_block);
         if (self.backend_type == .postgresql) return self.deleteEventLogsInRangePG(contract_name, event_name, from_block, to_block);
 
+        // SQLite 的绑定类型是 i64。上界放不进 i64 时表示删到链尖，不再加 `<=`。
+        const open_end = to_block > std.math.maxInt(i64);
         var sql_buf: [256]u8 = undefined;
-        const sql = try std.fmt.bufPrint(&sql_buf, "DELETE FROM event_{s}_{s} WHERE block_number >= ? AND block_number <= ?;", .{ contract_name, event_name });
+        const sql = if (open_end)
+            try std.fmt.bufPrint(&sql_buf, "DELETE FROM event_{s}_{s} WHERE block_number >= ?;", .{contract_name, event_name})
+        else
+            try std.fmt.bufPrint(&sql_buf, "DELETE FROM event_{s}_{s} WHERE block_number >= ? AND block_number <= ?;", .{ contract_name, event_name });
         var stmt: ?*c.sqlite3_stmt = null;
         const rc = c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null);
         if (rc != c.SQLITE_OK) return error.PrepareFailed;
         defer _ = c.sqlite3_finalize(stmt);
         if (c.sqlite3_bind_int64(stmt, 1, @intCast(from_block)) != c.SQLITE_OK) return error.BindFailed;
-        if (c.sqlite3_bind_int64(stmt, 2, @intCast(to_block)) != c.SQLITE_OK) return error.BindFailed;
+        if (!open_end) {
+            if (c.sqlite3_bind_int64(stmt, 2, @intCast(to_block)) != c.SQLITE_OK) return error.BindFailed;
+        }
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.ExecFailed;
         if (self.cache) |cc| cc.invalidate(contract_name, event_name);
     }
@@ -1082,6 +1311,8 @@ pub const Client = struct {
     // snapshots
     // ========================================================================
     pub fn createSnapshot(self: *Client, snapshot: Snapshot) !void {
+        self.guardEnter();
+        defer self.guardLeave();
         if (self.backend_type == .rocksdb) return self.createSnapshotRocks(snapshot);
         if (self.backend_type == .postgresql) return self.createSnapshotPG(snapshot);
 
@@ -1103,6 +1334,8 @@ pub const Client = struct {
     }
 
     pub fn getLatestSnapshot(self: *Client, contract_address: []const u8) !?Snapshot {
+        self.guardEnter();
+        defer self.guardLeave();
         if (self.backend_type == .rocksdb) return self.getLatestSnapshotRocks(contract_address);
         if (self.backend_type == .postgresql) return self.getLatestSnapshotPG(contract_address);
 
@@ -1158,6 +1391,8 @@ pub const Client = struct {
     // block_hashes
     // ========================================================================
     pub fn upsertBlockHash(self: *Client, contract_address: []const u8, block_number: u64, block_hash: []const u8) !void {
+        self.guardEnter();
+        defer self.guardLeave();
         if (self.backend_type == .rocksdb) return self.upsertBlockHashRocks(contract_address, block_number, block_hash);
         if (self.backend_type == .postgresql) return self.upsertBlockHashPG(contract_address, block_number, block_hash);
 
@@ -1184,6 +1419,8 @@ pub const Client = struct {
     }
 
     pub fn getBlockHash(self: *Client, contract_address: []const u8, block_number: u64) !?[]u8 {
+        self.guardEnter();
+        defer self.guardLeave();
         if (self.backend_type == .rocksdb) return self.getBlockHashRocks(contract_address, block_number);
         if (self.backend_type == .postgresql) return self.getBlockHashPG(contract_address, block_number);
 
@@ -1212,6 +1449,8 @@ pub const Client = struct {
     // blocks
     // ========================================================================
     pub fn upsertBlock(self: *Client, block: BlockRecord) !void {
+        self.guardEnter();
+        defer self.guardLeave();
         if (self.backend_type == .rocksdb) return self.upsertBlockRocks(block);
         if (self.backend_type == .postgresql) return self.upsertBlockPG(block);
 
@@ -1284,6 +1523,51 @@ pub const Client = struct {
         _ = try self.pgconn.?.execParams(sql, &args);
     }
 
+    /// 已落库的区块时间戳。没有这一行时返回 null，调用方再向节点要。
+    pub fn getBlockTimestamp(self: *Client, chain: []const u8, block_number: u64) !?u64 {
+        self.guardEnter();
+        defer self.guardLeave();
+        if (self.backend_type == .rocksdb) return self.getBlockTimestampRocks(chain, block_number);
+        if (self.backend_type == .postgresql) return self.getBlockTimestampPG(chain, block_number);
+        const sql = "SELECT timestamp FROM blocks WHERE chain = ? AND block_number = ?;";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_bind_text(stmt, 1, chain.ptr, @intCast(chain.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.BindFailed;
+        if (c.sqlite3_bind_int64(stmt, 2, @intCast(block_number)) != c.SQLITE_OK) return error.BindFailed;
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        const ts = c.sqlite3_column_int64(stmt, 0);
+        if (ts < 0) return 0;
+        return @intCast(ts);
+    }
+
+    fn getBlockTimestampRocks(self: *Client, chain: []const u8, block_number: u64) !?u64 {
+        var key_buf: [192]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "b:{s}:{d:0>20}", .{ chain, block_number });
+        const raw = (try self.rocks.?.get(key)) orelse return null;
+        defer self.alloc.free(raw);
+        const parsed = std.json.parseFromSlice(std.json.Value, self.alloc, raw, .{}) catch return null;
+        defer parsed.deinit();
+        const obj = switch (parsed.value) {
+            .object => |o| o,
+            else => return null,
+        };
+        const ts = obj.get("timestamp") orelse return null;
+        return switch (ts) {
+            .integer => |n| if (n < 0) 0 else @intCast(n),
+            else => null,
+        };
+    }
+
+    fn getBlockTimestampPG(self: *Client, chain: []const u8, block_number: u64) !?u64 {
+        var block_buf: [21]u8 = undefined;
+        const block_str = try std.fmt.bufPrint(&block_buf, "{d}", .{block_number});
+        var result = try self.pgconn.?.execParams("SELECT timestamp FROM blocks WHERE chain = $1 AND block_number = $2;", &.{ chain, block_str });
+        defer result.deinit();
+        if (result.rows() == 0 or result.isNull(0, 0)) return null;
+        return std.fmt.parseInt(u64, result.get(0, 0), 10) catch null;
+    }
+
     pub fn queryBlocks(
         self: *Client,
         chain: []const u8,
@@ -1292,6 +1576,8 @@ pub const Client = struct {
         limit: u32,
         offset: u32,
     ) ![]u8 {
+        self.guardEnter();
+        defer self.guardLeave();
         if (self.backend_type == .rocksdb) return self.queryBlocksRocks(chain, from_block, to_block, limit, offset);
         if (self.backend_type == .postgresql) return self.queryBlocksPG(chain, from_block, to_block, limit, offset);
 
@@ -1432,6 +1718,8 @@ pub const Client = struct {
     // call_cache
     // ========================================================================
     pub fn getCachedCall(self: *Client, cache_key: []const u8) !?[]u8 {
+        self.guardEnter();
+        defer self.guardLeave();
         if (self.backend_type == .rocksdb) {
             var key_buf: [256]u8 = undefined;
             const key = try std.fmt.bufPrint(&key_buf, "c:{s}", .{cache_key});
@@ -1462,6 +1750,8 @@ pub const Client = struct {
     }
 
     pub fn setCachedCall(self: *Client, cache_key: []const u8, result: []const u8, block_number: u64) !void {
+        self.guardEnter();
+        defer self.guardLeave();
         if (self.backend_type == .rocksdb) {
             var key_buf: [256]u8 = undefined;
             const key = try std.fmt.bufPrint(&key_buf, "c:{s}", .{cache_key});
@@ -1498,11 +1788,636 @@ pub const Client = struct {
     }
 
     // ========================================================================
+    // 原始日志缓存（schema sync）
+    // ========================================================================
+
+    pub fn hasLogCoverage(self: *Client, chain: []const u8, address: []const u8, topics_key: []const u8, from_block: u64, to_block: u64) !bool {
+        self.guardEnter();
+        defer self.guardLeave();
+        if (!self.logCacheEnabled()) return false;
+        var abuf: [42]u8 = undefined;
+        const addr = log_cache.cacheAddress(&abuf, address);
+        if (self.backend_type == .postgresql) return self.hasLogCoveragePG(chain, addr, topics_key, from_block, to_block);
+        const sql = "SELECT 1 FROM sync.chain_log_ranges WHERE chain = ? AND address = ? AND topics_key = ? AND from_block <= ? AND to_block >= ? LIMIT 1;";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt, 1, chain);
+        try bindText(stmt, 2, addr);
+        try bindText(stmt, 3, topics_key);
+        if (c.sqlite3_bind_int64(stmt, 4, @intCast(to_block)) != c.SQLITE_OK) return error.BindFailed;
+        if (c.sqlite3_bind_int64(stmt, 5, @intCast(from_block)) != c.SQLITE_OK) return error.BindFailed;
+        return c.sqlite3_step(stmt) == c.SQLITE_ROW;
+    }
+
+    pub fn uncoveredLogRanges(self: *Client, chain: []const u8, address: []const u8, topics_key: []const u8, from_block: u64, to_block: u64) ![]log_cache.BlockSpan {
+        self.guardEnter();
+        defer self.guardLeave();
+        const covered = try self.listLogRanges(chain, address, topics_key, from_block, to_block);
+        defer self.alloc.free(covered);
+        const buf = try self.alloc.alloc(log_cache.BlockSpan, covered.len + 1);
+        errdefer self.alloc.free(buf);
+        const n = log_cache.uncovered(covered, from_block, to_block, buf);
+        if (n == buf.len) return buf;
+        const out = try self.alloc.alloc(log_cache.BlockSpan, n);
+        @memcpy(out, buf[0..n]);
+        self.alloc.free(buf);
+        return out;
+    }
+
+    pub fn loadChainLogs(self: *Client, chain: []const u8, address: []const u8, from_block: u64, to_block: u64) ![]log_cache.ChainLogRow {
+        self.guardEnter();
+        defer self.guardLeave();
+        if (!self.logCacheEnabled()) return self.alloc.alloc(log_cache.ChainLogRow, 0);
+        var abuf: [42]u8 = undefined;
+        const addr = log_cache.cacheAddress(&abuf, address);
+        if (self.backend_type == .postgresql) return self.loadChainLogsPG(chain, addr, from_block, to_block);
+        const sql = "SELECT address, block_number, tx_hash, log_index, topics, data FROM sync.chain_logs WHERE chain = ? AND address = ? AND block_number >= ? AND block_number <= ? ORDER BY block_number, log_index;";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt, 1, chain);
+        try bindText(stmt, 2, addr);
+        if (c.sqlite3_bind_int64(stmt, 3, @intCast(from_block)) != c.SQLITE_OK) return error.BindFailed;
+        if (c.sqlite3_bind_int64(stmt, 4, @intCast(to_block)) != c.SQLITE_OK) return error.BindFailed;
+        var rows: std.ArrayList(log_cache.ChainLogRow) = .empty;
+        errdefer {
+            for (rows.items) |*row| freeChainLogRow(self.alloc, row);
+            rows.deinit(self.alloc);
+        }
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            try rows.append(self.alloc, .{
+                .address = try dupeSqliteText(self.alloc, stmt, 0),
+                .block_number = @intCast(c.sqlite3_column_int64(stmt, 1)),
+                .tx_hash = try dupeSqliteText(self.alloc, stmt, 2),
+                .log_index = @intCast(c.sqlite3_column_int64(stmt, 3)),
+                .topics = try dupeSqliteText(self.alloc, stmt, 4),
+                .data = try dupeSqliteText(self.alloc, stmt, 5),
+            });
+        }
+        return rows.toOwnedSlice(self.alloc);
+    }
+
+    pub fn freeChainLogs(self: *Client, rows: []log_cache.ChainLogRow) void {
+        for (rows) |*row| freeChainLogRow(self.alloc, row);
+        self.alloc.free(rows);
+    }
+
+    /// 把这一段的原始日志写入缓存，并把 `addresses` 的 `[from_block, to_block]` 标成完整。
+    /// 没有日志的地址也标完整，避免重跑时把空区间再向 RPC 要一遍。
+    pub fn storeLogCacheBatch(
+        self: *Client,
+        chain: []const u8,
+        addresses: []const []const u8,
+        topics_key: []const u8,
+        from_block: u64,
+        to_block: u64,
+        logs: []const log_cache.ChainLogIn,
+    ) !void {
+        if (!self.logCacheEnabled()) return;
+        if (from_block > to_block) return;
+        try self.beginWrite();
+        errdefer self.rollbackWrite();
+        for (logs) |lg| {
+            if (lg.block_number < from_block or lg.block_number > to_block) continue;
+            var abuf: [42]u8 = undefined;
+            const addr = log_cache.cacheAddress(&abuf, lg.address);
+            try self.insertChainLogTx(chain, addr, lg);
+        }
+        for (addresses) |address| {
+            var abuf: [42]u8 = undefined;
+            const addr = log_cache.cacheAddress(&abuf, address);
+            try self.markLogRangeTx(chain, addr, topics_key, from_block, to_block);
+        }
+        try self.commitWrite();
+    }
+
+    /// 尖端单条日志只入库，不推进覆盖区间。区间只由完整的 eth_getLogs 结果来标。
+    pub fn insertChainLog(self: *Client, chain: []const u8, lg: log_cache.ChainLogIn) !void {
+        self.guardEnter();
+        defer self.guardLeave();
+        if (!self.logCacheEnabled()) return;
+        var abuf: [42]u8 = undefined;
+        const addr = log_cache.cacheAddress(&abuf, lg.address);
+        try self.insertChainLogTx(chain, addr, lg);
+    }
+
+    pub fn deleteProjectionsFromBlock(self: *Client, from_block: u64, to_block: u64) !void {
+        self.guardEnter();
+        defer self.guardLeave();
+        if (from_block > to_block) return;
+        if (self.backend_type == .rocksdb) return;
+        if (self.backend_type == .postgresql) return self.deleteProjectionsFromBlockPG(from_block, to_block);
+        var names: std.ArrayList([]u8) = .empty;
+        defer {
+            for (names.items) |name| self.alloc.free(name);
+            names.deinit(self.alloc);
+        }
+        const sql = "SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'proj\\_%' ESCAPE '\\';";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            const name = std.mem.sliceTo(c.sqlite3_column_text(stmt, 0), 0);
+            const dup = try self.alloc.dupe(u8, name);
+            names.append(self.alloc, dup) catch {
+                self.alloc.free(dup);
+                return error.OutOfMemory;
+            };
+        }
+        const open_end = to_block > std.math.maxInt(i64);
+        for (names.items) |tbl| {
+            var del_buf: [512]u8 = undefined;
+            const del_sql = if (open_end)
+                std.fmt.bufPrint(&del_buf, "DELETE FROM \"{s}\" WHERE block_number >= ?;", .{tbl}) catch continue
+            else
+                std.fmt.bufPrint(&del_buf, "DELETE FROM \"{s}\" WHERE block_number >= ? AND block_number <= ?;", .{tbl}) catch continue;
+            var dstmt: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, del_sql.ptr, @intCast(del_sql.len), &dstmt, null) != c.SQLITE_OK) continue;
+            defer _ = c.sqlite3_finalize(dstmt);
+            if (c.sqlite3_bind_int64(dstmt, 1, @intCast(from_block)) != c.SQLITE_OK) continue;
+            if (!open_end) {
+                if (c.sqlite3_bind_int64(dstmt, 2, @intCast(to_block)) != c.SQLITE_OK) continue;
+            }
+            _ = c.sqlite3_step(dstmt);
+        }
+    }
+
+    /// 重放前一次性清掉区间内的事件和投影，并把断点写成 `from_block`。
+    /// 进程在这之后崩溃，重启会从 `from_block` 再跑，而不是停在旧的链尖。
+    /// 任一步失败则整段回滚，游标保持原值。
+    pub fn resetForReplay(
+        self: *Client,
+        state_key: []const u8,
+        contract_name: []const u8,
+        event_names: []const []const u8,
+        from_block: u64,
+        to_block: u64,
+    ) !void {
+        const use_txn = self.backend_type != .rocksdb;
+        if (use_txn) try self.beginWrite();
+        errdefer if (use_txn) self.rollbackWrite();
+        for (event_names) |evt_name| {
+            try self.deleteEventLogsInRange(contract_name, evt_name, from_block, to_block);
+        }
+        try self.deleteProjectionsFromBlock(from_block, to_block);
+        try self.deleteRawLogsFrom(state_key, from_block, to_block);
+        try self.upsertSyncState(.{
+            .contract_address = state_key,
+            .last_synced_block = from_block,
+            .status = "replaying",
+        });
+        if (use_txn) try self.commitWrite();
+    }
+
+    /// 删掉区间里的死信。上界放不进 i64 时表示删到链尖。
+    /// 重放和重组都要清掉，否则下一轮重试会把已经删掉的事件再插回来。
+    fn deleteRawLogsFrom(self: *Client, contract_key: []const u8, from_block: u64, to_block: u64) !void {
+        if (self.backend_type == .rocksdb) return;
+        const open_end = to_block > std.math.maxInt(i64);
+        if (self.backend_type == .postgresql) {
+            const sql = if (open_end)
+                "DELETE FROM raw_logs WHERE contract_address = $1 AND block_number >= $2;"
+            else
+                "DELETE FROM raw_logs WHERE contract_address = $1 AND block_number >= $2 AND block_number <= $3;";
+            var bf: [21]u8 = undefined;
+            var bt: [21]u8 = undefined;
+            const from_str = try std.fmt.bufPrint(&bf, "{}", .{from_block});
+            var result = if (open_end)
+                try self.pgconn.?.execParams(sql, &.{ contract_key, from_str })
+            else
+                try self.pgconn.?.execParams(sql, &.{ contract_key, from_str, try std.fmt.bufPrint(&bt, "{}", .{to_block}) });
+            defer result.deinit();
+            return;
+        }
+        const sql = if (open_end)
+            "DELETE FROM raw_logs WHERE contract_address = ? AND block_number >= ?;"
+        else
+            "DELETE FROM raw_logs WHERE contract_address = ? AND block_number >= ? AND block_number <= ?;";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt, 1, contract_key);
+        if (c.sqlite3_bind_int64(stmt, 2, @intCast(from_block)) != c.SQLITE_OK) return error.BindFailed;
+        if (!open_end) {
+            if (c.sqlite3_bind_int64(stmt, 3, @intCast(to_block)) != c.SQLITE_OK) return error.BindFailed;
+        }
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.ExecFailed;
+    }
+
+    fn guardEnter(self: *Client) void {
+        const me: u64 = @intCast(std.Thread.getCurrentId());
+        if (self.write_depth.load(.monotonic) > 0 and self.write_owner.load(.acquire) == me) {
+            _ = self.write_depth.fetchAdd(1, .monotonic);
+            return;
+        }
+        if (std.c.pthread_mutex_lock(self.write_mu) != .SUCCESS) unreachable;
+        self.write_owner.store(me, .release);
+        self.write_depth.store(1, .monotonic);
+    }
+
+    fn guardLeave(self: *Client) void {
+        const left = self.write_depth.load(.monotonic);
+        if (left > 1) {
+            self.write_depth.store(left - 1, .monotonic);
+            return;
+        }
+        self.write_depth.store(0, .monotonic);
+        self.write_owner.store(0, .release);
+        if (std.c.pthread_mutex_unlock(self.write_mu) != .SUCCESS) unreachable;
+    }
+
+    pub fn beginWrite(self: *Client) !void {
+        self.guardEnter();
+        errdefer self.guardLeave();
+        if (self.backend_type == .postgresql) {
+            try self.pgconn.?.exec("BEGIN");
+            return;
+        }
+        try self.exec("BEGIN;");
+    }
+
+    pub fn commitWrite(self: *Client) !void {
+        if (self.backend_type == .postgresql) {
+            try self.pgconn.?.exec("COMMIT");
+        } else {
+            try self.exec("COMMIT;");
+        }
+        self.guardLeave();
+    }
+
+    pub fn rollbackWrite(self: *Client) void {
+        if (self.backend_type == .postgresql) {
+            self.pgconn.?.exec("ROLLBACK") catch {};
+        } else {
+            _ = c.sqlite3_exec(self.db, "ROLLBACK;", null, null, null);
+        }
+        self.guardLeave();
+    }
+
+    fn trimLogCacheUnlocked(self: *Client, chain: []const u8, from_block: u64) !void {
+        if (!self.logCacheEnabled()) return;
+        if (self.backend_type == .postgresql) return self.trimLogCachePG(chain, from_block);
+        const del_logs = "DELETE FROM sync.chain_logs WHERE chain = ? AND block_number >= ?;";
+        const del_ranges = "DELETE FROM sync.chain_log_ranges WHERE chain = ? AND from_block >= ?;";
+        try execBind2(self.db, del_logs, chain, from_block);
+        try execBind2(self.db, del_ranges, chain, from_block);
+        if (from_block == 0) return;
+        const upd = "UPDATE sync.chain_log_ranges SET to_block = ? WHERE chain = ? AND from_block < ? AND to_block >= ?;";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, upd.ptr, @intCast(upd.len), &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        if (c.sqlite3_bind_int64(stmt, 1, @intCast(from_block - 1)) != c.SQLITE_OK) return error.BindFailed;
+        try bindText(stmt, 2, chain);
+        if (c.sqlite3_bind_int64(stmt, 3, @intCast(from_block)) != c.SQLITE_OK) return error.BindFailed;
+        if (c.sqlite3_bind_int64(stmt, 4, @intCast(from_block)) != c.SQLITE_OK) return error.BindFailed;
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.ExecFailed;
+    }
+
+    fn listLogRanges(self: *Client, chain: []const u8, address: []const u8, topics_key: []const u8, from_block: u64, to_block: u64) ![]log_cache.BlockSpan {
+        if (!self.logCacheEnabled()) return self.alloc.alloc(log_cache.BlockSpan, 0);
+        var abuf: [42]u8 = undefined;
+        const addr = log_cache.cacheAddress(&abuf, address);
+        if (self.backend_type == .postgresql) return self.listLogRangesPG(chain, addr, topics_key, from_block, to_block);
+        const sql = "SELECT from_block, to_block FROM sync.chain_log_ranges WHERE chain = ? AND address = ? AND topics_key = ? AND from_block <= ? AND to_block >= ? ORDER BY from_block;";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt, 1, chain);
+        try bindText(stmt, 2, addr);
+        try bindText(stmt, 3, topics_key);
+        if (c.sqlite3_bind_int64(stmt, 4, @intCast(to_block)) != c.SQLITE_OK) return error.BindFailed;
+        if (c.sqlite3_bind_int64(stmt, 5, @intCast(from_block)) != c.SQLITE_OK) return error.BindFailed;
+        var spans: std.ArrayList(log_cache.BlockSpan) = .empty;
+        errdefer spans.deinit(self.alloc);
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            try spans.append(self.alloc, .{
+                .from_block = @intCast(c.sqlite3_column_int64(stmt, 0)),
+                .to_block = @intCast(c.sqlite3_column_int64(stmt, 1)),
+            });
+        }
+        return spans.toOwnedSlice(self.alloc);
+    }
+
+    fn listAllLogRanges(self: *Client, chain: []const u8, address: []const u8, topics_key: []const u8) ![]log_cache.BlockSpan {
+        if (self.backend_type == .postgresql) return self.listAllLogRangesPG(chain, address, topics_key);
+        const sql = "SELECT from_block, to_block FROM sync.chain_log_ranges WHERE chain = ? AND address = ? AND topics_key = ? ORDER BY from_block;";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt, 1, chain);
+        try bindText(stmt, 2, address);
+        try bindText(stmt, 3, topics_key);
+        var spans: std.ArrayList(log_cache.BlockSpan) = .empty;
+        errdefer spans.deinit(self.alloc);
+        while (c.sqlite3_step(stmt) == c.SQLITE_ROW) {
+            try spans.append(self.alloc, .{
+                .from_block = @intCast(c.sqlite3_column_int64(stmt, 0)),
+                .to_block = @intCast(c.sqlite3_column_int64(stmt, 1)),
+            });
+        }
+        return spans.toOwnedSlice(self.alloc);
+    }
+
+    fn markLogRangeTx(self: *Client, chain: []const u8, address: []const u8, topics_key: []const u8, from_block: u64, to_block: u64) !void {
+        const spans = try self.listAllLogRanges(chain, address, topics_key);
+        defer self.alloc.free(spans);
+        const with_new = try self.alloc.alloc(log_cache.BlockSpan, spans.len + 1);
+        defer self.alloc.free(with_new);
+        @memcpy(with_new[0..spans.len], spans);
+        with_new[spans.len] = .{ .from_block = from_block, .to_block = to_block };
+        const merged = try log_cache.mergeSpans(self.alloc, with_new);
+        defer self.alloc.free(merged);
+        if (self.backend_type == .postgresql) {
+            var result = try self.pgconn.?.execParams("DELETE FROM sync.chain_log_ranges WHERE chain = $1 AND address = $2 AND topics_key = $3;", &.{ chain, address, topics_key });
+            result.deinit();
+            for (merged) |span| {
+                var from_buf: [21]u8 = undefined;
+                var to_buf: [21]u8 = undefined;
+                const from_str = try std.fmt.bufPrint(&from_buf, "{d}", .{span.from_block});
+                const to_str = try std.fmt.bufPrint(&to_buf, "{d}", .{span.to_block});
+                var ins = try self.pgconn.?.execParams(
+                    "INSERT INTO sync.chain_log_ranges(chain, address, topics_key, from_block, to_block) VALUES($1,$2,$3,$4,$5);",
+                    &.{ chain, address, topics_key, from_str, to_str },
+                );
+                ins.deinit();
+            }
+            return;
+        }
+        const del = "DELETE FROM sync.chain_log_ranges WHERE chain = ? AND address = ? AND topics_key = ?;";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, del.ptr, @intCast(del.len), &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt, 1, chain);
+        try bindText(stmt, 2, address);
+        try bindText(stmt, 3, topics_key);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.ExecFailed;
+        const ins = "INSERT INTO sync.chain_log_ranges(chain, address, topics_key, from_block, to_block) VALUES(?,?,?,?,?);";
+        for (merged) |span| {
+            var istmt: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, ins.ptr, @intCast(ins.len), &istmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+            defer _ = c.sqlite3_finalize(istmt);
+            try bindText(istmt, 1, chain);
+            try bindText(istmt, 2, address);
+            try bindText(istmt, 3, topics_key);
+            if (c.sqlite3_bind_int64(istmt, 4, @intCast(span.from_block)) != c.SQLITE_OK) return error.BindFailed;
+            if (c.sqlite3_bind_int64(istmt, 5, @intCast(span.to_block)) != c.SQLITE_OK) return error.BindFailed;
+            if (c.sqlite3_step(istmt) != c.SQLITE_DONE) return error.ExecFailed;
+        }
+    }
+
+    fn insertChainLogTx(self: *Client, chain: []const u8, address: []const u8, lg: log_cache.ChainLogIn) !void {
+        if (self.backend_type == .postgresql) {
+            var block_buf: [21]u8 = undefined;
+            var index_buf: [21]u8 = undefined;
+            const block_str = try std.fmt.bufPrint(&block_buf, "{d}", .{lg.block_number});
+            const index_str = try std.fmt.bufPrint(&index_buf, "{d}", .{lg.log_index});
+            var result = try self.pgconn.?.execParams(
+                "INSERT INTO sync.chain_logs(chain, address, block_number, tx_hash, log_index, topics, data) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(chain, tx_hash, log_index) DO NOTHING;",
+                &.{ chain, address, block_str, lg.tx_hash, index_str, lg.topics, lg.data },
+            );
+            result.deinit();
+            return;
+        }
+        const sql = "INSERT INTO sync.chain_logs(chain, address, block_number, tx_hash, log_index, topics, data) VALUES(?,?,?,?,?,?,?) ON CONFLICT(chain, tx_hash, log_index) DO NOTHING;";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        try bindText(stmt, 1, chain);
+        try bindText(stmt, 2, address);
+        if (c.sqlite3_bind_int64(stmt, 3, @intCast(lg.block_number)) != c.SQLITE_OK) return error.BindFailed;
+        try bindText(stmt, 4, lg.tx_hash);
+        if (c.sqlite3_bind_int64(stmt, 5, @intCast(lg.log_index)) != c.SQLITE_OK) return error.BindFailed;
+        try bindText(stmt, 6, lg.topics);
+        try bindText(stmt, 7, lg.data);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.ExecFailed;
+    }
+
+    fn hasLogCoveragePG(self: *Client, chain: []const u8, address: []const u8, topics_key: []const u8, from_block: u64, to_block: u64) !bool {
+        var to_buf: [21]u8 = undefined;
+        var from_buf: [21]u8 = undefined;
+        const to_str = try std.fmt.bufPrint(&to_buf, "{d}", .{to_block});
+        const from_str = try std.fmt.bufPrint(&from_buf, "{d}", .{from_block});
+        var result = try self.pgconn.?.execParams(
+            "SELECT 1 FROM sync.chain_log_ranges WHERE chain = $1 AND address = $2 AND topics_key = $3 AND from_block <= $4 AND to_block >= $5 LIMIT 1;",
+            &.{ chain, address, topics_key, to_str, from_str },
+        );
+        defer result.deinit();
+        return result.rows() > 0;
+    }
+
+    fn loadChainLogsPG(self: *Client, chain: []const u8, address: []const u8, from_block: u64, to_block: u64) ![]log_cache.ChainLogRow {
+        var from_buf: [21]u8 = undefined;
+        var to_buf: [21]u8 = undefined;
+        const from_str = try std.fmt.bufPrint(&from_buf, "{d}", .{from_block});
+        const to_str = try std.fmt.bufPrint(&to_buf, "{d}", .{to_block});
+        var result = try self.pgconn.?.execParams(
+            "SELECT address, block_number, tx_hash, log_index, topics, data FROM sync.chain_logs WHERE chain = $1 AND address = $2 AND block_number >= $3 AND block_number <= $4 ORDER BY block_number, log_index;",
+            &.{ chain, address, from_str, to_str },
+        );
+        defer result.deinit();
+        var rows: std.ArrayList(log_cache.ChainLogRow) = .empty;
+        errdefer {
+            for (rows.items) |*row| freeChainLogRow(self.alloc, row);
+            rows.deinit(self.alloc);
+        }
+        var i: c_int = 0;
+        while (i < result.rows()) : (i += 1) {
+            try rows.append(self.alloc, .{
+                .address = try self.alloc.dupe(u8, result.get(i, 0)),
+                .block_number = std.fmt.parseInt(u64, result.get(i, 1), 10) catch return error.InvalidData,
+                .tx_hash = try self.alloc.dupe(u8, result.get(i, 2)),
+                .log_index = std.fmt.parseInt(u64, result.get(i, 3), 10) catch return error.InvalidData,
+                .topics = try self.alloc.dupe(u8, result.get(i, 4)),
+                .data = try self.alloc.dupe(u8, result.get(i, 5)),
+            });
+        }
+        return rows.toOwnedSlice(self.alloc);
+    }
+
+    fn listLogRangesPG(self: *Client, chain: []const u8, address: []const u8, topics_key: []const u8, from_block: u64, to_block: u64) ![]log_cache.BlockSpan {
+        var to_buf: [21]u8 = undefined;
+        var from_buf: [21]u8 = undefined;
+        const to_str = try std.fmt.bufPrint(&to_buf, "{d}", .{to_block});
+        const from_str = try std.fmt.bufPrint(&from_buf, "{d}", .{from_block});
+        var result = try self.pgconn.?.execParams(
+            "SELECT from_block, to_block FROM sync.chain_log_ranges WHERE chain = $1 AND address = $2 AND topics_key = $3 AND from_block <= $4 AND to_block >= $5 ORDER BY from_block;",
+            &.{ chain, address, topics_key, to_str, from_str },
+        );
+        defer result.deinit();
+        return try spansFromPg(self.alloc, &result);
+    }
+
+    fn listAllLogRangesPG(self: *Client, chain: []const u8, address: []const u8, topics_key: []const u8) ![]log_cache.BlockSpan {
+        var result = try self.pgconn.?.execParams(
+            "SELECT from_block, to_block FROM sync.chain_log_ranges WHERE chain = $1 AND address = $2 AND topics_key = $3 ORDER BY from_block;",
+            &.{ chain, address, topics_key },
+        );
+        defer result.deinit();
+        return try spansFromPg(self.alloc, &result);
+    }
+
+    fn trimLogCachePG(self: *Client, chain: []const u8, from_block: u64) !void {
+        var block_buf: [21]u8 = undefined;
+        const block_str = try std.fmt.bufPrint(&block_buf, "{d}", .{from_block});
+        var logs = try self.pgconn.?.execParams("DELETE FROM sync.chain_logs WHERE chain = $1 AND block_number >= $2;", &.{ chain, block_str });
+        logs.deinit();
+        var ranges = try self.pgconn.?.execParams("DELETE FROM sync.chain_log_ranges WHERE chain = $1 AND from_block >= $2;", &.{ chain, block_str });
+        ranges.deinit();
+        if (from_block == 0) return;
+        var prev_buf: [21]u8 = undefined;
+        const prev_str = try std.fmt.bufPrint(&prev_buf, "{d}", .{from_block - 1});
+        var upd = try self.pgconn.?.execParams(
+            "UPDATE sync.chain_log_ranges SET to_block = $1 WHERE chain = $2 AND from_block < $3 AND to_block >= $3;",
+            &.{ prev_str, chain, block_str },
+        );
+        upd.deinit();
+    }
+
+    fn deleteProjectionsFromBlockPG(self: *Client, from_block: u64, to_block: u64) !void {
+        var result = try self.pgconn.?.execParams("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE' AND table_name LIKE 'proj\\_%' ESCAPE '\\';", &.{});
+        defer result.deinit();
+        const open_end = to_block > std.math.maxInt(i64);
+        var from_buf: [21]u8 = undefined;
+        var to_buf: [21]u8 = undefined;
+        const from_str = try std.fmt.bufPrint(&from_buf, "{d}", .{from_block});
+        const to_str = if (open_end) "" else try std.fmt.bufPrint(&to_buf, "{d}", .{to_block});
+        var i: c_int = 0;
+        while (i < result.rows()) : (i += 1) {
+            const tbl = result.get(i, 0);
+            if (std.mem.indexOfScalar(u8, tbl, '"') != null) continue;
+            var del_buf: [512]u8 = undefined;
+            const del_sql = if (open_end)
+                std.fmt.bufPrint(&del_buf, "DELETE FROM \"{s}\" WHERE block_number >= $1;", .{tbl}) catch continue
+            else
+                std.fmt.bufPrint(&del_buf, "DELETE FROM \"{s}\" WHERE block_number >= $1 AND block_number <= $2;", .{tbl}) catch continue;
+            var del = self.pgconn.?.execParams(del_sql, if (open_end) &.{from_str} else &.{ from_str, to_str }) catch continue;
+            del.deinit();
+        }
+    }
+
+    /// 老库的覆盖区间没有 topics_key。丢掉区间、保留 chain_logs，下一次同步按新事件集合补拉。
+    fn ensureRawLogColumns(self: *Client) !void {
+        if (self.backend_type == .postgresql) {
+            try self.pgconn.?.exec("ALTER TABLE raw_logs ADD COLUMN IF NOT EXISTS log_address TEXT NOT NULL DEFAULT '';");
+            try self.pgconn.?.exec("ALTER TABLE raw_logs ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0;");
+            try self.pgconn.?.exec("ALTER TABLE raw_logs ADD COLUMN IF NOT EXISTS retry_after BIGINT NOT NULL DEFAULT 0;");
+            return;
+        }
+        if (self.backend_type != .sqlite) return;
+        if (!self.sqliteColumnExists("raw_logs", "log_address")) {
+            try self.exec("ALTER TABLE raw_logs ADD COLUMN log_address TEXT NOT NULL DEFAULT '';");
+        }
+        if (!self.sqliteColumnExists("raw_logs", "attempts")) {
+            try self.exec("ALTER TABLE raw_logs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0;");
+        }
+        if (!self.sqliteColumnExists("raw_logs", "retry_after")) {
+            try self.exec("ALTER TABLE raw_logs ADD COLUMN retry_after INTEGER NOT NULL DEFAULT 0;");
+        }
+    }
+
+    fn sqliteColumnExists(self: *Client, table: []const u8, column: []const u8) bool {
+        var buf: [128]u8 = undefined;
+        const sql = std.fmt.bufPrint(&buf, "SELECT {s} FROM {s} LIMIT 0;", .{ column, table }) catch return false;
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK) return false;
+        _ = c.sqlite3_finalize(stmt);
+        return true;
+    }
+
+    fn ensureLogCacheTopicsKey(self: *Client) !void {
+        if (self.backend_type == .postgresql) return self.ensureLogCacheTopicsKeyPG();
+        const probe = "SELECT topics_key FROM sync.chain_log_ranges LIMIT 0;";
+        var stmt: ?*c.sqlite3_stmt = null;
+        if (c.sqlite3_prepare_v2(self.db, probe.ptr, @intCast(probe.len), &stmt, null) == c.SQLITE_OK) {
+            _ = c.sqlite3_finalize(stmt);
+            return;
+        }
+        log.warn("chain_log_ranges 缺少 topics_key，丢弃覆盖区间，原始日志保留", .{});
+        try self.exec("DROP TABLE IF EXISTS sync.chain_log_ranges;");
+        try self.exec(log_cache.sqlite_ddl);
+    }
+
+    fn ensureLogCacheTopicsKeyPG(self: *Client) !void {
+        var result = try self.pgconn.?.execParams("SELECT 1 FROM information_schema.columns WHERE table_schema = 'sync' AND table_name = 'chain_log_ranges' AND column_name = 'topics_key';", &.{});
+        defer result.deinit();
+        if (result.rows() > 0) return;
+        log.warn("chain_log_ranges 缺少 topics_key，丢弃覆盖区间，原始日志保留", .{});
+        try self.pgconn.?.exec("DROP TABLE IF EXISTS sync.chain_log_ranges;");
+        try self.pgconn.?.exec(log_cache.pg_ddl);
+    }
+
+fn sqlInt(v: SqlValue) i64 {
+    return switch (v) {
+        .integer => |n| n,
+        .text => |t| std.fmt.parseInt(i64, t, 10) catch 0,
+        else => 0,
+    };
+}
+
+fn dupeSqlText(alloc: std.mem.Allocator, v: SqlValue) ![]u8 {
+    const s = switch (v) {
+        .text => |t| t,
+        .blob => |b| b,
+        else => "",
+    };
+    return alloc.dupe(u8, s);
+}
+
+fn freeRawLogRow(alloc: std.mem.Allocator, row: Client.RawLogRow) void {
+    alloc.free(row.tx_hash);
+    alloc.free(row.topics);
+    alloc.free(row.data);
+    alloc.free(row.log_address);
+}
+
+fn bindText(stmt: ?*c.sqlite3_stmt, idx: c_int, value: []const u8) !void {
+    if (c.sqlite3_bind_text(stmt, idx, value.ptr, @intCast(value.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.BindFailed;
+}
+
+fn dupeSqliteText(alloc: std.mem.Allocator, stmt: ?*c.sqlite3_stmt, idx: c_int) ![]u8 {
+    const text = c.sqlite3_column_text(stmt, idx);
+    if (text == null) return alloc.dupe(u8, "");
+    return alloc.dupe(u8, std.mem.sliceTo(text, 0));
+}
+
+fn freeChainLogRow(alloc: std.mem.Allocator, row: *log_cache.ChainLogRow) void {
+    alloc.free(row.address);
+    alloc.free(row.tx_hash);
+    alloc.free(row.topics);
+    alloc.free(row.data);
+}
+
+fn execBind2(db: ?*c.sqlite3, sql: []const u8, chain: []const u8, block: u64) !void {
+    var stmt: ?*c.sqlite3_stmt = null;
+    if (c.sqlite3_prepare_v2(db, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+    defer _ = c.sqlite3_finalize(stmt);
+    try bindText(stmt, 1, chain);
+    if (c.sqlite3_bind_int64(stmt, 2, @intCast(block)) != c.SQLITE_OK) return error.BindFailed;
+    if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.ExecFailed;
+}
+
+fn spansFromPg(alloc: std.mem.Allocator, result: *pg.PgResult) ![]log_cache.BlockSpan {
+    var spans: std.ArrayList(log_cache.BlockSpan) = .empty;
+    errdefer spans.deinit(alloc);
+    var i: c_int = 0;
+    while (i < result.rows()) : (i += 1) {
+        try spans.append(alloc, .{
+            .from_block = std.fmt.parseInt(u64, result.get(i, 0), 10) catch return error.InvalidData,
+            .to_block = std.fmt.parseInt(u64, result.get(i, 1), 10) catch return error.InvalidData,
+        });
+    }
+    return spans.toOwnedSlice(alloc);
+}
+
+    // ========================================================================
     // rollback
     // ========================================================================
-    pub fn rollbackFromBlock(self: *Client, contract_address: []const u8, contract_name: []const u8, event_names: []const []const u8, from_block: u64) !void {
-        if (self.backend_type == .rocksdb) return self.rollbackFromBlockRocks(contract_address, contract_name, event_names, from_block);
-        if (self.backend_type == .postgresql) return self.rollbackFromBlockPG(contract_address, contract_name, event_names, from_block);
+    pub fn rollbackFromBlock(self: *Client, contract_address: []const u8, contract_name: []const u8, event_names: []const []const u8, from_block: u64, chain: []const u8) !void {
+        self.guardEnter();
+        defer self.guardLeave();
+        if (self.backend_type == .rocksdb) return self.rollbackFromBlockRocks(contract_address, contract_name, event_names, from_block, chain);
+        if (self.backend_type == .postgresql) return self.rollbackFromBlockPG(contract_address, contract_name, event_names, from_block, chain);
 
         try self.exec("BEGIN;");
         errdefer { _ = c.sqlite3_exec(self.db, "ROLLBACK;", null, null, null); }
@@ -1537,7 +2452,7 @@ pub const Client = struct {
             if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.ExecFailed;
         }
         {
-            const sql = "UPDATE sync_state SET last_synced_block = ? - 1, status = 'reorg_rollback' WHERE contract_address = ?;";
+            const sql = "UPDATE sync_state SET last_synced_block = ?, status = 'reorg_rollback' WHERE contract_address = ?;";
             var stmt: ?*c.sqlite3_stmt = null;
             const rc = c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null);
             if (rc != c.SQLITE_OK) return error.PrepareFailed;
@@ -1578,10 +2493,21 @@ pub const Client = struct {
                 log.info("重组回滚：级联清理 {d} 张投影表 (block >= {d})", .{ proj_names.items.len, from_block });
             }
         }
+        if (self.config.log_cache and chain.len > 0) try self.trimLogCacheUnlocked(chain, from_block);
+        {
+            const sql = "DELETE FROM blocks WHERE chain = ? AND block_number >= ?;";
+            var stmt: ?*c.sqlite3_stmt = null;
+            if (c.sqlite3_prepare_v2(self.db, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK) return error.PrepareFailed;
+            defer _ = c.sqlite3_finalize(stmt);
+            if (c.sqlite3_bind_text(stmt, 1, chain.ptr, @intCast(chain.len), c.SQLITE_STATIC) != c.SQLITE_OK) return error.BindFailed;
+            if (c.sqlite3_bind_int64(stmt, 2, @intCast(from_block)) != c.SQLITE_OK) return error.BindFailed;
+            if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.ExecFailed;
+        }
+        try self.deleteRawLogsFrom(contract_address, from_block, std.math.maxInt(u64));
         try self.exec("COMMIT;");
     }
 
-    fn rollbackFromBlockRocks(self: *Client, contract_address: []const u8, contract_name: []const u8, event_names: []const []const u8, from_block: u64) !void {
+    fn rollbackFromBlockRocks(self: *Client, contract_address: []const u8, contract_name: []const u8, event_names: []const []const u8, from_block: u64, chain: []const u8) !void {
         var batch = rocksdb.WriteBatch.init();
         defer batch.deinit();
         for (event_names) |evt_name| {
@@ -1631,12 +2557,27 @@ pub const Client = struct {
             }
             iter.deinit();
         }
+        {
+            var prefix_buf: [192]u8 = undefined;
+            const prefix = try std.fmt.bufPrint(&prefix_buf, "b:{s}:", .{chain});
+            var seek_buf: [192]u8 = undefined;
+            const seek_key = try std.fmt.bufPrint(&seek_buf, "b:{s}:{d:0>20}", .{ chain, from_block });
+            var iter = self.rocks.?.iterator();
+            iter.seek(seek_key);
+            while (iter.valid()) {
+                const k = iter.key();
+                if (!std.mem.startsWith(u8, k, prefix)) break;
+                batch.delete(k);
+                iter.next();
+            }
+            iter.deinit();
+        }
         try self.rocks.?.writeBatch(&batch);
         // update sync state
         var key_buf: [128]u8 = undefined;
         const sync_key = try std.fmt.bufPrint(&key_buf, "s:{s}", .{contract_address});
         var val_buf: [128]u8 = undefined;
-        const sync_val = try std.fmt.bufPrint(&val_buf, "{{\"last_synced_block\":{d},\"status\":\"reorg_rollback\"}}", .{from_block - 1});
+        const sync_val = try std.fmt.bufPrint(&val_buf, "{{\"last_synced_block\":{d},\"status\":\"reorg_rollback\"}}", .{from_block});
         try self.rocks.?.put(sync_key, sync_val);
     }
 
@@ -1644,6 +2585,8 @@ pub const Client = struct {
     // countEventRows
     // ========================================================================
     pub fn countEventRows(self: *Client, contract_name: []const u8, event_name: []const u8) !u64 {
+        self.guardEnter();
+        defer self.guardLeave();
         if (self.backend_type == .rocksdb) return self.countEventRowsRocks(contract_name, event_name);
         if (self.backend_type == .postgresql) return self.countEventRowsPG(contract_name, event_name);
 
@@ -1718,6 +2661,9 @@ pub const Client = struct {
             \\  topics TEXT NOT NULL,
             \\  data TEXT NOT NULL,
             \\  reason TEXT NOT NULL DEFAULT 'abi_mismatch',
+            \\  log_address TEXT NOT NULL DEFAULT '',
+            \\  attempts INTEGER NOT NULL DEFAULT 0,
+            \\  retry_after BIGINT NOT NULL DEFAULT 0,
             \\  created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
             \\);
             \\CREATE INDEX IF NOT EXISTS idx_raw_logs ON raw_logs(contract_address, block_number);
@@ -1766,6 +2712,12 @@ pub const Client = struct {
             \\);
         ;
         try self.pgconn.?.exec(sql);
+        try self.ensureRawLogColumns();
+        if (self.config.log_cache) {
+            try self.pgconn.?.exec(log_cache.pg_schema_ddl);
+            try self.pgconn.?.exec(log_cache.pg_ddl);
+            try self.ensureLogCacheTopicsKey();
+        }
     }
 
     fn autoMigrateContractPG(
@@ -1963,13 +2915,20 @@ pub const Client = struct {
         topics: []const u8,
         data: []const u8,
         reason: []const u8,
+        log_address: []const u8,
     ) !void {
-        const sql = "INSERT INTO raw_logs (contract_address, block_number, tx_hash, log_index, topics, data, reason) VALUES ($1,$2,$3,$4,$5,$6,$7);";
+        const sql =
+            \\INSERT INTO raw_logs (contract_address, block_number, tx_hash, log_index, topics, data, reason, log_address)
+            \\SELECT $1,$2,$3,$4,$5,$6,$7,$8
+            \\WHERE NOT EXISTS (
+            \\  SELECT 1 FROM raw_logs WHERE contract_address = $9 AND tx_hash = $10 AND log_index = $11
+            \\);
+        ;
         var block_buf: [21]u8 = undefined;
         const block_str = try std.fmt.bufPrint(&block_buf, "{}", .{block_number});
         var li_buf: [21]u8 = undefined;
         const li_str = try std.fmt.bufPrint(&li_buf, "{}", .{log_index});
-        const params = &.{ contract_address, block_str, tx_hash, li_str, topics, data, reason };
+        const params = &.{ contract_address, block_str, tx_hash, li_str, topics, data, reason, log_address, contract_address, tx_hash, li_str };
         var result = try self.pgconn.?.execParams(sql, params);
         defer result.deinit();
     }
@@ -2124,14 +3083,19 @@ pub const Client = struct {
         from_block: u64,
         to_block: u64,
     ) !void {
+        const open_end = to_block > std.math.maxInt(i64);
         var sql_buf: [256]u8 = undefined;
-        const sql = try std.fmt.bufPrint(&sql_buf, "DELETE FROM event_{s}_{s} WHERE block_number >= $1 AND block_number <= $2;", .{ contract_name, event_name });
+        const sql = if (open_end)
+            try std.fmt.bufPrint(&sql_buf, "DELETE FROM event_{s}_{s} WHERE block_number >= $1;", .{contract_name, event_name})
+        else
+            try std.fmt.bufPrint(&sql_buf, "DELETE FROM event_{s}_{s} WHERE block_number >= $1 AND block_number <= $2;", .{ contract_name, event_name });
         var bf_buf: [21]u8 = undefined;
         var bt_buf: [21]u8 = undefined;
-        var result = try self.pgconn.?.execParams(sql, &.{
-            try std.fmt.bufPrint(&bf_buf, "{}", .{from_block}),
-            try std.fmt.bufPrint(&bt_buf, "{}", .{to_block}),
-        });
+        const from_str = try std.fmt.bufPrint(&bf_buf, "{}", .{from_block});
+        var result = if (open_end)
+            try self.pgconn.?.execParams(sql, &.{from_str})
+        else
+            try self.pgconn.?.execParams(sql, &.{ from_str, try std.fmt.bufPrint(&bt_buf, "{}", .{to_block}) });
         defer result.deinit();
         if (self.cache) |cc| cc.invalidate(contract_name, event_name);
     }
@@ -2180,7 +3144,10 @@ pub const Client = struct {
         return try self.alloc.dupe(u8, result.get(0, 0));
     }
 
-    fn rollbackFromBlockPG(self: *Client, contract_address: []const u8, contract_name: []const u8, event_names: []const []const u8, from_block: u64) !void {
+    fn rollbackFromBlockPG(self: *Client, contract_address: []const u8, contract_name: []const u8, event_names: []const []const u8, from_block: u64, chain: []const u8) !void {
+        try self.pgconn.?.exec("BEGIN;");
+        errdefer self.pgconn.?.exec("ROLLBACK;") catch {};
+
         var block_buf: [21]u8 = undefined;
         const block_str = try std.fmt.bufPrint(&block_buf, "{}", .{from_block});
 
@@ -2219,12 +3186,19 @@ pub const Client = struct {
         }
         {
             var rollback_buf: [21]u8 = undefined;
-            const rollback_block = if (from_block > 0) from_block - 1 else 0;
-            const rollback_str = try std.fmt.bufPrint(&rollback_buf, "{}", .{rollback_block});
+            const rollback_str = try std.fmt.bufPrint(&rollback_buf, "{}", .{from_block});
             const sql = "UPDATE sync_state SET last_synced_block = $1, status = 'reorg_rollback' WHERE contract_address = $2;";
             var result = try self.pgconn.?.execParams(sql, &.{ rollback_str, contract_address });
             defer result.deinit();
         }
+        if (self.config.log_cache and chain.len > 0) try self.trimLogCacheUnlocked(chain, from_block);
+        {
+            const sql = "DELETE FROM blocks WHERE chain = $1 AND block_number >= $2;";
+            var result = try self.pgconn.?.execParams(sql, &.{ chain, block_str });
+            defer result.deinit();
+        }
+        try self.deleteRawLogsFrom(contract_address, from_block, std.math.maxInt(u64));
+        try self.pgconn.?.exec("COMMIT;");
     }
 
     fn countEventRowsPG(self: *Client, contract_name: []const u8, event_name: []const u8) !u64 {
@@ -2245,6 +3219,8 @@ pub const Client = struct {
         param_names: []const []const u8,
         param_values: []const []const u8,
     ) ![]u8 {
+        self.guardEnter();
+        defer self.guardLeave();
         switch (self.backend_type) {
             .sqlite => return self.execQuerySqlite(sql, param_names, param_values),
             .postgresql => return self.execQueryPG(sql, param_names, param_values),
@@ -2352,6 +3328,8 @@ pub const Client = struct {
     /// 执行写语句（CREATE/INSERT/UPDATE/DELETE），返回 affected rows。
     /// 注意：text/blob 参数按 SQLITE_STATIC 绑定，调用期间须保持有效。
     pub fn ponderExec(self: *Client, sql: []const u8, params: []const SqlValue) !usize {
+        self.guardEnter();
+        defer self.guardLeave();
         switch (self.backend_type) {
             .sqlite => return self.ponderExecSqlite(sql, params),
             .postgresql => return self.ponderExecPG(sql, params),
@@ -2361,6 +3339,8 @@ pub const Client = struct {
 
     /// 执行查询，返回行数组（调用方负责 freeQueryRows）。非 SELECT 返回空数组。
     pub fn ponderQuery(self: *Client, sql: []const u8, params: []const SqlValue) ![]QueryRow {
+        self.guardEnter();
+        defer self.guardLeave();
         switch (self.backend_type) {
             .sqlite => return self.ponderQuerySqlite(sql, params),
             .postgresql => return self.ponderQueryPG(sql, params),
@@ -2848,6 +3828,122 @@ test "db template_addresses PostgreSQL 后端" {
     cleanup.deinit();
 }
 
+test "PostgreSQL 日志缓存、重放事务与区块时间戳" {
+    if (!build_options.postgres) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const admin_cfg = DatabaseConfig{ .db_type = "postgresql", .db_name = "host=localhost port=5432 dbname=postgres", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var admin = Client.init(alloc, &admin_cfg) catch return error.SkipZigTest;
+    _ = admin.ponderExec("DROP DATABASE IF EXISTS zponder_cache_pg_test;", &.{}) catch {};
+    _ = admin.ponderExec("CREATE DATABASE zponder_cache_pg_test;", &.{}) catch {
+        admin.deinit();
+        return error.SkipZigTest;
+    };
+    admin.deinit();
+
+    const cfg = DatabaseConfig{
+        .db_type = "postgresql",
+        .db_name = "host=localhost port=5432 dbname=zponder_cache_pg_test",
+        .wal_mode = true,
+        .busy_timeout_ms = 5000,
+        .max_connections = 10,
+        .log_cache = true,
+    };
+    var client = try Client.init(alloc, &cfg);
+    defer {
+        if (Client.init(alloc, &admin_cfg)) |opened| {
+            var cleanup = opened;
+            _ = cleanup.ponderExec("DROP DATABASE IF EXISTS zponder_cache_pg_test;", &.{}) catch {};
+            cleanup.deinit();
+        } else |_| {}
+    }
+    defer client.deinit();
+    try client.migrate();
+
+    const addr = "0x00000000000000000000000000000000000000ab";
+    try client.storeLogCacheBatch("ethereum", &.{addr}, "*", 1, 10, &.{});
+    try std.testing.expect(try client.hasLogCoverage("ethereum", addr, "*", 1, 10));
+    try std.testing.expect(!try client.hasLogCoverage("ethereum", addr, "0xaa", 1, 10));
+    try client.storeLogCacheBatch("ethereum", &.{addr}, "0xbb", 1, 2, &.{});
+    try std.testing.expect(try client.hasLogCoverage("ethereum", addr, "*", 1, 10));
+    try std.testing.expect(!try client.hasLogCoverage("ethereum", addr, "0xbb", 3, 4));
+
+    const test_evt = abi.AbiEvent{ .name = "Transfer", .inputs = &.{ .{ .name = "from", .type = "address", .indexed = true }, .{ .name = "to", .type = "address", .indexed = true }, .{ .name = "value", .type = "uint256", .indexed = false } }, .signature = std.mem.zeroes([32]u8) };
+    var events = try alloc.alloc(abi.AbiEvent, 1);
+    events[0] = test_evt;
+    defer alloc.free(events);
+    const test_contract = abi.AbiContract{ .events = events, .functions = &.{} };
+    try client.autoMigrateContract("test", &test_contract, &.{"Transfer"}, "0xtest");
+    try client.pgconn.?.exec("CREATE TABLE proj_bal (id TEXT, block_number BIGINT);");
+    try client.pgconn.?.exec("INSERT INTO proj_bal (id, block_number) VALUES ('keep', 100), ('drop', 200);");
+    const f = &.{ DecodedField{ .name = "from", .value = "0x1111" }, DecodedField{ .name = "to", .value = "0x2222" }, DecodedField{ .name = "value", .value = "0x64" } };
+    _ = try client.insertEventLog("test", "Transfer", f, 100, "0xtx1", 0, "0xtest");
+    _ = try client.insertEventLog("test", "Transfer", f, 200, "0xtx2", 1, "0xtest");
+    _ = try client.insertEventLog("test", "Transfer", f, 300, "0xtx3", 2, "0xtest");
+    try client.upsertSyncState(.{ .contract_address = "0xtest", .last_synced_block = 300, .status = "running" });
+
+    try std.testing.expectError(error.ExecFailed, client.resetForReplay("0xtest", "test", &.{ "Transfer", "Missing" }, 150, std.math.maxInt(u64)));
+    const still = try client.getSyncState("0xtest");
+    try std.testing.expectEqual(@as(u64, 300), still.?.last_synced_block);
+    alloc.free(still.?.contract_address);
+    alloc.free(still.?.status);
+
+    try client.resetForReplay("0xtest", "test", &.{"Transfer"}, 150, 250);
+    const state = try client.getSyncState("0xtest");
+    try std.testing.expectEqual(@as(u64, 150), state.?.last_synced_block);
+    try std.testing.expectEqualStrings("replaying", state.?.status);
+    alloc.free(state.?.contract_address);
+    alloc.free(state.?.status);
+    const rows = try client.queryEventLogs("test", "Transfer", null, null, null, null, 10, 0, true);
+    defer alloc.free(rows);
+    try std.testing.expect(std.mem.indexOf(u8, rows, "0xtx1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rows, "0xtx2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rows, "0xtx3") != null);
+    try client.deleteEventLogsInRange("test", "Transfer", 150, std.math.maxInt(u64));
+    const after_open = try client.queryEventLogs("test", "Transfer", null, null, null, null, 10, 0, true);
+    defer alloc.free(after_open);
+    try std.testing.expect(std.mem.indexOf(u8, after_open, "0xtx1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, after_open, "0xtx3") == null);
+    const proj = try client.execQuery("SELECT id FROM proj_bal ORDER BY id;", &.{}, &.{});
+    defer alloc.free(proj);
+    try std.testing.expect(std.mem.indexOf(u8, proj, "keep") != null);
+    try std.testing.expect(std.mem.indexOf(u8, proj, "drop") == null);
+
+    try client.upsertBlock(.{
+        .chain = "ethereum",
+        .block_number = 4,
+        .block_hash = "0x4",
+        .timestamp = 100,
+        .miner = "0x",
+        .gas_used = 1,
+        .gas_limit = 2,
+        .base_fee_per_gas = "0",
+        .transaction_count = 1,
+    });
+    try client.upsertBlock(.{
+        .chain = "ethereum",
+        .block_number = 9,
+        .block_hash = "0x9",
+        .timestamp = 200,
+        .miner = "0x",
+        .gas_used = 1,
+        .gas_limit = 2,
+        .base_fee_per_gas = "0",
+        .transaction_count = 1,
+    });
+    try client.rollbackFromBlock("0xtest", "test", &.{}, 9, "ethereum");
+    try std.testing.expectEqual(@as(u64, 100), (try client.getBlockTimestamp("ethereum", 4)).?);
+    try std.testing.expect((try client.getBlockTimestamp("ethereum", 9)) == null);
+    try std.testing.expect(try client.hasLogCoverage("ethereum", addr, "*", 1, 8));
+    try std.testing.expect(!try client.hasLogCoverage("ethereum", addr, "*", 9, 10));
+    try std.testing.expect(try client.hasLogCoverage("ethereum", addr, "0xbb", 1, 2));
+
+    try client.pgconn.?.exec("DROP TABLE sync.chain_log_ranges;");
+    try client.pgconn.?.exec("CREATE TABLE sync.chain_log_ranges (chain TEXT NOT NULL, address TEXT NOT NULL, from_block BIGINT NOT NULL, to_block BIGINT NOT NULL, PRIMARY KEY (chain, address, from_block));");
+    try client.pgconn.?.exec("INSERT INTO sync.chain_log_ranges(chain, address, from_block, to_block) VALUES ('ethereum', '0xold', 1, 9);");
+    try client.migrate();
+    try std.testing.expect(!try client.hasLogCoverage("ethereum", "0xold", "*", 1, 9));
+}
+
 test "db snapshot and block_hash" {
     const alloc = std.testing.allocator;
     const cfg = DatabaseConfig{ .db_type = "sqlite", .db_name = ":memory:", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
@@ -2873,16 +3969,84 @@ test "db raw_logs insert" {
     var client = try Client.init(alloc, &cfg);
     defer client.deinit();
     try client.migrate();
-    try client.insertRawLog("0xabc", 100, "0xtx", 0, "[\"0xtopic\"]", "0xdata", "abi_mismatch");
-    const sql = "SELECT COUNT(*) FROM raw_logs WHERE tx_hash = '0xtx';";
-    var stmt: ?*c.sqlite3_stmt = null;
-    const rc = c.sqlite3_prepare_v2(client.db, sql, @intCast(sql.len), &stmt, null);
-    try std.testing.expect(rc == c.SQLITE_OK);
-    defer _ = c.sqlite3_finalize(stmt);
-    const step_rc = c.sqlite3_step(stmt);
-    try std.testing.expect(step_rc == c.SQLITE_ROW);
-    const count = c.sqlite3_column_int64(stmt, 0);
-    try std.testing.expectEqual(@as(i64, 1), count);
+    try client.insertRawLog("0xabc", 100, "0xtx", 0, "[\"0xtopic\"]", "0xdata", "abi_mismatch", "0xaddr");
+    try client.insertRawLog("0xabc", 100, "0xtx", 0, "[\"0xtopic\"]", "0xdata", "abi_mismatch", "0xaddr");
+    const counted = try client.ponderQuery("SELECT COUNT(*) AS n FROM raw_logs WHERE tx_hash = ?;", &.{.{ .text = "0xtx" }});
+    defer client.freeQueryRows(counted);
+    try std.testing.expectEqual(@as(i64, 1), counted[0].values[0].integer);
+    const listed = try client.listRawLogs("0xabc", 10, 0);
+    defer client.freeRawLogs(listed);
+    try std.testing.expectEqual(@as(usize, 1), listed.len);
+    try std.testing.expectEqualStrings("0xaddr", listed[0].log_address);
+    try std.testing.expectEqual(@as(i64, 0), listed[0].attempts);
+    try std.testing.expectEqual(@as(i64, 1), try client.countRawLogs());
+    try client.bumpRawLogAttempt(listed[0].id, 5_000);
+    const waiting = try client.listRawLogs("0xabc", 10, 0);
+    defer client.freeRawLogs(waiting);
+    try std.testing.expectEqual(@as(usize, 0), waiting.len);
+    const bumped = try client.listRawLogs("0xabc", 10, 5_000);
+    defer client.freeRawLogs(bumped);
+    try std.testing.expectEqual(@as(i64, 1), bumped[0].attempts);
+    try client.deleteRawLog(bumped[0].id);
+    const gone = try client.listRawLogs("0xabc", 10, 0);
+    defer client.freeRawLogs(gone);
+    try std.testing.expectEqual(@as(usize, 0), gone.len);
+
+    // 旧库没有重试列：migrate 补上之后仍能写入。
+    try client.exec("DROP TABLE raw_logs;");
+    try client.exec("CREATE TABLE raw_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, contract_address TEXT NOT NULL, block_number INTEGER NOT NULL, tx_hash TEXT NOT NULL, log_index INTEGER NOT NULL, topics TEXT NOT NULL, data TEXT NOT NULL, reason TEXT NOT NULL DEFAULT 'abi_mismatch', created_at DATETIME DEFAULT CURRENT_TIMESTAMP);");
+    try client.migrate();
+    try client.insertRawLog("0xabc", 1, "0xold", 0, "[]", "0x", "abi_mismatch", "0xlog");
+    const upgraded = try client.listRawLogs("0xabc", 10, 0);
+    defer client.freeRawLogs(upgraded);
+    try std.testing.expectEqual(@as(usize, 1), upgraded.len);
+    try std.testing.expectEqualStrings("0xlog", upgraded[0].log_address);
+}
+
+test "写事务持有连接锁，其它线程的写入会等到提交" {
+    const alloc = std.testing.allocator;
+    const cfg = DatabaseConfig{ .db_type = "sqlite", .db_name = ":memory:", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var client = try Client.init(alloc, &cfg);
+    defer client.deinit();
+    try client.migrate();
+
+    try client.beginWrite();
+    var open = true;
+    try client.insertRawLog("0xabc", 1, "0xheld", 0, "[]", "0x", "abi_mismatch", "0xlog");
+
+    const Gate = struct {
+        client: *Client,
+        started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        fn run(self: *@This()) void {
+            self.started.store(true, .release);
+            self.client.insertRawLog("0xabc", 2, "0xother", 0, "[]", "0x", "abi_mismatch", "0xlog") catch {
+                self.finished.store(true, .release);
+                return;
+            };
+            self.finished.store(true, .release);
+        }
+    };
+    var gate = Gate{ .client = &client };
+    const thread = try std.Thread.spawn(.{}, Gate.run, .{&gate});
+    var joined = false;
+    defer if (!joined) {
+        if (open) client.rollbackWrite();
+        thread.join();
+    };
+    while (!gate.started.load(.acquire)) std.Thread.yield() catch {};
+    var spins: u32 = 0;
+    while (spins < 2000) : (spins += 1) std.Thread.yield() catch {};
+    try std.testing.expect(!gate.finished.load(.acquire));
+
+    try client.commitWrite();
+    open = false;
+    thread.join();
+    joined = true;
+    try std.testing.expect(gate.finished.load(.acquire));
+    const rows = try client.listRawLogs("0xabc", 10, 0);
+    defer client.freeRawLogs(rows);
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
 }
 
 test "db account_states" {
@@ -3003,7 +4167,7 @@ test "db rollbackFromBlock" {
     try client.createSnapshot(.{ .contract_address = "0xabc", .block_number = 200, .snapshot_data = "{}" });
     try client.upsertBlockHash("0xabc", 100, "0xhash100");
     try client.upsertBlockHash("0xabc", 200, "0xhash200");
-    try client.rollbackFromBlock("0xabc", "test", &.{}, 150);
+    try client.rollbackFromBlock("0xabc", "test", &.{}, 150, "");
     const snap = try client.getLatestSnapshot("0xabc");
     defer if (snap) |s| { alloc.free(s.contract_address); alloc.free(s.snapshot_data); };
     try std.testing.expect(snap != null);
@@ -3015,6 +4179,41 @@ test "db rollbackFromBlock" {
     const h200 = try client.getBlockHash("0xabc", 200);
     defer if (h200) |h| alloc.free(h);
     try std.testing.expect(h200 == null);
+}
+
+test "区块时间戳可回读，重组裁掉分叉点之后" {
+    const alloc = std.testing.allocator;
+    const cfg = DatabaseConfig{ .db_type = "sqlite", .db_name = ":memory:", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var client = try Client.init(alloc, &cfg);
+    defer client.deinit();
+    try client.migrate();
+    try client.upsertBlock(.{
+        .chain = "ethereum",
+        .block_number = 4,
+        .block_hash = "0x4",
+        .timestamp = 100,
+        .miner = "0x",
+        .gas_used = 1,
+        .gas_limit = 2,
+        .base_fee_per_gas = "0",
+        .transaction_count = 1,
+    });
+    try client.upsertBlock(.{
+        .chain = "ethereum",
+        .block_number = 9,
+        .block_hash = "0x9",
+        .timestamp = 200,
+        .miner = "0x",
+        .gas_used = 1,
+        .gas_limit = 2,
+        .base_fee_per_gas = "0",
+        .transaction_count = 1,
+    });
+    try std.testing.expectEqual(@as(u64, 100), (try client.getBlockTimestamp("ethereum", 4)).?);
+    try std.testing.expect((try client.getBlockTimestamp("ethereum", 5)) == null);
+    try client.rollbackFromBlock("0x", "t", &.{}, 9, "ethereum");
+    try std.testing.expectEqual(@as(u64, 100), (try client.getBlockTimestamp("ethereum", 4)).?);
+    try std.testing.expect((try client.getBlockTimestamp("ethereum", 9)) == null);
 }
 
 test "db sanitizeColumnName" {
@@ -3066,6 +4265,62 @@ test "db deleteEventLogsInRange" {
     try std.testing.expect(std.mem.indexOf(u8, r, "0xtx1") != null);
     try std.testing.expect(std.mem.indexOf(u8, r, "0xtx2") == null);
     try std.testing.expect(std.mem.indexOf(u8, r, "0xtx3") != null);
+}
+
+test "db resetForReplay 删除与断点同一事务" {
+    const alloc = std.testing.allocator;
+    const cfg = DatabaseConfig{ .db_type = "sqlite", .db_name = ":memory:", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var client = try Client.init(alloc, &cfg);
+    defer client.deinit();
+    try client.migrate();
+    const test_evt = abi.AbiEvent{ .name = "Transfer", .inputs = &.{ .{ .name = "from", .type = "address", .indexed = true }, .{ .name = "to", .type = "address", .indexed = true }, .{ .name = "value", .type = "uint256", .indexed = false } }, .signature = std.mem.zeroes([32]u8) };
+    var events = try alloc.alloc(abi.AbiEvent, 1);
+    events[0] = test_evt;
+    defer alloc.free(events);
+    const test_contract = abi.AbiContract{ .events = events, .functions = &.{} };
+    try client.autoMigrateContract("test", &test_contract, &.{"Transfer"}, "0xtest");
+    try client.exec("CREATE TABLE proj_bal (id TEXT, block_number INTEGER);");
+    try client.exec("INSERT INTO proj_bal (id, block_number) VALUES ('keep', 100), ('drop', 200);");
+    const f = &.{ DecodedField{ .name = "from", .value = "0x1111" }, DecodedField{ .name = "to", .value = "0x2222" }, DecodedField{ .name = "value", .value = "0x64" } };
+    _ = try client.insertEventLog("test", "Transfer", f, 100, "0xtx1", 0, "0xtest");
+    _ = try client.insertEventLog("test", "Transfer", f, 200, "0xtx2", 1, "0xtest");
+    _ = try client.insertEventLog("test", "Transfer", f, 300, "0xtx3", 2, "0xtest");
+    try client.upsertSyncState(.{ .contract_address = "0xtest", .last_synced_block = 300, .status = "running" });
+    try client.insertRawLog("0xtest", 100, "0xraw1", 0, "[]", "0x", "abi_mismatch", "0xlog");
+    try client.insertRawLog("0xtest", 200, "0xraw2", 0, "[]", "0x", "abi_mismatch", "0xlog");
+    try client.insertRawLog("0xtest", 300, "0xraw3", 0, "[]", "0x", "abi_mismatch", "0xlog");
+
+    try std.testing.expectError(error.PrepareFailed, client.resetForReplay("0xtest", "test", &.{ "Transfer", "Missing" }, 150, std.math.maxInt(u64)));
+    const still = try client.getSyncState("0xtest");
+    try std.testing.expectEqual(@as(u64, 300), still.?.last_synced_block);
+    try std.testing.expectEqualStrings("running", still.?.status);
+    alloc.free(still.?.contract_address);
+    alloc.free(still.?.status);
+    const kept_rows = try client.queryEventLogs("test", "Transfer", null, null, null, null, 10, 0, true);
+    defer alloc.free(kept_rows);
+    try std.testing.expect(std.mem.indexOf(u8, kept_rows, "0xtx2") != null);
+    const raw_kept = try client.listRawLogs("0xtest", 10, 0);
+    defer client.freeRawLogs(raw_kept);
+    try std.testing.expectEqual(@as(usize, 3), raw_kept.len);
+
+    try client.resetForReplay("0xtest", "test", &.{"Transfer"}, 150, 250);
+    const state = try client.getSyncState("0xtest");
+    try std.testing.expectEqual(@as(u64, 150), state.?.last_synced_block);
+    try std.testing.expectEqualStrings("replaying", state.?.status);
+    alloc.free(state.?.contract_address);
+    alloc.free(state.?.status);
+    const rows = try client.queryEventLogs("test", "Transfer", null, null, null, null, 10, 0, true);
+    defer alloc.free(rows);
+    try std.testing.expect(std.mem.indexOf(u8, rows, "0xtx1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rows, "0xtx2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rows, "0xtx3") != null);
+    const proj = try client.execQuery("SELECT id FROM proj_bal ORDER BY id;", &.{}, &.{});
+    defer alloc.free(proj);
+    try std.testing.expect(std.mem.indexOf(u8, proj, "keep") != null);
+    try std.testing.expect(std.mem.indexOf(u8, proj, "drop") == null);
+    const raw_left = try client.listRawLogs("0xtest", 10, 0);
+    defer client.freeRawLogs(raw_left);
+    try std.testing.expectEqual(@as(usize, 2), raw_left.len);
 }
 
 test "db rocksdb sync_state and block_hash" {
@@ -3198,7 +4453,7 @@ test "db rollbackFromBlock 级联清理 proj_ 投影表" {
         _ = try client.ponderExec("INSERT INTO other_data (block_number) VALUES (?);", &.{.{ .integer = @intCast(bn) }});
     }
 
-    try client.rollbackFromBlock("0xabc", "test", &.{}, 150);
+    try client.rollbackFromBlock("0xabc", "test", &.{}, 150, "");
 
     const proj = try client.ponderQuery("SELECT block_number FROM proj_kline ORDER BY block_number;", &.{});
     defer client.freeQueryRows(proj);
@@ -3253,7 +4508,7 @@ test "db ponderExec/ponderQuery PostgreSQL 后端" {
     try std.testing.expect(null_rows[0].values[0] == .null);
 
     // 级联回滚：proj_ 表按 block_number 清理
-    try client.rollbackFromBlock("0xabc", "test", &.{}, 150);
+    try client.rollbackFromBlock("0xabc", "test", &.{}, 150, "");
     const after = try client.ponderQuery("SELECT block_number FROM proj_pg_test ORDER BY block_number;", &.{});
     defer client.freeQueryRows(after);
     try std.testing.expectEqual(@as(usize, 1), after.len);
@@ -3980,4 +5235,67 @@ test "db 事件表重建丢用户自建索引：显式索引数下降 → 触发
     try std.testing.expectEqual(@as(usize, 1), indexesLostBeforeRebuild(before, after));
     try std.testing.expectEqual(@as(usize, 0), indexesLostBeforeRebuild(3, 3));
     try std.testing.expectEqual(@as(usize, 0), indexesLostBeforeRebuild(3, 4));
+}
+
+test "log cache 空区间记为已覆盖，重组裁掉分叉点之后" {
+    const alloc = std.testing.allocator;
+    const addr = "0x00000000000000000000000000000000000000ab";
+    const cfg = DatabaseConfig{
+        .db_type = "sqlite",
+        .db_name = ":memory:",
+        .wal_mode = true,
+        .busy_timeout_ms = 5000,
+        .max_connections = 1,
+        .log_cache = true,
+    };
+    var client = try Client.init(alloc, &cfg);
+    defer client.deinit();
+    try client.migrate();
+
+    try client.storeLogCacheBatch("ethereum", &.{addr}, "*", 1, 10, &.{});
+    try std.testing.expect(try client.hasLogCoverage("ethereum", addr, "*", 1, 10));
+    try std.testing.expect(!try client.hasLogCoverage("ethereum", addr, "0xaa", 1, 10));
+    const other = try client.uncoveredLogRanges("ethereum", addr, "0xaa", 1, 10);
+    defer alloc.free(other);
+    try std.testing.expectEqual(@as(usize, 1), other.len);
+    try std.testing.expectEqual(@as(u64, 1), other[0].from_block);
+    try std.testing.expectEqual(@as(u64, 10), other[0].to_block);
+    const holes = try client.uncoveredLogRanges("ethereum", addr, "*", 1, 12);
+    defer alloc.free(holes);
+    try std.testing.expectEqual(@as(usize, 1), holes.len);
+    try std.testing.expectEqual(@as(u64, 11), holes[0].from_block);
+    try std.testing.expectEqual(@as(u64, 12), holes[0].to_block);
+
+    const mixed = "0x00000000000000000000000000000000000000AB";
+    try client.storeLogCacheBatch("ethereum", &.{mixed}, "*", 5, 6, &.{.{
+        .address = mixed,
+        .block_number = 5,
+        .tx_hash = "0xtx",
+        .log_index = 1,
+        .topics = "0xaa",
+        .data = "0x",
+    }});
+    const rows = try client.loadChainLogs("ethereum", addr, 1, 10);
+    defer client.freeChainLogs(rows);
+    try std.testing.expectEqual(@as(usize, 1), rows.len);
+    try std.testing.expectEqualStrings(addr, rows[0].address);
+    try std.testing.expectEqualStrings("0xaa", rows[0].topics);
+
+    try client.storeLogCacheBatch("ethereum", &.{addr}, "0xbb", 1, 2, &.{});
+    try std.testing.expect(try client.hasLogCoverage("ethereum", addr, "*", 1, 4));
+    try std.testing.expect(try client.hasLogCoverage("ethereum", addr, "0xbb", 1, 2));
+    try std.testing.expect(!try client.hasLogCoverage("ethereum", addr, "0xbb", 3, 4));
+
+    try client.rollbackFromBlock(addr, "test", &.{}, 5, "ethereum");
+    try std.testing.expect(!try client.hasLogCoverage("ethereum", addr, "*", 5, 6));
+    try std.testing.expect(try client.hasLogCoverage("ethereum", addr, "*", 1, 4));
+    const left = try client.loadChainLogs("ethereum", addr, 1, 10);
+    defer client.freeChainLogs(left);
+    try std.testing.expectEqual(@as(usize, 0), left.len);
+
+    try client.exec("DROP TABLE sync.chain_log_ranges;");
+    try client.exec("CREATE TABLE sync.chain_log_ranges (chain TEXT NOT NULL, address TEXT NOT NULL, from_block INTEGER NOT NULL, to_block INTEGER NOT NULL, PRIMARY KEY (chain, address, from_block));");
+    try client.exec("INSERT INTO sync.chain_log_ranges(chain, address, from_block, to_block) VALUES ('ethereum', '0xold', 1, 9);");
+    try client.migrate();
+    try std.testing.expect(!try client.hasLogCoverage("ethereum", "0xold", "*", 1, 9));
 }

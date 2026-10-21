@@ -36,6 +36,27 @@ const CircuitState = enum(u8) {
     half_open, // 半开测试
 };
 
+/// `getBlockNumber` 短缓存寿命。年龄达到该值即过期（`now - at >= ttl` 未命中）。
+pub const block_number_cache_ttl_ms: i64 = 250;
+
+/// 最近一次成功的区块号。`valid == false` 表示还没有成功结果。
+pub const BlockNumberSnapshot = struct {
+    number: u64 = 0,
+    at_ms: i64 = 0,
+    valid: bool = false,
+};
+
+/// 250ms 内复用同一结果。无效、过期，或 `now_ms` 早于缓存时间（回拨）都返回 null。
+/// 纯函数：单测传入毫秒时间戳，不睡眠、不打 RPC。
+pub fn lookupBlockNumberCache(snapshot: BlockNumberSnapshot, now_ms: i64) ?u64 {
+    if (!snapshot.valid) return null;
+    // 有符号减法 999-1000 得到 -1，不会溢出，必须先拒绝回拨。
+    if (now_ms < snapshot.at_ms) return null;
+    const age = std.math.sub(i64, now_ms, snapshot.at_ms) catch return null;
+    if (age >= block_number_cache_ttl_ms) return null;
+    return snapshot.number;
+}
+
 /// 以太坊 RPC 客户端（带熔断器和指数退避）
 pub const Client = struct {
     alloc: std.mem.Allocator,
@@ -57,6 +78,12 @@ pub const Client = struct {
     circuit_state: std.atomic.Value(CircuitState),
     circuit_failures: std.atomic.Value(u32),
     circuit_last_failure: std.atomic.Value(i64), // 毫秒时间戳
+    // getBlockNumber 短缓存。不用 http_mutex：rpcCall 会再锁它，重入会死锁，
+    // 也会把缓存检查卷进 HTTP 串行。这把锁只护住 block_number_cache 的读写。
+    block_number_mutex: std.atomic.Mutex = .unlocked,
+    block_number_cache: BlockNumberSnapshot = .{},
+    // 缓存命中次数。命中不走 rpcCall，因此不增加 total_requests / total_errors。
+    block_number_cache_hits: std.atomic.Value(u64) = .init(0),
     const CIRCUIT_THRESHOLD = 5;    // 连续失败 5 次后熔断
     const CIRCUIT_TIMEOUT_SEC = 30; // 熔断 30 秒后尝试半开
 
@@ -81,11 +108,48 @@ pub const Client = struct {
         self.http_client.deinit();
     }
 
-    /// 获取最新区块号
+    /// 获取最新区块号。250ms 内重复调用直接返回缓存，不打 RPC、不计入 total_requests。
     pub fn getBlockNumber(self: *Client) !u64 {
+        const now_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
+        return self.getBlockNumberAt(now_ms);
+    }
+
+    /// 与 `getBlockNumber` 相同，但时间由调用方传入，单测不必睡眠。
+    /// 未命中才走 `rpcCallWithRetry`（故障转移、熔断、重试保持原样）。
+    /// 只有解析成功才写入缓存；失败不缓存，也不记一次缓存命中。
+    pub fn getBlockNumberAt(self: *Client, now_ms: i64) !u64 {
+        if (self.loadCachedBlockNumber(now_ms)) |number| {
+            _ = self.block_number_cache_hits.fetchAdd(1, .monotonic);
+            return number;
+        }
+
         const raw = try self.rpcCallWithRetry("eth_blockNumber", "[]");
         defer self.alloc.free(raw);
-        return try extractHexU64Result(self.alloc, raw);
+        const number = try extractHexU64Result(self.alloc, raw);
+        self.storeCachedBlockNumber(number, now_ms);
+        return number;
+    }
+
+    fn lockBlockNumberCache(self: *Client) void {
+        while (!self.block_number_mutex.tryLock()) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn loadCachedBlockNumber(self: *Client, now_ms: i64) ?u64 {
+        self.lockBlockNumberCache();
+        defer self.block_number_mutex.unlock();
+        return lookupBlockNumberCache(self.block_number_cache, now_ms);
+    }
+
+    fn storeCachedBlockNumber(self: *Client, number: u64, now_ms: i64) void {
+        self.lockBlockNumberCache();
+        defer self.block_number_mutex.unlock();
+        self.block_number_cache = .{
+            .number = number,
+            .at_ms = now_ms,
+            .valid = true,
+        };
     }
 
     /// 获取区块 hash（返回调用者拥有的字符串，需释放）
@@ -219,6 +283,23 @@ pub const Client = struct {
         return try parseLogs(self.alloc, raw);
     }
 
+    /// 单块的 `eth_getLogs` 被节点截断时，用收据把这一块的日志拿全，再按地址和 topic0 过滤。
+    /// 调用方拥有返回的切片。
+    pub fn getBlockReceiptLogs(
+        self: *Client,
+        block_number: u64,
+        addresses: []const []const u8,
+        topics: ?[]const []const u8,
+    ) ![]Log {
+        const params = try std.fmt.allocPrint(self.alloc, "[\"0x{x}\"]", .{block_number});
+        defer self.alloc.free(params);
+
+        const raw = try self.rpcCallWithRetry("eth_getBlockReceipts", params);
+        defer self.alloc.free(raw);
+
+        return try parseBlockReceiptLogs(self.alloc, raw, block_number, addresses, topics);
+    }
+
     /// 带指数退避重试的 RPC 调用
     fn rpcCallWithRetry(self: *Client, method: []const u8, params: []const u8) ![]u8 {
         // 检查熔断器
@@ -332,13 +413,31 @@ pub const Client = struct {
             self.config.url;
 
         _ = self.total_requests.fetchAdd(1, .monotonic);
+        // std.http.Client.fetch 没有超时参数。request_timeout_ms 为 0 时保持
+        // 原来的 fetch（单测传入 undefined io，不能碰时钟）。非 0 时只替换
+        // 这一次请求的 Io.operate：net_read / net_write 走 operateTimeout。
+        // 连接仍走系统 connect；对端收下 TCP 但不发字节时，读会在超时后返回。
+        const timeout = rpcIoTimeout(self.config.request_timeout_ms);
+        var timed_vtable: std.Io.VTable = undefined;
+        if (timeout != .none) {
+            timed_vtable = self.io.vtable.*;
+            timed_vtable.operate = timedNetOperate;
+            rpc_io_inner = self.io;
+            rpc_io_timeout = timeout;
+            self.http_client.io = .{
+                .userdata = self.io.userdata,
+                .vtable = &timed_vtable,
+            };
+        }
+        defer if (timeout != .none) {
+            self.http_client.io = self.io;
+            rpc_io_timeout = .none;
+        };
         const result = self.http_client.fetch(.{
             .location = .{ .url = target_url },
             .method = .POST,
             .payload = req_buf.items,
-            // Zig 0.17-dev 的 std.http.Client 无读超时；复用池内陈旧连接
-            // 会导致读永久挂起（4 合约并发时偶发 c3 卡死）。禁用 keep_alive
-            // 每次新建连接，避免陈旧连接。完整超时需 std 层支持。
+            // 复用池内陈旧连接会导致读永久挂起。禁用 keep_alive，每次新建连接。
             .keep_alive = false,
             .extra_headers = &.{
                 .{ .name = "Content-Type", .value = "application/json" },
@@ -351,6 +450,7 @@ pub const Client = struct {
 
         const status_int = @intFromEnum(result.status);
         // 客户端错误：不可重试
+        if (status_int == 413) return error.RpcLimitExceeded;
         if (status_int >= 400 and status_int < 500 and status_int != 429) {
             return error.HttpClientError;
         }
@@ -373,7 +473,7 @@ pub const Client = struct {
                 const code = if (err.object.get("code")) |c| switch (c) { .integer => |v| v, else => -1 } else -1;
                 const msg = if (err.object.get("message")) |m| switch (m) { .string => |v| v, else => "unknown" } else "unknown";
                 log.warn("RPC error: code={d}, msg={s}", .{ code, msg });
-                if (code == -32005) return error.RpcLimitExceeded;
+                if (rpcRangeTooWide(code, msg)) return error.RpcLimitExceeded;
                 return error.RpcError;
             }
         } else |_| {}
@@ -440,6 +540,40 @@ pub fn formatLogFilterObject(alloc: std.mem.Allocator, filter: LogFilter, includ
     var list = buf.toArrayList();
     defer list.deinit(alloc);
     return try alloc.dupe(u8, list.items);
+}
+
+fn containsFold(hay: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or hay.len < needle.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= hay.len) : (i += 1) {
+        if (std.ascii.eqlIgnoreCase(hay[i..][0..needle.len], needle)) return true;
+    }
+    return false;
+}
+
+/// 区间太大，缩小批次再要。限流不算：原样重试即可，不该把批次砍掉。
+fn rpcRangeTooWide(code: i64, msg: []const u8) bool {
+    if (containsFold(msg, "rate limit") or containsFold(msg, "too many requests")) return false;
+    if (code == -32005) return true;
+    const needles = [_][]const u8{
+        "returned more than",
+        "response size",
+        "too many logs",
+        "too many results",
+        "too many blocks",
+        "log limit",
+        "block range",
+        "exceed max",
+        "exceeds max",
+        "maximum block",
+        "query exceeds",
+        "result limit",
+        "size exceeded",
+    };
+    for (needles) |needle| {
+        if (containsFold(msg, needle)) return true;
+    }
+    return false;
 }
 
 /// 从 JSON-RPC 响应中提取十六进制 u64 结果
@@ -540,7 +674,7 @@ fn parseLogs(alloc: std.mem.Allocator, raw: []const u8) ![]Log {
             else => "unknown",
         } else "unknown";
         log.err("RPC error: code={d}, msg={s}", .{ code, msg });
-        if (code == -32005) return error.RpcLimitExceeded;
+        if (rpcRangeTooWide(code, msg)) return error.RpcLimitExceeded;
         return error.RpcError;
     }
 
@@ -556,6 +690,79 @@ fn parseLogs(alloc: std.mem.Allocator, raw: []const u8) ![]Log {
     for (result.array.items) |item| {
         if (item != .object) continue;
         try logs.append(alloc, try parseLogObject(alloc, item.object));
+    }
+
+    return try logs.toOwnedSlice(alloc);
+}
+
+fn receiptLogWanted(addresses: []const []const u8, topics: ?[]const []const u8, lg: Log) bool {
+    var address_ok = false;
+    for (addresses) |want| {
+        if (std.ascii.eqlIgnoreCase(want, lg.address)) {
+            address_ok = true;
+            break;
+        }
+    }
+    if (!address_ok) return false;
+    const want_topics = topics orelse return true;
+    if (want_topics.len == 0) return true;
+    if (lg.topics.len == 0) return false;
+    for (want_topics) |topic| {
+        if (std.ascii.eqlIgnoreCase(topic, lg.topics[0])) return true;
+    }
+    return false;
+}
+
+/// 解析 `eth_getBlockReceipts` 响应，只留下这一块里地址和 topic0 都命中的日志。
+pub fn parseBlockReceiptLogs(
+    alloc: std.mem.Allocator,
+    raw: []const u8,
+    block_number: u64,
+    addresses: []const []const u8,
+    topics: ?[]const []const u8,
+) ![]Log {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return error.InvalidResponse;
+    if (parsed.value.object.get("error")) |err| {
+        if (err != .object) return error.InvalidResponse;
+        const code = if (err.object.get("code")) |c| switch (c) {
+            .integer => |v| v,
+            else => -1,
+        } else -1;
+        const msg = if (err.object.get("message")) |m| switch (m) {
+            .string => |v| v,
+            else => "unknown",
+        } else "unknown";
+        log.err("RPC error: code={d}, msg={s}", .{ code, msg });
+        if (rpcRangeTooWide(code, msg)) return error.RpcLimitExceeded;
+        return error.RpcError;
+    }
+
+    const result = parsed.value.object.get("result") orelse return error.InvalidResponse;
+    if (result == .null) return error.BlockNotFound;
+    if (result != .array) return error.InvalidResponse;
+
+    var logs: std.ArrayList(Log) = .empty;
+    errdefer {
+        for (logs.items) |l| freeLog(alloc, l);
+        logs.deinit(alloc);
+    }
+
+    for (result.array.items) |receipt| {
+        if (receipt != .object) continue;
+        const receipt_logs = receipt.object.get("logs") orelse continue;
+        if (receipt_logs != .array) continue;
+        for (receipt_logs.array.items) |item| {
+            if (item != .object) continue;
+            const lg = try parseLogObject(alloc, item.object);
+            if (lg.block_number != block_number or !receiptLogWanted(addresses, topics, lg)) {
+                freeLog(alloc, lg);
+                continue;
+            }
+            try logs.append(alloc, lg);
+        }
     }
 
     return try logs.toOwnedSlice(alloc);
@@ -594,9 +801,98 @@ pub fn freeLogs(alloc: std.mem.Allocator, logs: []Log) void {
     alloc.free(logs);
 }
 
+/// `0` 表示不安装读超时，调用方继续走原来的 `fetch`。
+fn rpcIoTimeout(ms: u32) std.Io.Timeout {
+    if (ms == 0) return .none;
+    return .{
+        .duration = .{
+            .raw = .fromMilliseconds(@as(i64, ms)),
+            .clock = .awake,
+        },
+    };
+}
+
+/// 当前线程正在进行的那一次 RPC。`http_client.io` 的 userdata 仍是原来的
+/// Threaded，超时值放在这里，避免包一层完整 Io vtable。
+threadlocal var rpc_io_inner: std.Io = undefined;
+threadlocal var rpc_io_timeout: std.Io.Timeout = .none;
+
+fn timedNetOperate(userdata: ?*anyopaque, operation: std.Io.Operation) std.Io.Cancelable!std.Io.Operation.Result {
+    const inner = std.Io{ .userdata = userdata, .vtable = rpc_io_inner.vtable };
+    switch (operation) {
+        .net_read, .net_write, .net_receive, .net_send => {},
+        else => return inner.operate(operation),
+    }
+    if (rpc_io_timeout == .none) return inner.operate(operation);
+    return inner.operateTimeout(operation, rpc_io_timeout) catch |err| switch (err) {
+        error.Timeout => return netTimeoutResult(operation),
+        error.ConcurrencyUnavailable => return inner.operate(operation),
+        else => |e| return e,
+    };
+}
+
+fn netTimeoutResult(operation: std.Io.Operation) std.Io.Operation.Result {
+    return switch (operation) {
+        .net_read => .{ .net_read = error.ConnectionTimedOut },
+        .net_write => .{ .net_write = error.ConnectionTimedOut },
+        .net_receive => .{ .net_receive = .{ error.ConnectionTimedOut, 0 } },
+        .net_send => .{ .net_send = .{ error.ConnectionTimedOut, 0 } },
+        else => unreachable,
+    };
+}
+
+fn monoMs() i64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
+}
+
 // ============================================================================
 // 单元测试
 // ============================================================================
+
+// chain_pipeline 尚未接入索引循环，root.zig 也不在本次改动范围。
+// 从这里引用，`zig build test` 才会编译并运行它的测试。
+test {
+    _ = @import("chain_pipeline.zig");
+}
+
+test "lookupBlockNumberCache 250ms 窗口" {
+    const fresh = BlockNumberSnapshot{ .number = 42, .at_ms = 1_000, .valid = true };
+    try std.testing.expectEqual(@as(?u64, 42), lookupBlockNumberCache(fresh, 1_000));
+    try std.testing.expectEqual(@as(?u64, 42), lookupBlockNumberCache(fresh, 1_249));
+    try std.testing.expectEqual(@as(?u64, null), lookupBlockNumberCache(fresh, 1_250));
+    try std.testing.expectEqual(@as(?u64, null), lookupBlockNumberCache(fresh, 1_500));
+    try std.testing.expectEqual(@as(?u64, null), lookupBlockNumberCache(fresh, 999));
+    try std.testing.expectEqual(@as(?u64, null), lookupBlockNumberCache(.{ .number = 42, .at_ms = 1_000 }, 1_000));
+}
+
+test "getBlockNumberAt 缓存命中不计入请求与失败" {
+    const alloc = std.testing.allocator;
+    var rpc_cfg = RpcConfig{
+        .url = "",
+        .retry_count = 0,
+        .retry_delay_ms = 0,
+        .request_timeout_ms = 0,
+        .max_concurrent = 1,
+    };
+    var client = Client.init(alloc, undefined, &rpc_cfg);
+    defer client.deinit();
+
+    client.block_number_cache = .{ .number = 99, .at_ms = 1_000, .valid = true };
+
+    try std.testing.expectEqual(@as(?u64, null), client.loadCachedBlockNumber(1_250));
+    try std.testing.expectEqual(@as(u64, 0), client.block_number_cache_hits.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), client.total_requests.load(.monotonic));
+
+    const n = try client.getBlockNumberAt(1_249);
+    try std.testing.expectEqual(@as(u64, 99), n);
+    const n2 = try client.getBlockNumberAt(1_000);
+    try std.testing.expectEqual(@as(u64, 99), n2);
+    try std.testing.expectEqual(@as(u64, 2), client.block_number_cache_hits.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), client.total_requests.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), client.total_errors.load(.monotonic));
+}
 
 test "extractHexU64Result" {
     const alloc = std.testing.allocator;
@@ -634,6 +930,41 @@ test "parseSubscriptionNotification removed" {
     defer freeLog(alloc, maybe.?);
     try std.testing.expect(maybe.?.removed);
     try std.testing.expectEqual(@as(u64, 16), maybe.?.block_number);
+}
+
+test "区间超限与限流分开" {
+    try std.testing.expect(rpcRangeTooWide(-32005, "limit exceeded"));
+    try std.testing.expect(rpcRangeTooWide(-32602, "Log response size exceeded. up to a 2,000 block range"));
+    try std.testing.expect(rpcRangeTooWide(-32000, "query returned more than 10000 results"));
+    try std.testing.expect(!rpcRangeTooWide(-32602, "invalid argument"));
+    try std.testing.expect(!rpcRangeTooWide(429, "Too Many Requests"));
+    try std.testing.expect(!rpcRangeTooWide(-32005, "rate limit exceeded"));
+}
+
+test "parseLogs 把区间超限从普通 RPC 错误里分出来" {
+    const alloc = std.testing.allocator;
+    const raw = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32602,\"message\":\"Log response size exceeded\"}}";
+    try std.testing.expectError(error.RpcLimitExceeded, parseLogs(alloc, raw));
+}
+
+test "eth_getBlockReceipts 只留下地址和 topic0 都命中的日志" {
+    const alloc = std.testing.allocator;
+    const raw =
+        \\{"jsonrpc":"2.0","id":1,"result":[{"logs":[{"address":"0xAbC","topics":["0xT1"],"data":"0x01","blockNumber":"0x10","transactionHash":"0xtx1","logIndex":"0x0"},{"address":"0xdef","topics":["0xT1"],"data":"0x02","blockNumber":"0x10","transactionHash":"0xtx2","logIndex":"0x1"},{"address":"0xabc","topics":["0xT2"],"data":"0x03","blockNumber":"0x10","transactionHash":"0xtx3","logIndex":"0x2"}]},{"logs":[{"address":"0xabc","topics":["0xt1","0xpad"],"data":"0x04","blockNumber":"0x10","transactionHash":"0xtx4","logIndex":"0x3"},{"address":"0xabc","topics":["0xT1"],"data":"0x05","blockNumber":"0x11","transactionHash":"0xtx5","logIndex":"0x0"}]}]}
+    ;
+    const addrs = [_][]const u8{"0xabc"};
+    const topics = [_][]const u8{"0xT1"};
+    const logs = try parseBlockReceiptLogs(alloc, raw, 0x10, &addrs, &topics);
+    defer freeLogs(alloc, logs);
+    try std.testing.expectEqual(@as(usize, 2), logs.len);
+    try std.testing.expectEqual(@as(u64, 0), logs[0].log_index);
+    try std.testing.expectEqual(@as(u64, 3), logs[1].log_index);
+    try std.testing.expectEqualStrings("0xtx4", logs[1].transaction_hash);
+
+    const missing = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}";
+    try std.testing.expectError(error.BlockNotFound, parseBlockReceiptLogs(alloc, missing, 1, &addrs, null));
+    const rpc_err = "{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"method not found\"}}";
+    try std.testing.expectError(error.RpcError, parseBlockReceiptLogs(alloc, rpc_err, 1, &addrs, null));
 }
 
 test "parseLogs empty result" {
@@ -745,4 +1076,59 @@ test "acquireSlot and releaseSlot" {
 
     client.releaseSlot();
     try std.testing.expectEqual(@as(u32, 0), client.concurrent_requests.load(.monotonic));
+}
+
+test "request_timeout_ms 为 0 时不安装读超时" {
+    try std.testing.expect(rpcIoTimeout(0) == .none);
+    switch (rpcIoTimeout(200)) {
+        .duration => |d| try std.testing.expectEqual(@as(i64, 200), d.raw.toMilliseconds()),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "request_timeout_ms 切断只接受不回应的 RPC" {
+    const alloc = std.testing.allocator;
+    var backend = std.Io.Threaded.init(alloc, .{});
+    defer backend.deinit();
+    const io = backend.io();
+
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try addr.listen(io, .{});
+    var release = std.atomic.Value(bool).init(false);
+    const holder = try std.Thread.spawn(.{}, struct {
+        fn run(listen: *std.Io.net.Server, io_: std.Io, release_: *std.atomic.Value(bool)) void {
+            const stream = listen.accept(io_) catch return;
+            defer stream.close(io_);
+            var waited_ms: u32 = 0;
+            while (!release_.load(.acquire) and waited_ms < 3000) : (waited_ms += 20) {
+                std.Io.sleep(io_, .fromMilliseconds(20), .awake) catch return;
+            }
+        }
+    }.run, .{ &server, io, &release });
+    defer {
+        release.store(true, .release);
+        server.deinit(io);
+        holder.join();
+    }
+
+    var url_buf: [64]u8 = undefined;
+    const url = std.fmt.bufPrint(&url_buf, "http://127.0.0.1:{d}", .{server.socket.address.getPort()}) catch unreachable;
+    var rpc_cfg = RpcConfig{
+        .url = url,
+        .retry_count = 0,
+        .retry_delay_ms = 0,
+        .request_timeout_ms = 200,
+        .max_concurrent = 1,
+    };
+    var client = Client.init(alloc, io, &rpc_cfg);
+    defer client.deinit();
+
+    const started = monoMs();
+    const result = client.rpcCall("eth_blockNumber", "[]");
+    const elapsed = monoMs() - started;
+    try std.testing.expect(elapsed < 2000);
+    if (result) |_| return error.TestUnexpectedResult else |err| switch (err) {
+        error.ReadFailed, error.WriteFailed => {},
+        else => return err,
+    }
 }

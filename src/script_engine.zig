@@ -1,6 +1,7 @@
 const std = @import("std");
 const log = @import("log.zig");
 const db = @import("db.zig");
+const webhook = @import("webhook.zig");
 
 pub const Action = union(enum) {
     log_msg: []const u8,
@@ -43,6 +44,7 @@ pub const ScriptEngine = struct {
     io: std.Io,
     rules: std.ArrayList(Rule),
     mutex: std.atomic.Mutex,
+    webhook_mgr: ?*webhook.Manager = null,
 
     pub fn init(alloc: std.mem.Allocator, io: std.Io) ScriptEngine {
         return .{
@@ -51,6 +53,10 @@ pub const ScriptEngine = struct {
             .rules = .empty,
             .mutex = .unlocked,
         };
+    }
+
+    pub fn setWebhook(self: *ScriptEngine, mgr: *webhook.Manager) void {
+        self.webhook_mgr = mgr;
     }
 
     pub fn deinit(self: *ScriptEngine) void {
@@ -184,7 +190,11 @@ pub const ScriptEngine = struct {
                         log.info("[ScriptEngine Handler] {s} | {s}.{s} @ 区块 {d}", .{ m, contract_name, event_name, block_number });
                     },
                     .webhook_url => |u| {
-                        log.info("[ScriptEngine Webhook] 触发 Webhook 目标 {s} @ 区块 {d}", .{ u, block_number });
+                        if (self.webhook_mgr) |mgr| {
+                            mgr.enqueueEvent(u, contract_name, event_name, fields, block_number);
+                        } else {
+                            log.info("[ScriptEngine Webhook] 触发 Webhook 目标 {s} @ 区块 {d}", .{ u, block_number });
+                        }
                     },
                     .update_account => {},
                 }

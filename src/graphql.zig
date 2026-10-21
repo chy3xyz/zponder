@@ -6,6 +6,7 @@ const indexer = @import("indexer.zig");
 const eth_rpc = @import("eth_rpc.zig");
 const abi = @import("abi.zig");
 const build_options = @import("build_options");
+const auth = @import("auth.zig");
 
 const log = std.log.scoped(.graphql);
 
@@ -86,7 +87,62 @@ const Builder = zg.SchemaBuilder(.{
     },
 });
 
-pub fn start(alloc: std.mem.Allocator, cfg: *const config.GraphQLConfig, ctx: Context) !std.Thread {
+/// 鉴权代理监听对外端口，GraphQL 本体绑在 127.0.0.1 的错开端口上。
+pub fn internalGraphqlPort(public_port: u16) u16 {
+    if (public_port < 45536) return public_port + 20000;
+    return public_port - 20000;
+}
+
+/// 主线程在 `listen` 返回前持有的停止把手。`Gate` 比服务线程活得久，由 `stop` 释放。
+pub const Gate = struct {
+    mu: std.atomic.Mutex = .unlocked,
+    alive: bool = true,
+    server: *zg.GraphQLServer,
+    bind: std.Io.net.IpAddress,
+};
+
+pub const Service = struct {
+    thread: std.Thread,
+    gate: *Gate,
+    alloc: std.mem.Allocator,
+
+    /// 连一下监听地址，让堵在 `accept` 里的 `listen` 返回去看 `shutdown` 标志。
+    pub fn poke(self: *const Service, io: std.Io) bool {
+        const addr = pokeAddress(self.gate.bind);
+        const stream = addr.connect(io, .{ .mode = .stream }) catch return false;
+        stream.close(io);
+        return true;
+    }
+
+    pub fn stop(self: *Service, io: std.Io) void {
+        lockGate(&self.gate.mu);
+        const still = self.gate.alive;
+        if (still) self.gate.server.shutdown();
+        self.gate.mu.unlock();
+        if (still) _ = self.poke(io);
+        self.thread.join();
+        self.alloc.destroy(self.gate);
+        self.gate = undefined;
+    }
+};
+
+fn lockGate(mu: *std.atomic.Mutex) void {
+    while (!mu.tryLock()) std.atomic.spinLoopHint();
+}
+
+fn pokeAddress(addr: std.Io.net.IpAddress) std.Io.net.IpAddress {
+    return switch (addr) {
+        .ip4 => |ip4| .{
+            .ip4 = if (ip4.bytes[0] == 0 and ip4.bytes[1] == 0 and ip4.bytes[2] == 0 and ip4.bytes[3] == 0)
+                .loopback(ip4.port)
+            else
+                ip4,
+        },
+        .ip6 => addr,
+    };
+}
+
+pub fn start(alloc: std.mem.Allocator, cfg: *const config.GraphQLConfig, ctx: Context, api_token: []const u8) !Service {
     if (!cfg.enabled) {
         log.info("GraphQL 服务未启用", .{});
         return error.GraphQLDisabled;
@@ -97,7 +153,14 @@ pub fn start(alloc: std.mem.Allocator, cfg: *const config.GraphQLConfig, ctx: Co
 
     attachResolvers(&schema_def);
 
-    const addr = try std.Io.net.IpAddress.parseIp4(cfg.host, cfg.port);
+    const public_addr = try std.Io.net.IpAddress.parseIp4(cfg.host, cfg.port);
+    const token_copy = try alloc.dupe(u8, api_token);
+    errdefer alloc.free(token_copy);
+    const internal_port: u16 = if (token_copy.len > 0) internalGraphqlPort(cfg.port) else cfg.port;
+    const bind_addr = if (token_copy.len > 0)
+        try std.Io.net.IpAddress.parseIp4("127.0.0.1", internal_port)
+    else
+        public_addr;
 
     const ctx_ptr = try alloc.create(Context);
     errdefer alloc.destroy(ctx_ptr);
@@ -112,7 +175,7 @@ pub fn start(alloc: std.mem.Allocator, cfg: *const config.GraphQLConfig, ctx: Co
     }
 
     const server = zg.GraphQLServer.init(alloc, &schema_def, .{
-        .bind_address = addr,
+        .bind_address = bind_addr,
         .max_query_depth = if (cfg.max_query_depth > 0) cfg.max_query_depth else null,
         .max_query_complexity = if (cfg.max_query_complexity > 0) cfg.max_query_complexity else null,
         .enable_playground = cfg.enable_playground,
@@ -128,9 +191,21 @@ pub fn start(alloc: std.mem.Allocator, cfg: *const config.GraphQLConfig, ctx: Co
         enable_playground: bool,
         ctx_ptr: *Context,
         rate_limiter: ?zg.RateLimiter,
+        api_token: []u8,
+        internal_port: u16,
+        proxy_running: std.atomic.Value(bool),
+        proxy_ready: std.atomic.Value(bool),
+        proxy_ok: std.atomic.Value(bool),
+        proxy_io: std.Io,
+        proxy_listener: ?std.Io.net.Server,
+        gate: *Gate,
 
         fn run(self: *@This()) void {
             defer {
+                lockGate(&self.gate.mu);
+                self.gate.alive = false;
+                self.gate.mu.unlock();
+                self.allocator.free(self.api_token);
                 self.ctx_ptr.shutdown_flag.store(true, .release);
                 self.schema_def.deinit();
                 if (self.rate_limiter) |*rl| rl.deinit();
@@ -143,14 +218,148 @@ pub fn start(alloc: std.mem.Allocator, cfg: *const config.GraphQLConfig, ctx: Co
             defer backend.deinit();
             const backend_io = backend.io();
 
-            log.info("GraphQL 服务已启动: http://{f}/graphql", .{self.address});
             if (self.enable_playground) {
                 log.info("GraphQL Playground: http://{f}/graphql/playground", .{self.address});
             }
 
+            if (self.api_token.len == 0) {
+                log.info("GraphQL 服务已启动: http://{f}/graphql", .{self.address});
+                self.server.listen(backend_io) catch |err| {
+                    log.err("GraphQL 服务异常退出: {s}", .{@errorName(err)});
+                };
+                return;
+            }
+
+            self.proxy_running.store(true, .release);
+            const proxy_thread = std.Thread.spawn(.{}, @This().authProxyMain, .{self}) catch |err| {
+                log.err("GraphQL 鉴权代理启动失败: {s}", .{@errorName(err)});
+                return;
+            };
+            while (!self.proxy_ready.load(.acquire)) std.atomic.spinLoopHint();
+            if (!self.proxy_ok.load(.acquire)) {
+                log.err("GraphQL 鉴权代理未能监听 {f}", .{self.address});
+                proxy_thread.join();
+                return;
+            }
+
+            log.info("GraphQL 服务已启动: http://{f}/graphql（Bearer 鉴权）", .{self.address});
             self.server.listen(backend_io) catch |err| {
                 log.err("GraphQL 服务异常退出: {s}", .{@errorName(err)});
             };
+            self.proxy_running.store(false, .release);
+            if (self.proxy_listener) |*ls| {
+                ls.deinit(self.proxy_io);
+                self.proxy_listener = null;
+            }
+            proxy_thread.join();
+        }
+
+        fn authProxyMain(self: *@This()) void {
+            var threaded = std.Io.Threaded.init(self.allocator, .{});
+            defer threaded.deinit();
+            const io = threaded.io();
+            self.proxy_io = io;
+
+            var listener = self.address.listen(io, .{ .kernel_backlog = 128 }) catch |err| {
+                log.err("GraphQL 鉴权代理绑定失败: {s}", .{@errorName(err)});
+                self.proxy_ready.store(true, .release);
+                return;
+            };
+            self.proxy_listener = listener;
+            self.proxy_ok.store(true, .release);
+            self.proxy_ready.store(true, .release);
+
+            var http_client: std.http.Client = .{ .allocator = self.allocator, .io = io };
+            defer http_client.deinit();
+            while (self.proxy_running.load(.acquire)) {
+                const stream = listener.accept(io) catch break;
+                self.handleProxyClient(io, &http_client, stream);
+            }
+        }
+
+        fn handleProxyClient(self: *@This(), io: std.Io, http_client: *std.http.Client, stream: std.Io.net.Stream) void {
+            defer stream.close(io);
+            var read_buf: [65536]u8 = undefined;
+            var write_buf: [65536]u8 = undefined;
+            var stream_reader = stream.reader(io, &read_buf);
+            var stream_writer = stream.writer(io, &write_buf);
+            var http_server = std.http.Server.init(&stream_reader.interface, &stream_writer.interface);
+
+            var request = http_server.receiveHead() catch return;
+            const target = request.head.target;
+            const path_end = std.mem.indexOfScalar(u8, target, '?') orelse target.len;
+            const path = target[0..path_end];
+            const method = request.head.method;
+
+            if (method == .OPTIONS) {
+                request.respond("", .{
+                    .status = .no_content,
+                    .extra_headers = &.{
+                        .{ .name = "Access-Control-Allow-Origin", .value = "*" },
+                        .{ .name = "Access-Control-Allow-Methods", .value = "GET, POST, OPTIONS" },
+                        .{ .name = "Access-Control-Allow-Headers", .value = "Content-Type, Authorization" },
+                    },
+                }) catch {};
+                return;
+            }
+            if (!auth.routeAllowed(self.api_token, false, path, request.head_buffer)) {
+                request.respond("{\"error\":\"Unauthorized\"}", .{
+                    .status = .unauthorized,
+                    .extra_headers = &.{
+                        .{ .name = "Content-Type", .value = "application/json" },
+                        .{ .name = "WWW-Authenticate", .value = "Bearer" },
+                    },
+                }) catch {};
+                return;
+            }
+            if (request.upgradeRequested() == .websocket) {
+                request.respond("{\"error\":\"api_token is set; WebSocket subscriptions are not forwarded\"}", .{
+                    .status = .not_implemented,
+                    .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+                }) catch {};
+                return;
+            }
+
+            var body_buf: [4096]u8 = undefined;
+            var body_storage: std.ArrayList(u8) = .empty;
+            defer body_storage.deinit(self.allocator);
+            if ((request.head.content_length orelse 0) > 0) {
+                const body_reader = request.server.reader.bodyReader(&body_buf, request.head.transfer_encoding, request.head.content_length);
+                var writer = std.Io.Writer.Allocating.init(self.allocator);
+                defer writer.deinit();
+                _ = body_reader.stream(&writer.writer, std.Io.Limit.limited(1024 * 1024)) catch return;
+                body_storage = writer.toArrayList();
+            }
+
+            const url = std.fmt.allocPrint(self.allocator, "http://127.0.0.1:{d}{s}", .{ self.internal_port, target }) catch return;
+            defer self.allocator.free(url);
+            var response_writer: std.Io.Writer.Allocating = .init(self.allocator);
+            defer response_writer.deinit();
+            const result = http_client.fetch(.{
+                .location = .{ .url = url },
+                .method = method,
+                .payload = if (body_storage.items.len > 0) body_storage.items else null,
+                .keep_alive = false,
+                .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+                .response_writer = &response_writer.writer,
+            }) catch {
+                request.respond("{\"error\":\"Bad Gateway\"}", .{
+                    .status = .bad_gateway,
+                    .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+                }) catch {};
+                return;
+            };
+            const content_type: []const u8 = if (std.mem.indexOf(u8, path, "/playground") != null)
+                "text/html; charset=utf-8"
+            else
+                "application/json; charset=utf-8";
+            request.respond(response_writer.written(), .{
+                .status = result.status,
+                .extra_headers = &.{
+                    .{ .name = "Content-Type", .value = content_type },
+                    .{ .name = "Access-Control-Allow-Origin", .value = "*" },
+                },
+            }) catch {};
         }
     };
 
@@ -159,21 +368,45 @@ pub fn start(alloc: std.mem.Allocator, cfg: *const config.GraphQLConfig, ctx: Co
         .server = server,
         .schema_def = schema_def,
         .allocator = alloc,
-        .address = addr,
+        .address = public_addr,
         .enable_playground = cfg.enable_playground,
         .ctx_ptr = ctx_ptr,
         .rate_limiter = rate_limiter,
+        .api_token = token_copy,
+        .internal_port = internal_port,
+        .proxy_running = std.atomic.Value(bool).init(false),
+        .proxy_ready = std.atomic.Value(bool).init(false),
+        .proxy_ok = std.atomic.Value(bool).init(false),
+        .proxy_io = undefined,
+        .proxy_listener = null,
+        .gate = undefined,
     };
     // Fix: the server's schema_def pointer must point to the heap copy in wrapper,
     // not the stack-local schema_def which goes out of scope when start() returns.
     wrapper.server.schema_def = &wrapper.schema_def;
 
-    const thread = std.Thread.spawn(.{}, ServerWrapper.run, .{wrapper}) catch |err| {
+    const gate = alloc.create(Gate) catch |err| {
         if (rate_limiter) |*rl| rl.deinit();
         alloc.destroy(wrapper);
         return err;
     };
-    return thread;
+    gate.* = .{
+        .server = &wrapper.server,
+        .bind = bind_addr,
+    };
+    wrapper.gate = gate;
+
+    const thread = std.Thread.spawn(.{}, ServerWrapper.run, .{wrapper}) catch |err| {
+        if (rate_limiter) |*rl| rl.deinit();
+        alloc.destroy(gate);
+        alloc.destroy(wrapper);
+        return err;
+    };
+    return .{
+        .thread = thread,
+        .gate = gate,
+        .alloc = alloc,
+    };
 }
 
 fn getCtx(user_data: ?*anyopaque) *const Context {
@@ -491,15 +724,17 @@ fn attachResolvers(schema_def: *zg.schema.Schema) void {
                     if (idx.abi_contract) |*ac| ac.findFunctionByName(method_name) else null
                 else
                     null;
-                const return_type: []const u8 = if (fn_def) |f|
-                    (f.returnType(alloc) orelse "uint256")
-                else
-                    "uint256";
-                // returnType 在多返回值时返回堆上 tuple，需释放（单返回值指向 ABI slice）
-                defer if (fn_def) |f| {
-                    if (f.outputs.len > 1) alloc.free(return_type);
+                // 多个返回值拼成最外层元组，直接展开。单个动态结构体先读偏移。
+                const decoded = decoded: {
+                    const f = fn_def orelse break :decoded try abi.decodeCallResult(alloc, "uint256", result_hex);
+                    if (f.outputs.len <= 1) {
+                        const t = f.returnType(alloc) orelse "uint256";
+                        break :decoded try abi.decodeSingleOutput(alloc, t, result_hex);
+                    }
+                    const t = f.returnType(alloc) orelse "uint256";
+                    defer alloc.free(t);
+                    break :decoded try abi.decodeCallResult(alloc, t, result_hex);
                 };
-                const decoded = try abi.decodeCallResult(alloc, return_type, result_hex);
                 defer alloc.free(decoded);
 
                 // Cache result
@@ -679,4 +914,73 @@ test "graphql: 端到端执行（zgraphql v0.4.0）" {
         const vresult = try validator.validate(&doc);
         try std.testing.expect(!vresult.isValid());
     }
+}
+
+test "graphql internal port 与对外端口错开" {
+    try std.testing.expectEqual(@as(u16, 28081), internalGraphqlPort(8081));
+    try std.testing.expect(internalGraphqlPort(8081) != 8081);
+    try std.testing.expectEqual(@as(u16, 30000), internalGraphqlPort(50000));
+}
+
+test "graphql stop 能从堵住的 accept 返回" {
+    const alloc = std.testing.allocator;
+    var backend = std.Io.Threaded.init(alloc, .{});
+    defer backend.deinit();
+    const io = backend.io();
+
+    const probe_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var probe = try probe_addr.listen(io, .{});
+    const port = probe.socket.address.getPort();
+    probe.deinit(io);
+
+    const cfg = db.DatabaseConfig{
+        .db_type = "sqlite",
+        .db_name = ":memory:",
+        .wal_mode = true,
+        .busy_timeout_ms = 5000,
+        .max_connections = 2,
+    };
+    var database = try db.Client.init(alloc, &cfg);
+    defer database.deinit();
+
+    var shutdown = std.atomic.Value(bool).init(false);
+    const gql_cfg = config.GraphQLConfig{
+        .enabled = true,
+        .host = "127.0.0.1",
+        .port = port,
+        .enable_playground = false,
+        .max_query_depth = 8,
+        .max_query_complexity = 100,
+        .rate_limit_rps = null,
+        .rate_limit_burst = null,
+    };
+    var svc = try start(alloc, &gql_cfg, .{
+        .database = &database,
+        .indexers = &.{},
+        .chain = "bsc",
+        .shutdown_flag = &shutdown,
+        .rpc = undefined,
+    }, "");
+    var stopped = false;
+    defer if (!stopped) svc.stop(io);
+
+    var up = false;
+    var wait: u32 = 0;
+    while (wait < 50) : (wait += 1) {
+        if (svc.poke(io)) {
+            up = true;
+            break;
+        }
+        std.Io.sleep(io, .fromMilliseconds(20), .awake) catch {};
+    }
+    try std.testing.expect(up);
+
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+    const started = @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
+    svc.stop(io);
+    stopped = true;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+    const elapsed = @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000) - started;
+    try std.testing.expect(elapsed < 2000);
 }

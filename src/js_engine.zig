@@ -2,6 +2,7 @@ const std = @import("std");
 const c = @import("c");
 const log = @import("log.zig");
 const db = @import("db.zig");
+const projection = @import("projection.zig");
 
 /// JS undefined 值（立即数，无堆分配）。
 /// 注意：c.JS_UNDEFINED 宏在 Zig 0.17 的 zeroInit 有兼容问题，手动构造；
@@ -322,6 +323,11 @@ pub const JsEngine = struct {
             return arr;
         }
 
+        // 重组只能删掉带 block_number 的投影行，拦掉就地 UPDATE 和缺块号的写入。
+        projection.checkWrite(sql) catch {
+            return c.JS_ThrowTypeError(ctx, "投影只能插入带 block_number 的行，不能 UPDATE；DELETE 必须带 block_number。");
+        };
+
         const changes = client.ponderExec(sql, params) catch |e| {
             engine.recordProjectionError(sql, e);
             return throwDbError(ctx, e);
@@ -532,18 +538,19 @@ pub const JsEngine = struct {
         }
     }
 
-    /// 事件触发入口（indexer 线程）：查找匹配 handler 并执行
-    pub fn handleEvent(self: *JsEngine, contract_name: []const u8, event_name: []const u8, fields: []const db.DecodedField, block_number: u64, block_timestamp: u64, contract_address: []const u8, tx_hash: []const u8, log_index: u64) void {
+    /// 事件触发入口（indexer 线程）：查找匹配 handler 并执行。
+    /// 返回 false 表示 handler 抛错，调用方回滚本条事件后再试。
+    pub fn handleEvent(self: *JsEngine, contract_name: []const u8, event_name: []const u8, fields: []const db.DecodedField, block_number: u64, block_timestamp: u64, contract_address: []const u8, tx_hash: []const u8, log_index: u64) bool {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
 
-        const ctx = self.ctx orelse return;
+        const ctx = self.ctx orelse return true;
 
         // 匹配 "Contract:Event" 或 "Event" 两种写法
-        const full_key_buf = std.fmt.allocPrint(self.alloc, "{s}:{s}", .{ contract_name, event_name }) catch return;
+        const full_key_buf = std.fmt.allocPrint(self.alloc, "{s}:{s}", .{ contract_name, event_name }) catch return true;
         defer self.alloc.free(full_key_buf);
 
-        const handler = self.handlers.get(full_key_buf) orelse self.handlers.get(event_name) orelse return;
+        const handler = self.handlers.get(full_key_buf) orelse self.handlers.get(event_name) orelse return true;
 
         // 构造 event 对象: { contractAddress, args: {field: value}, block: { number, timestamp } }
         var event_obj = c.JS_NewObject(ctx);
@@ -578,8 +585,10 @@ pub const JsEngine = struct {
 
         // 调用 handler(event)
         const result = c.JS_Call(ctx, handler, jsUndefined(ctx), 1, &event_obj);
-        // handler 抛错不中断索引，但必须可见：记录日志 + 计数（设计 §5 失败语义）
+        // handler 抛错不中断索引，但必须可见，并且告诉调用方回滚这条事件。
+        var ok = true;
         if (c.JS_IsException(result)) {
+            ok = false;
             const exc = c.JS_GetException(ctx);
             const str = c.JS_ToCString(ctx, exc);
             if (str != null) {
@@ -599,6 +608,7 @@ pub const JsEngine = struct {
             if (ret < 0) break;
             if (ret == 0) break;
         }
+        return ok;
     }
 
     /// HTTP 动态路由入口：匹配 ponder.http 注册的路由并执行 handler。
@@ -858,7 +868,7 @@ test "js engine ponder.on 注册与事件触发" {
 
     // 触发事件（Contract:Event 与 Event 两种写法都应匹配）
     const fields = [_]db.DecodedField{.{ .name = "value", .value = "100" }};
-    engine.handleEvent("dai", "Transfer", &fields, 123, 1700000000, "0xDAI", "0xhash1", 1);
+    _ = engine.handleEvent("dai", "Transfer", &fields, 123, 1700000000, "0xDAI", "0xhash1", 1);
 
     // 验证 handler 被调用
     try engine.evalScript("if (received !== 123) throw new Error('handler not called: ' + received);", "check.js");
@@ -875,7 +885,7 @@ test "js engine ponder.on Contract:Event 全名匹配" {
     , "test.js");
 
     const fields = [_]db.DecodedField{.{ .name = "value", .value = "0x64" }};
-    engine.handleEvent("Dai", "Transfer", &fields, 1, 1700000000, "0xDAI", "0xhash2", 2);
+    _ = engine.handleEvent("Dai", "Transfer", &fields, 1, 1700000000, "0xDAI", "0xhash2", 2);
 
     try engine.evalScript("if (hit !== '0x64') throw new Error('not hit: ' + hit);", "check.js");
 }
@@ -985,6 +995,10 @@ test "js engine ponder.http handler 异常返回 500" {
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "kaboom") != null);
 }
 
+test {
+    _ = projection;
+}
+
 test "js engine ponder.db 投影写库与查询" {
     const alloc = std.testing.allocator;
     const cfg = db.DatabaseConfig{ .db_type = "sqlite", .db_name = ":memory:", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
@@ -1047,7 +1061,7 @@ test "js engine event.block.timestamp 注入" {
     , "test.js");
 
     const fields = [_]db.DecodedField{.{ .name = "value", .value = "1" }};
-    engine.handleEvent("dai", "Transfer", &fields, 5, 1700000123, "0xDAI", "0xhash3", 3);
+    _ = engine.handleEvent("dai", "Transfer", &fields, 5, 1700000123, "0xDAI", "0xhash3", 3);
 
     try engine.evalScript("if (ts !== 1700000123) throw new Error('ts=' + ts);", "check.js");
 }
@@ -1063,7 +1077,7 @@ test "js engine event.contractAddress 注入" {
     , "test.js");
 
     const fields = [_]db.DecodedField{.{ .name = "value", .value = "1" }};
-    engine.handleEvent("curve", "Transfer", &fields, 5, 1700000123, "0xCLONE", "0xhash", 0);
+    _ = engine.handleEvent("curve", "Transfer", &fields, 5, 1700000123, "0xCLONE", "0xhash", 0);
 
     try engine.evalScript("if (ca !== '0xCLONE') throw new Error('ca=' + ca);", "check.js");
 }
@@ -1083,7 +1097,7 @@ test "js engine event.transactionHash / logIndex 注入" {
 
     const fields = [_]db.DecodedField{.{ .name = "value", .value = "1" }};
     const tx = "0xabc0000000000000000000000000000000000000000000000000000000000001";
-    engine.handleEvent("curve", "Transfer", &fields, 5, 1700000123, "0xCLONE", tx, 7);
+    _ = engine.handleEvent("curve", "Transfer", &fields, 5, 1700000123, "0xCLONE", tx, 7);
 
     try engine.evalScript(
         \\if (th !== "0xabc0000000000000000000000000000000000000000000000000000000000001") throw new Error('th=' + th);
