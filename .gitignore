@@ -5,6 +5,9 @@ zig-pkg/
 .zig-cache/
 zig-out/
 
+# Generated docs site
+public/
+
 # SQLite databases
 *.db
 *.db-shm

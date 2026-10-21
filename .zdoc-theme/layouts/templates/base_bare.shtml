@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="$site.localeCode()">
+	<head id="head">
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, initial-scale=1">
+		<title :text="$page.title"></title>
+		<link rel="stylesheet" href="$site.asset('zdoc.css').link()">
+		<script defer src="$site.asset('zdoc.js').link()"></script>
+		<!-- Mermaid is only needed by pages that actually contain a diagram.
+		     The loader is generated at build time so it can point at a
+		     vendored bundle when one is configured, and at the CDN otherwise. -->
+		<script type="module" src="$site.asset('mermaid.js').link()"></script>
+		<super>
+	</head>
+	<!-- The same document as `base.shtml`, minus the sidebar and the table of
+	     contents. A landing page has nothing to navigate to and no headings
+	     worth listing, so showing either would just be furniture. Keeping a
+	     separate base rather than adding conditionals to the shared one is
+	     what lets both stay readable. -->
+	<body id="body">
+		<div class="layout layout--bare" id="main">
+			<super>
+		</div>
+	</body>
+</html>

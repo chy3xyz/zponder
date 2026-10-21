@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="$site.localeCode()">
+	<head id="head">
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, initial-scale=1">
+		<title :text="$page.title"></title>
+		<!-- Sharing cards.
+		     A `<meta>` carries its value in `content`, and `:text` sets an
+		     element's text rather than an attribute -- so these use an
+		     attribute whose value is exactly one `$` expression. That works
+		     because the template language parses such an attribute as a single
+		     script expression; what it cannot do is concatenate, which is why
+		     no `content="a $x"` form appears anywhere in the theme.
+
+		     The description group is conditional: most pages in a documentation
+		     tree have no description, and a card with an empty description
+		     looks broken rather than minimal. -->
+		<ctx :if="$page.hasDescription()">
+			<meta name="description" content="$page.description">
+			<meta property="og:title" content="$page.title">
+			<meta property="og:description" content="$page.description">
+			<meta property="og:type" content="article">
+		</ctx>
+		<meta property="og:site_name" content="$site.title">
+		<link rel="stylesheet" href="$site.asset('zdoc.css').link()">
+		<script defer src="$site.asset('zdoc.js').link()"></script>
+		<!-- Mermaid is only needed by pages that actually contain a diagram.
+		     The loader is generated at build time so it can point at a
+		     vendored bundle when one is configured, and at the CDN otherwise. -->
+		<script type="module" src="$site.asset('mermaid.js').link()"></script>
+		<!-- Where zdoc.js fetches the search index from. Written here rather
+		     than derived in the script, because the script cannot know the
+		     site's URL prefix. -->
+		<meta name="zdoc-search-index" content="$site.searchIndex()">
+		<super>
+	</head>
+	<body id="body">
+		<!-- Only reachable on a narrow screen; see the media query. The label
+		     names the control for a screen reader, which never sees the icon. -->
+		<button id="nav-toggle" class="nav-toggle" type="button"
+			aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false">
+			<span class="nav-toggle__bar"></span>
+			<span class="nav-toggle__bar"></span>
+			<span class="nav-toggle__bar"></span>
+		</button>
+		<div class="nav-scrim" id="nav-scrim" hidden></div>
+		<div class="layout">
+			<nav class="sidebar" id="sidebar">
+				<a class="sidebar__title" href="$site.index().link()" :text="$site.title"></a>
+				<div class="search" id="search">
+					<!-- The combobox roles are what let a screen reader follow
+					     the result list as the reader arrows through it; the
+					     list is empty until they type, so it starts collapsed. -->
+					<input id="search-input" class="search__input" type="search"
+						placeholder="Search" autocomplete="off" spellcheck="false"
+						role="combobox" aria-expanded="false" aria-controls="search-results"
+						aria-autocomplete="list" aria-label="Search the documentation">
+					<kbd class="search__hint" aria-hidden="true">/</kbd>
+					<ul id="search-results" class="search__results" role="listbox"
+						aria-label="Search results" hidden></ul>
+					<p id="search-status" class="search__status" role="status" aria-live="polite"></p>
+				</div>
+				<super>
+			</nav>
+			<main class="content" id="main">
+				<article class="doc" :html="$page.content()"></article>
+				<!-- A page's age says whether its advice still holds. The
+				     string is empty when the content is not in a git
+				     repository, which leaves the element empty rather than
+				     printing a placeholder. -->
+				<footer class="doc__footer" :if="$page.hasLastUpdated()">
+					<p class="doc__updated">Last updated: <time :text="$page.lastUpdated()"></time></p>
+				</footer>
+			</main>
+			<aside class="toc" id="toc">
+				<div class="toc__title">On this page</div>
+				<super>
+			</aside>
+		</div>
+	</body>
+</html>

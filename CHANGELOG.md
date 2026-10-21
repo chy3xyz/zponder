@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-10-21
+
+### Added
+- **Raw log cache (`database.log_cache = true`)**: persists `eth_getLogs` results and covered `[from_block, to_block]` intervals in `sync.chain_logs` and `sync.chain_log_ranges` (attached `.sync.db` file on SQLite; `sync` schema on PostgreSQL). Replays and restarts read covered ranges locally without calling `eth_getLogs`.
+- **Single-block overflow recovery**: when a single block hits the 10,000-log page limit or `-32005`, the indexer bisects the address filter, bisects the `topic0` filter, and falls back to `eth_getBlockReceipts` when a single address and single topic still overflow.
+- **Full ABI decoding for arrays, tuples, and signed ints**:
+  - Event inputs and function outputs with `"type": "tuple"` and `components` canonicalize to `(T1,T2,...)`, `(T1,T2)[]`, or `(T1,T2)[k]`, and event `topic0` hashes the canonical signature.
+  - `decodeLog` decodes fixed arrays, dynamic arrays, and static or dynamic structs into JSON array strings.
+  - `decodeCallResult` and `decodeSingleOutput` decode multi-output tuples, single dynamic struct outputs, arrays, and two's-complement signed `int*` returns.
+- **Template multi-subscription WebSocket live mode**: template indexers split active clone addresses into slices of `max_addresses_per_request` (default `200`) across multiple `eth_subscribe("logs")` subscriptions, recover logs pushed during subscription handshakes over HTTP, and resubscribe when new clones are discovered.
+- **Network read and write timeouts**:
+  - HTTP JSON-RPC applies `request_timeout_ms` via per-request `Io.operateTimeout`.
+  - WebSocket live sessions enforce a 120-second idle read timeout (`ws_rpc.idle_timeout_ms`) when `request_timeout_ms > 0`.
+  - HTTP server connections enforce `read_timeout_ms` and non-blocking `write_timeout_ms` deadlines.
+- **Bearer token authentication (`[http].api_token`)**: protects REST and GraphQL routes with `Authorization: Bearer <token>` while keeping `GET /health` and CORS preflight open.
+- **User schema tables (`[global].schema_path`)**: migrates `user_*` tables from `.zp` definitions and serves primary-key lookups at `GET /user/:table/:pk`.
+- **Dead-letter backoff and observability**: `raw_logs` tracks `attempts` and exponential-backoff `retry_after` (`1s` to `256s`), surfaced in `/health` (`dead_letters`) and `/metrics` (`zponder_dead_letters`).
+- **Documentation site (`zdoc`)**: added `docs/index.md` and `docs/.zdoc-theme/site.yaml` and rewrote the documentation suite in English for `zdoc docs`.
+
+### Fixed
+- **Transactional handler execution and reentrant DB write lock**: `processLog` wraps event insertion, ERC-20 balance updates, and `ponder.db.exec` writes in one transaction guarded by a reentrant pthread mutex (`write_mu`), rolling back on handler failure.
+- **Reorg reconciliation across cache, projections, and factory children**: `rollbackTo` trims `sync.chain_logs` and `sync.chain_log_ranges`, deletes `blocks` and `proj_*` rows from the fork block in one transaction, drops factory children discovered at or after the fork, and rewinds earlier children.
+- **WebSocket live cursor and gap handling**: `bridgeToTip` scans the tip block when `cursor == latest`, `fillLiveGap` backfills skipped blocks over HTTP before processing live logs, and out-of-order live logs never rewind `last_synced_block`.
+- **Graceful shutdown**: `main` stops and joins the GraphQL server, HTTP server, parent indexers, and factory child threads before closing the database.
+
 ## [0.8.6] - 2026-10-13
 
 ### Added

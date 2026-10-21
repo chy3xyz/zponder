@@ -1,189 +1,102 @@
-<div align="center">
+# zponder
 
-# ⚡ zponder
-
-**Production-grade EVM event indexer in a single static binary — pure Zig, zero Node.js, zero Docker, zero external services.**
-
-Index any smart contract on any EVM chain, react to events with Ponder-style JavaScript handlers,
-and query everything through REST, GraphQL, and SSE — all in one process.
+EVM event indexer written in Zig 0.17.0. `zponder` indexes contract logs into SQLite, PostgreSQL, or RocksDB, runs QuickJS event handlers (`ponder.on`, `ponder.db`, `ponder.http`), and serves REST, GraphQL, and Server-Sent Events (SSE) from a single binary.
 
 [![Release](https://img.shields.io/github/v/release/chy3xyz/zponder)](https://github.com/chy3xyz/zponder/releases)
 [![License: MIT](https://img.shields.io/github/license/chy3xyz/zponder)](LICENSE)
-[![CI](https://img.shields.io/github/actions/workflow/status/chy3xyz/zponder/publish.yml)](https://github.com/chy3xyz/zponder/actions)
+[![CI](https://img.shields.io/github/actions/workflow/status/chy3xyz/zponder/test.yml)](https://github.com/chy3xyz/zponder/actions)
 [![Zig](https://img.shields.io/badge/Zig-0.17.0-f7a41d?logo=zig&logoColor=white)](https://ziglang.org)
-![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey)
 
-*Inspired by [Ponder](https://ponder.sh) — rebuilt from the ground up in Zig.*
+## Capabilities
 
-</div>
+- **Embedded QuickJS-ng v0.17.0**: register event handlers with `ponder.on("Contract:Event", fn)`, write derived tables with `ponder.db.exec` and `ponder.db.query`, and mount custom HTTP routes with `ponder.http.get/post/put/delete/use`.
+- **Transactional projections and reorg rollback**: event inserts, balance updates, and `ponder.db` writes run inside one SQLite or PostgreSQL transaction. Tables prefixed with `proj_` that contain a `block_number` column roll back automatically when a chain reorganization is detected (default `max_reorg_depth = 64`).
+- **Raw log cache (`database.log_cache = true`)**: saves `eth_getLogs` responses and covered `[from_block, to_block]` intervals in `sync.chain_logs` and `sync.chain_log_ranges` (an attached `.sync.db` sidecar file on SQLite, or schema `sync` on PostgreSQL) so replays do not re-fetch covered blocks from the RPC node.
+- **RPC range splitting and receipt fallback**: shrinks block batches on `-32005` / HTTP `413` / 10,000-log truncation, bisects address and `topic0` filters on single-block overflows, and falls back to `eth_getBlockReceipts` when a single address and single topic still exceed the RPC limit.
+- **WebSocket live subscriptions (`ws_url`)**: switches to `eth_subscribe("logs")` after HTTP catch-up, splits large template clone sets into multiple subscriptions (`max_addresses_per_request`, default `200`), fills skipped blocks over HTTP, and enforces a 120-second idle read timeout.
+- **Factory and template indexing (`[[factories]]`, `[[templates]]`)**: discovers child contracts from factory events (`address`) or from events emitted by template clones (`from_template`), storing all clone events in shared `event_<template>_<Event>` tables.
+- **Full ABI decoding**: decodes static types, `string`, `bytes`, fixed and dynamic arrays, and Solidity `tuple` structs (both in event logs and `eth_call` single or multi-output returns, including signed `int*` values).
+- **APIs and webhooks**: REST endpoints (`/events`, `/sync_state`, `/balance`, `/user`, `/queries`, `/replay`, `/health`, `/metrics`), `/stream` SSE, GraphQL (`zgraphql` v0.8.0) with `contractCall` and `Subscription.newBlocks`, optional `Authorization: Bearer <api_token>` authentication, and a persistent SQLite webhook outbox (`webhook_outbox.db`).
 
----
-
-## Why zponder?
-
-| | `zponder` | Typical JS indexer |
-|---|---|---|
-| **Runtime** | Single static binary, native machine code | Node.js + Docker + npm deps |
-| **Handler scripts** | Embedded QuickJS — JS runs **inside** the Zig process | Separate process / VM |
-| **Startup** | ~instant, no container orchestration | minutes of toolchain setup |
-| **RPC cost** | Optional `eth_subscribe` live mode after catch-up | constant HTTP polling |
-| **Storage** | SQLite / RocksDB / PostgreSQL out of the box | bring-your-own |
-
-**One command to index:** write a handler, point at an RPC, go.
-
----
-
-## ✨ Key Features
-
-### 🚀 Indexing & Scripting
-- **Embedded QuickJS Engine** — native JS runtime for event handlers:
-  ```js
-  ponder.on("PancakePair:Swap", (event) => { /* event.args, event.block, event.transactionHash, event.logIndex */ });
-  ```
-- **Custom HTTP routes** — `ponder.http.get/post/use(...)` define your own API (Hono-style) right in handlers.
-- **Auto Handler Scanning** — drop `.js` / `.json` files into `./handlers/`, they just work.
-- **Multi-Contract Parallel Sync** — threaded per-contract loops with **reorg rollback** safety.
-- **WSS Live Subscribe** — after HTTP catch-up, switch to `eth_subscribe("logs")` and cut RPC cost ([docs/WSS.md](docs/WSS.md)).
-- **Async Webhook Queue** — non-blocking worker pool pushes event payloads to Telegram / Slack / your API.
-- **Auto ABI Fetch** — pull ABIs straight from Etherscan / BscScan / PolygonScan.
-
-### 💾 Storage & Resilience
-- **Multi-Backend** — SQLite (WAL + isolated `read_db` pool), RocksDB, or PostgreSQL.
-- **Multi-RPC Failover** — node rotation, retry, and circuit breaker built in.
-- **LRU Query Cache** — thread-safe, memory-bounded, block-aware TTL invalidation.
-- **State Tracking** — ERC-20 transfer & balance tracking out of the box.
-
-### 📡 APIs & Tooling
-- **GraphQL + Playground** — type-safe schema powered by `zgraphql`, with built-in IDE.
-- **REST + SSE Stream** — filtered logs, balances, health, metrics, real-time event stream.
-- **Declarative SQL Queries** — named, parameterized queries straight from `config.toml`.
-- **CLI** — `start`, `check`, `dev`, `add-script`, `init`, `install`, `version`.
-
----
-
-## 🚀 Quick Start
-
-### Install (choose one)
+## Install
 
 ```bash
-# npm (recommended, auto-selects platform binary)
+# Prebuilt binary via npm (SQLite backend, no external dynamic library dependencies)
 npm install -g zponder
 
-# or from source
-git clone https://github.com/chy3xyz/zponder.git && cd zponder && ./install.sh
+# Or build and install from source
+git clone https://github.com/chy3xyz/zponder.git
+cd zponder
+./install.sh
 ```
 
-### 构建矩阵（可选后端）
+### Build options
 
-RocksDB 与 PostgreSQL 是**可选构建特性**，默认都开启：
+RocksDB and PostgreSQL are compile-time options (both enabled by default):
 
-| 构建 | 命令 | 动态依赖 | 适用场景 |
-| :--- | :--- | :--- | :--- |
-| 默认 | `zig build -Doptimize=ReleaseFast` | sqlite3 + librocksdb + libpq | 需要三种后端，机器上已装 rocksdb / libpq 开发包 |
-| sqlite-only | `zig build -Doptimize=ReleaseFast -Drocksdb=false -Dpostgres=false` | sqlite3 | 发布/分发：干净机器上直接能跑 |
+| Build mode | Command | Dynamic libraries |
+|---|---|---|
+| Default (all backends) | `zig build -Doptimize=ReleaseFast` | `sqlite3`, `librocksdb`, `libpq` |
+| SQLite only (release binary) | `zig build -Doptimize=ReleaseFast -Drocksdb=false -Dpostgres=false` | `sqlite3` |
+| Disable RocksDB only | `zig build -Doptimize=ReleaseFast -Drocksdb=false` | `sqlite3`, `libpq` |
+| Disable PostgreSQL only | `zig build -Doptimize=ReleaseFast -Dpostgres=false` | `sqlite3`, `librocksdb` |
 
-npm 上的预编译二进制即 sqlite-only —— 此前它动态依赖 `librocksdb.11.dylib`
-（CI 的 brew rocksdb 版本）与 `libpq.5.dylib`，在没装这两个库的机器上启动就
-`dyld: Library not loaded`，等于不可用。关闭后端后，把它们当作
-`database.type` 使用会在启动时明确报错（`RocksDbSupportNotCompiled` /
-`PostgresSupportNotCompiled`），不会被静默忽略。
+When a backend is disabled at compile time, setting `database.type` to that backend fails at startup with `RocksDbSupportNotCompiled` or `PostgresSupportNotCompiled`.
 
-要自己带后端构建：
+## Quick start
 
 ```bash
-# 依赖：brew install rocksdb libpq   /   apt-get install librocksdb-dev libpq-dev
-zig build -Doptimize=ReleaseFast                          # 两者都开（默认）
-zig build -Doptimize=ReleaseFast -Drocksdb=false          # 只关 RocksDB
-zig build -Doptimize=ReleaseFast -Dpostgres=false         # 只关 PostgreSQL
-```
-
-### Index your first contract
-
-```bash
-zponder init          # interactive config wizard
-zponder add-script swap_alert   # generate a handler template in ./handlers/
+zponder init
+zponder add-script swap_alert
+zponder check -c config.toml
 zponder start -c config.toml
 ```
 
-That's it — blocks are flowing into SQLite, your JS handler is firing on every event,
-and you can query it all:
+Query indexed events over GraphQL:
 
 ```bash
-curl -X POST localhost:8081/graphql \
+curl -X POST http://localhost:8081/graphql \
   -H 'Content-Type: application/json' \
-  -d '{"query":"{ latestEvents(contract: \"uniswap_v2\", event: \"Swap\", limit: 5) { transactionHash fields { key value } } }"}'
+  -d '{"query":"{ latestEvents(contract: \"dai\", event: \"Transfer\", limit: 5) { blockNumber transactionHash contractAddress fields { key value } } }"}'
 ```
 
----
-
-## 🎯 Example: Whale Alert Handler
-
-Drop this in `./handlers/whale_alert.js` — `zponder` picks it up automatically:
+## Example handler (`./handlers/whale_alert.js`)
 
 ```javascript
 ponder.on("ERC20:Transfer", (event) => {
   const { from, to, value } = event.args;
-  // uint 参数是 hex 字符串，用 BigInt 解析；按 18 位小数、$1800/ETH 估算
-  const usd = Number(BigInt(value || "0x0")) / 1e18 * 1800;
+  const usd = (Number(BigInt(value || "0x0")) / 1e18) * 1800;
 
   if (usd >= 1_000_000) {
-    console.log(`🐋 Whale: ${from} → ${to} | $${usd.toLocaleString()} @ block ${event.block.number}`);
+    console.log(
+      `Whale transfer: ${from} -> ${to} ($${usd.toLocaleString()}) at block ${event.block.number} (${event.transactionHash}:${event.logIndex})`,
+    );
   }
 });
 ```
 
-Prefer declarative rules? Use a `.json` rule instead — no code required (webhook alerts to
-Telegram/Slack are declarative JSON rules). See [`examples/handlers/`](examples/handlers/).
+## Documentation
 
----
-
-## 🧱 Architecture at a Glance
-
-```
-┌─────────────┐    eth_getLogs / eth_subscribe    ┌──────────────┐
-│  RPC nodes  │ ────────────────────────────────► │  eth_rpc     │
-└─────────────┘                                    │  + ws_rpc    │
-                                                   └──────┬───────┘
-                                                          ▼
-                                              ┌─────────────────────┐
-                                              │ indexer (per-contract│
-                                              │  sync loop + reorg)  │
-                                              └──────┬──────┬────────┘
-                                                     ▼      ▼
-                                       ┌───────────────────────────┐
-                                       │ QuickJS / script engine   │
-                                       │  → webhook queue          │
-                                       └──────┬────────────┬───────┘
-                                              ▼            ▼
-                                     ┌────────────┐  ┌────────────┐
-                                     │ SQLite /   │  │ REST +     │
-                                     │ RocksDB /  │  │ GraphQL +  │
-                                     │ PostgreSQL │  │ SSE        │
-                                     └────────────┘  └────────────┘
-```
-
----
-
-## 📖 Documentation
-
-| Doc | Content |
-| :--- | :--- |
-| [docs/API.md](docs/API.md) | REST + GraphQL + SSE API reference |
-| [docs/WSS.md](docs/WSS.md) | WSS `eth_subscribe` live indexing & ops tips |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Layered architecture (EN / 中文) |
-| [docs/dev.md](docs/dev.md) | Design notes & config walkthrough |
-| [examples/](examples/) | Local Anvil demo & production handler examples |
-
-## 🧪 Testing
+Build the documentation site with [`zdoc`](https://github.com/chy3xyz/zdoc):
 
 ```bash
-zig build test    # 83 unit + integration tests
+zdoc docs docs --output public --force --strict
 ```
 
----
+- [docs/index.md](docs/index.md) — Documentation home
+- [docs/dev.md](docs/dev.md) — Configuration, CLI, JS handlers, projections, and templates
+- [docs/API.md](docs/API.md) — REST, SSE, and GraphQL API reference
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — Module layout, database schema, and data flow
+- [docs/WSS.md](docs/WSS.md) — WebSocket `eth_subscribe` live indexing
+- [docs/EVALUATION.md](docs/EVALUATION.md) — Engineering audit and resolved defects
+- [examples/](examples/) — Local Anvil demos and handler scripts
 
-<div align="center">
+## Testing
 
-Built with ❤️ in [Zig](https://ziglang.org) · MIT License
+```bash
+zig build test -Drocksdb=false -Dpostgres=false --summary all
+```
 
-</div>
+## License
+
+MIT
