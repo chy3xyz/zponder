@@ -1,0 +1,65 @@
+name: docs
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - '.github/workflows/docs.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+env:
+  ZDOC_VERSION: v0.17.0
+  ZDOC_SHA256: 7f1ceb21773739facf7d2d9edef226bf30fd9d56aee28c15d874f4e473fc9bd6
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install zdoc (${{ env.ZDOC_VERSION }})
+        run: |
+          curl -sSfL -o zdoc.tar.xz \
+            "https://github.com/chy3xyz/zdoc/releases/download/${ZDOC_VERSION}/x86_64-linux-musl.tar.xz"
+          echo "${ZDOC_SHA256}  zdoc.tar.xz" | sha256sum -c -
+          tar -xJf zdoc.tar.xz
+          ./zdoc version
+
+      - name: Build documentation site
+        run: ./zdoc docs docs --output public --force --strict
+
+      - if: github.event_name != 'pull_request'
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

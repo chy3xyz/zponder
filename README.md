@@ -5,6 +5,7 @@ EVM event indexer written in Zig 0.17.0. `zponder` indexes contract logs into SQ
 [![Release](https://img.shields.io/github/v/release/chy3xyz/zponder)](https://github.com/chy3xyz/zponder/releases)
 [![License: MIT](https://img.shields.io/github/license/chy3xyz/zponder)](LICENSE)
 [![CI](https://img.shields.io/github/actions/workflow/status/chy3xyz/zponder/test.yml)](https://github.com/chy3xyz/zponder/actions)
+[![Docs](https://img.shields.io/badge/docs-chy3xyz.github.io%2Fzponder-0f766e)](https://chy3xyz.github.io/zponder/)
 [![Zig](https://img.shields.io/badge/Zig-0.17.0-f7a41d?logo=zig&logoColor=white)](https://ziglang.org)
 
 ## Capabilities
@@ -77,7 +78,9 @@ ponder.on("ERC20:Transfer", (event) => {
 
 ## Documentation
 
-Build the documentation site with [`zdoc`](https://github.com/chy3xyz/zdoc):
+Published site: [https://chy3xyz.github.io/zponder/](https://chy3xyz.github.io/zponder/)
+
+Build the documentation site locally with [`zdoc`](https://github.com/chy3xyz/zdoc):
 
 ```bash
 zdoc docs docs --output public --force --strict
