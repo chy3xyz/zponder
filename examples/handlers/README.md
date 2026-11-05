@@ -26,6 +26,7 @@ ponder.on("ContractName:EventName", (event) => {
 - `event.block.number` and `event.block.timestamp` are numbers.
 - `event.contractAddress` is the emitting contract address (the specific clone address in template mode).
 - `event.transactionHash` and `event.logIndex` identify the log within its transaction; use `(transactionHash, logIndex)` as a primary key in projection tables.
+- `event.transaction.hash` and `event.log.logIndex` are Ponder-compatible aliases for the flat `event.transactionHash` and `event.logIndex` fields, respectively.
 - Handlers can match `"Contract:Event"` or the bare event name `"Event"`. If multiple scripts register the same key, the last registered handler wins.
 
 | File | Description |

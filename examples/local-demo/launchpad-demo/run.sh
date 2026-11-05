@@ -271,6 +271,36 @@ check_eq "A9 event_pair_Swap rows" 1 \
 check_eq "A10 event_pair_Swap 来自被发现的 pair 地址" "$PAIR" \
     "$(sqlite3 "$DB" "SELECT contract_address FROM event_pair_Swap LIMIT 1;")"
 
+# A11 — a live SSE log payload carries all three log identity/timestamp keys
+SSE_LOG=/tmp/zponder-launchpad-sse.log
+rm -f "$SSE_LOG"
+curl -sN --max-time 3 "http://127.0.0.1:${HTTP_PORT}/stream" >"$SSE_LOG" &
+SSE_CURL_PID=$!
+for _ in $(seq 1 20); do
+    grep -q '^event: connected' "$SSE_LOG" 2>/dev/null && break
+    sleep 0.05
+done
+send "${CURVES[0]}" "buy(uint256)" 1000000000000000000 >/dev/null
+wait "$SSE_CURL_PID" || true
+check_eq "A11 SSE payload has tx_hash/log_index/block_timestamp" 1 \
+    "$(sed -n 's/^data: //p' "$SSE_LOG" | jget 'import json,sys;rows=[json.loads(line) for line in sys.stdin if line.strip()];print(int(any(all(k in row for k in ("tx_hash","log_index","block_timestamp")) for row in rows)))')"
+
+# A12 — health is ready and every indexer exposes its block lag
+HEALTH=$(curl -s "http://127.0.0.1:${HTTP_PORT}/health")
+check_eq "A12a /health ready" "true" \
+    "$(echo "$HEALTH" | jget 'import json,sys;print(str(json.load(sys.stdin)["ready"]).lower())')"
+check_eq "A12b every /health indexer has lag_blocks" 1 \
+    "$(echo "$HEALTH" | jget 'import json,sys;d=json.load(sys.stdin);print(int(bool(d["indexers"]) and all("lag_blocks" in idx for idx in d["indexers"])))')"
+
+# A13 — running gauges use the contract label; dead letters remain exposed
+METRICS=$(curl -s "http://127.0.0.1:${HTTP_PORT}/metrics")
+check_eq "A13a curve running metric" 1 \
+    "$(echo "$METRICS" | grep -Fxc 'zponder_indexer_running{contract="curve"} 1' || true)"
+check_eq "A13b pair running metric" 1 \
+    "$(echo "$METRICS" | grep -Fxc 'zponder_indexer_running{contract="pair"} 1' || true)"
+check_eq "A13c dead-letter metric present" 1 \
+    "$(echo "$METRICS" | grep -c '^zponder_dead_letters ' || true)"
+
 echo ""
 echo -e "${GREEN}${BOLD}All assertions passed.${NC}"
 echo "  Inspect: sqlite3 demo.db \"SELECT contract_address, COUNT(*) FROM event_curve_Buy GROUP BY 1;\""

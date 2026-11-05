@@ -65,9 +65,16 @@
 
 ### Template mode (`[[templates]]`)
 
-- Config section `[[templates]]`: `name`, `abi_path`, `events`, `factory_name`,
-  `discovery_event`, `discovery_address_field`, `from_block`,
-  `poll_interval_ms`, `block_batch_size`, `max_addresses_per_request`. `[[factories]]`
+- Config section `[[templates]]`: `name`, `abi_path`, `abi_address`, `events`,
+  `filters`, `factory_name`, `discovery_event`, `discovery_address_field`,
+  `from_block`, `poll_interval_ms`, `block_batch_size`, `max_addresses_per_request`.
+  Optional `filters` use the same `"Event:field:op:value"` syntax as
+  `[[contracts]]` and apply to every event across the template's full address
+  set; individual clones cannot be filtered separately. When `abi_path` is empty
+  and `global.etherscan_api_key` is configured, optional `abi_address` names a
+  representative address whose ABI zponder fetches from Etherscan and caches.
+  For an EIP-1167 proxy, use the implementation address if Etherscan returns an
+  empty ABI for the proxy. `[[factories]]`
   gained `template_name`, which is **mutually exclusive** with `child_abi_path`.
   `discovery_event` / `discovery_address_field` are reserved and currently **not**
   used at runtime — dispatch follows the factory's `creation_event` /
@@ -82,7 +89,8 @@
   mutually exclusive; `from_template` requires `template_name`, forbids
   `child_abi_path` and cannot point at its own target. One source may carry
   several rules (`Indexer.factory_idxs` is a list); the source indexer must have
-  the `creation_event` in its `events` list to decode it.
+  the `creation_event` in its `events` list to decode it. Discovery semantics are
+  unchanged: a template source only feeds a template.
 - One `Indexer` holds a dynamic set of clone addresses; every clone's events go
   into one shared `event_{template}_{event}` table set. `LogFilter` accepts an
   **address array**, and the main sweep splits that array into chunks of at most

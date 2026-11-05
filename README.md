@@ -109,6 +109,9 @@ factory_name = "pair_discovery"
 from_block = 0
 ```
 
+- `[[templates]]` supports optional `filters`, using the same `"Event:field:op:value"` syntax as `[[contracts]]`. Filters apply to all events across the template's entire address set; they cannot filter individual clones separately.
+- Optional `abi_address` supplies a representative address for ABI discovery. When `abi_path` is empty and `global.etherscan_api_key` is configured, zponder fetches and caches that address's ABI from Etherscan. For an EIP-1167 proxy, use the implementation address if Etherscan returns an empty ABI for the proxy.
+
 ## Documentation
 
 Published site: [https://chy3xyz.github.io/zponder/](https://chy3xyz.github.io/zponder/)
