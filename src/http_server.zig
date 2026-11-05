@@ -308,10 +308,11 @@ fn buildEventCacheKey(
 /// 序列化一条 SSE 事件的 `data:` 载荷（不含 `event:` 前缀与结尾空行）。
 /// `contract_address` 与事件表列名一致（REST `/events` 返回的行也是这个键）。
 fn writeSsePayload(w: *std.Io.Writer, ev: *const eb.Event) !void {
-    try w.print("{{\"contract\":\"{s}\",\"contract_address\":\"{s}\",\"block_number\":{d},\"tx_hash\":\"{s}\",\"log_index\":{d},\"fields\":{{", .{
+    try w.print("{{\"contract\":\"{s}\",\"contract_address\":\"{s}\",\"block_number\":{d},\"block_timestamp\":{d},\"tx_hash\":\"{s}\",\"log_index\":{d},\"fields\":{{", .{
         ev.contract_name,
         ev.contract_address,
         ev.block_number,
+        ev.block_timestamp,
         ev.tx_hash,
         ev.log_index,
     });
@@ -983,8 +984,10 @@ pub const Server = struct {
         try self.sendJson(request, buf.items, .ok);
     }
 
-    fn lag(idx: *indexer.Indexer) u64 {
+    fn lag(idx: *indexer.Indexer) ?u64 {
         const tip = idx.last_tip.load(.monotonic);
+        // Indexer 的 last_tip 是 u64，0 是这里唯一能识别的“尚无 tip”哨兵。
+        if (tip == 0) return null;
         const cur = idx.getCurrentBlock();
         return if (tip > cur) tip - cur else 0;
     }
@@ -1036,12 +1039,15 @@ pub const Server = struct {
         }
 
         for (self.indexers) |idx| {
-            const status_str = switch (idx.getStatus()) {
+            const status = idx.getStatus();
+            const status_str = switch (status) {
                 .running => @as(u8, 1),
                 .stopped => @as(u8, 0),
                 .error_state => @as(u8, 2),
                 .replaying => @as(u8, 3),
             };
+            const current_block = idx.getCurrentBlock();
+            const lag_blocks = lag(idx) orelse 0;
             try buf.writer.print(
                 "# HELP zponder_indexer_current_block 索引器当前区块\n" ++
                 "# TYPE zponder_indexer_current_block gauge\n" ++
@@ -1051,8 +1057,18 @@ pub const Server = struct {
                 "zponder_indexer_status{{contract=\"{s}\"}} {d}\n" ++
                 "# HELP zponder_indexer_lag 同步滞后块数（tip - 当前）\n" ++
                 "# TYPE zponder_indexer_lag gauge\n" ++
-                "zponder_indexer_lag{{contract=\"{s}\"}} {d}\n",
-                .{ idx.contract.name, idx.getCurrentBlock(), idx.contract.name, status_str, idx.contract.name, lag(idx) },
+                "zponder_indexer_lag{{contract=\"{s}\"}} {d}\n" ++
+                // 只新增 running；标签沿用既有的 contract，不再另起一套 name 标签
+                // （否则同一指标会出现 contract=/name= 两条重复序列）。
+                "# HELP zponder_indexer_running 索引器是否正在运行\n" ++
+                "# TYPE zponder_indexer_running gauge\n" ++
+                "zponder_indexer_running{{contract=\"{s}\"}} {d}\n",
+                .{
+                    idx.contract.name, current_block,
+                    idx.contract.name, status_str,
+                    idx.contract.name, lag_blocks,
+                    idx.contract.name, @intFromBool(status == .running),
+                },
             );
         }
 
@@ -1073,8 +1089,12 @@ pub const Server = struct {
         defer buf.deinit();
 
         const cache_stats = self.cache.stats();
+        var ready = true;
+        for (self.indexers) |idx| {
+            if (idx.getStatus() != .running) ready = false;
+        }
 
-        try buf.writer.print("{{\"status\":\"ok\",\"dead_letters\":{d},\"indexers\":[", .{self.database.countRawLogs() catch 0});
+        try buf.writer.print("{{\"status\":\"ok\",\"ready\":{},\"dead_letters\":{d},\"indexers\":[", .{ ready, self.database.countRawLogs() catch 0 });
         for (self.indexers, 0..) |idx, i| {
             if (i > 0) try buf.writer.writeByte(',');
             const status_str = switch (idx.getStatus()) {
@@ -1084,9 +1104,14 @@ pub const Server = struct {
                 .replaying => "replaying",
             };
             try buf.writer.print(
-                "{{\"name\":\"{s}\",\"current_block\":{d},\"status\":\"{s}\"}}",
+                "{{\"name\":\"{s}\",\"current_block\":{d},\"status\":\"{s}\",\"lag_blocks\":",
                 .{ idx.contract.name, idx.getCurrentBlock(), status_str },
             );
+            if (lag(idx)) |lag_blocks| {
+                try buf.writer.print("{d}}}", .{lag_blocks});
+            } else {
+                try buf.writer.writeAll("null}");
+            }
         }
         try buf.writer.print(
             "],\"cache\":{{\"entries\":{d},\"bytes\":{d}}}}}",
@@ -1803,7 +1828,56 @@ test "?address= 解析结果透传到 queryEventLogs" {
     try std.testing.expect(std.mem.indexOf(u8, json_str, "0xA") == null);
 }
 
-test "SSE 载荷含 contract_address 与 tx_hash/log_index" {
+fn httpBodyForTest(alloc: std.mem.Allocator, io: std.Io, srv: *Server, target: []const u8) ![]u8 {
+    const addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var listener = try addr.listen(io, .{});
+    defer listener.deinit(io);
+
+    srv.running.store(true, .monotonic);
+    const worker = try std.Thread.spawn(.{}, struct {
+        fn run(listen: *std.Io.net.Server, http: *Server) void {
+            const stream = listen.accept(http.io) catch return;
+            http.handleConnection(stream);
+        }
+    }.run, .{ &listener, srv });
+    var worker_live = true;
+    defer if (worker_live) worker.join();
+
+    const client_addr: std.Io.net.IpAddress = .{ .ip4 = .loopback(listener.socket.address.getPort()) };
+    const client = try client_addr.connect(io, .{ .mode = .stream });
+    var client_live = true;
+    defer if (client_live) client.close(io);
+
+    var request_buf: [1024]u8 = undefined;
+    const request = try std.fmt.bufPrint(&request_buf, "GET {s} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", .{target});
+    var write_buf: [1024]u8 = undefined;
+    var writer = client.writer(io, &write_buf);
+    try writer.interface.writeAll(request);
+    try writer.interface.flush();
+
+    var response: std.ArrayList(u8) = .empty;
+    defer response.deinit(alloc);
+    var read_buf: [4096]u8 = undefined;
+    while (true) {
+        const n = std.c.recv(client.socket.handle, read_buf[0..].ptr, read_buf.len, 0);
+        if (n == 0) break;
+        if (n < 0) {
+            if (std.c.errno(n) == .INTR) continue;
+            return error.HttpReadFailed;
+        }
+        try response.appendSlice(alloc, read_buf[0..@intCast(n)]);
+    }
+
+    client.close(io);
+    client_live = false;
+    worker.join();
+    worker_live = false;
+
+    const body_start = std.mem.indexOf(u8, response.items, "\r\n\r\n") orelse return error.HttpResponseMissingBody;
+    return alloc.dupe(u8, response.items[body_start + 4 ..]);
+}
+
+test "SSE 载荷含 block_timestamp 与 tx_hash/log_index" {
     const alloc = std.testing.allocator;
     const fields = [_]db.DecodedField{ .{ .name = "value", .value = "1" }, .{ .name = "to", .value = "0xBB" } };
     const ev = eb.Event{
@@ -1822,7 +1896,113 @@ test "SSE 载荷含 contract_address 与 tx_hash/log_index" {
     try writeSsePayload(&out.writer, &ev);
 
     try std.testing.expectEqualStrings(
-        "{\"contract\":\"curve\",\"contract_address\":\"0xCLONE\",\"block_number\":5,\"tx_hash\":\"0xTX\",\"log_index\":4,\"fields\":{\"value\":\"1\",\"to\":\"0xBB\"}}",
+        "{\"contract\":\"curve\",\"contract_address\":\"0xCLONE\",\"block_number\":5,\"block_timestamp\":1700000123,\"tx_hash\":\"0xTX\",\"log_index\":4,\"fields\":{\"value\":\"1\",\"to\":\"0xBB\"}}",
         out.written(),
     );
+}
+
+test "health 与 metrics 暴露索引器就绪状态和同步滞后" {
+    const alloc = std.testing.allocator;
+    var backend = std.Io.Threaded.init(alloc, .{});
+    defer backend.deinit();
+    const io = backend.io();
+
+    const db_cfg = db.DatabaseConfig{ .db_type = "sqlite", .db_name = ":memory:", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var database = try db.Client.init(alloc, &db_cfg);
+    defer database.deinit();
+    try database.migrate();
+    try database.insertRawLog("0xa", 100, "0xdead", 0, "[]", "0x", "测试死信", "0xa");
+
+    var query_cache = cache.Cache.init(alloc, 16, 1024);
+    defer query_cache.deinit();
+    var bus = eb.EventBus.init(alloc);
+    defer bus.deinit();
+
+    const rpc_cfg = config.RpcConfig{
+        .url = "http://127.0.0.1:1",
+        .retry_count = 0,
+        .retry_delay_ms = 0,
+        .request_timeout_ms = 0,
+        .max_concurrent = 1,
+    };
+    var rpc = @import("eth_rpc.zig").Client.init(alloc, io, &rpc_cfg);
+    defer rpc.deinit();
+
+    const alpha_cfg = config.ContractConfig{
+        .name = "alpha",
+        .address = "0xa",
+        .abi_path = "",
+        .events = &.{},
+        .from_block = 0,
+        .start_block = null,
+        .poll_interval_ms = null,
+        .max_reorg_depth = null,
+        .block_batch_size = null,
+        .filters = &.{},
+    };
+    const beta_cfg = config.ContractConfig{
+        .name = "beta",
+        .address = "0xb",
+        .abi_path = "",
+        .events = &.{},
+        .from_block = 0,
+        .start_block = null,
+        .poll_interval_ms = null,
+        .max_reorg_depth = null,
+        .block_batch_size = null,
+        .filters = &.{},
+    };
+    var indexers: [2]indexer.Indexer = undefined;
+    for (&indexers, [_]*const config.ContractConfig{ &alpha_cfg, &beta_cfg }) |*idx, contract_cfg| {
+        idx.contract = contract_cfg;
+        idx.rpc = &rpc;
+        idx.state = std.atomic.Value(indexer.IndexerState).init(.running);
+    }
+    indexers[0].current_block = std.atomic.Value(u64).init(100);
+    indexers[0].last_tip = std.atomic.Value(u64).init(105);
+    indexers[1].current_block = std.atomic.Value(u64).init(90);
+    indexers[1].last_tip = std.atomic.Value(u64).init(80);
+    var indexer_ptrs = [_]*indexer.Indexer{ &indexers[0], &indexers[1] };
+
+    var http_cfg = config.HttpConfig{
+        .host = "127.0.0.1",
+        .port = 0,
+        .read_timeout_ms = 0,
+        .write_timeout_ms = 0,
+        .max_body_size = 1024,
+        .cors_origins = &.{},
+        .rate_limit_rps = null,
+        .rate_limit_burst = null,
+        .api_token = "",
+    };
+    var srv = Server.init(alloc, io, &http_cfg, &database, &query_cache, &indexer_ptrs, &.{}, &.{}, &bus, null);
+    defer srv.deinit();
+
+    const ready_body = try httpBodyForTest(alloc, io, &srv, "/health");
+    defer alloc.free(ready_body);
+    try std.testing.expectEqualStrings(
+        "{\"status\":\"ok\",\"ready\":true,\"dead_letters\":1,\"indexers\":[{\"name\":\"alpha\",\"current_block\":100,\"status\":\"running\",\"lag_blocks\":5},{\"name\":\"beta\",\"current_block\":90,\"status\":\"running\",\"lag_blocks\":0}],\"cache\":{\"entries\":0,\"bytes\":0}}",
+        ready_body,
+    );
+
+    indexers[1].state.store(.stopped, .monotonic);
+    indexers[1].last_tip.store(0, .monotonic);
+    const not_ready_body = try httpBodyForTest(alloc, io, &srv, "/health");
+    defer alloc.free(not_ready_body);
+    try std.testing.expectEqualStrings(
+        "{\"status\":\"ok\",\"ready\":false,\"dead_letters\":1,\"indexers\":[{\"name\":\"alpha\",\"current_block\":100,\"status\":\"running\",\"lag_blocks\":5},{\"name\":\"beta\",\"current_block\":90,\"status\":\"stopped\",\"lag_blocks\":null}],\"cache\":{\"entries\":0,\"bytes\":0}}",
+        not_ready_body,
+    );
+
+    const metrics_body = try httpBodyForTest(alloc, io, &srv, "/metrics");
+    defer alloc.free(metrics_body);
+    try std.testing.expect(std.mem.indexOf(u8, metrics_body, "zponder_indexer_current_block{contract=\"alpha\"} 100\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics_body, "zponder_indexer_lag{contract=\"alpha\"} 5\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics_body, "zponder_indexer_running{contract=\"alpha\"} 1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics_body, "zponder_indexer_current_block{contract=\"beta\"} 90\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics_body, "zponder_indexer_lag{contract=\"beta\"} 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics_body, "zponder_indexer_running{contract=\"beta\"} 0\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, metrics_body, "zponder_dead_letters 1\n") != null);
+    // 不允许再出现 name= 标签的重复序列
+    try std.testing.expect(std.mem.indexOf(u8, metrics_body, "{name=") == null);
 }
