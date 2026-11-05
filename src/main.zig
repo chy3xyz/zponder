@@ -314,9 +314,22 @@ pub fn main(init: std.process.Init) !void {
     defer rpc_pool.deinit();
     for (cfg.chains, rpc_pool.clients) |ch, *client| {
         log.info("链 {s}: {s}", .{ ch.name, client.config.url });
-        const latest_block = client.getBlockNumber() catch |e| {
-            log.warn("链 {s} RPC 连接测试失败: {any}，继续启动", .{ ch.name, e });
-            continue;
+        const latest_block = blk: {
+            var retry_count: u3 = 0;
+            while (true) {
+                const block_number = client.getBlockNumber() catch |e| {
+                    if (retry_count == 4) {
+                        log.err("链 {s} RPC 连接测试在 4 次重试后仍失败: {any}，启动中止", .{ ch.name, e });
+                        return e;
+                    }
+                    const delay_seconds = @as(u64, 1) << @intCast(retry_count);
+                    retry_count += 1;
+                    log.warn("链 {s} RPC 连接测试失败: {any}，{d} 秒后进行第 {d}/4 次重试", .{ ch.name, e, delay_seconds, retry_count });
+                    try std.Io.sleep(init.io, .fromSeconds(@as(i64, @intCast(delay_seconds))), .awake);
+                    continue;
+                };
+                break :blk block_number;
+            }
         };
         if (latest_block > 0) log.info("链 {s} 连接成功，最新区块: {d}", .{ ch.name, latest_block });
     }
@@ -461,6 +474,9 @@ pub fn main(init: std.process.Init) !void {
         for (indexers.items) |*idx| idx.deinit();
         indexers.deinit(alloc);
     }
+    // 启动失败 unwind 也要先停子索引器；这个 defer 后注册，故先于主索引器 join 执行。
+    // 正常退出路径的 stopChildren 可重复调用，之后的 fm.deinit 仍负责 join 与释放。
+    defer if (factory_manager) |*fm| fm.stopChildren();
 
     // ponder.db 必须在加载 handler 前注入：脚本顶层常以 ponder.db 建投影表
     js_eng.setDb(&database);
@@ -581,6 +597,92 @@ pub fn main(init: std.process.Init) !void {
 // ============================================================================
 // check — 校验配置与环境
 // ============================================================================
+
+/// 与 HTTP 自定义查询一致，把 `$参数名` 转成后端的位置占位符。
+fn translateConfiguredQuerySql(alloc: std.mem.Allocator, query: *const config.QueryConfig, backend_type: db.BackendType) ![]u8 {
+    var translated: std.ArrayList(u8) = .empty;
+    errdefer translated.deinit(alloc);
+
+    var i: usize = 0;
+    while (i < query.sql.len) {
+        if (query.sql[i] == '$' and i + 1 < query.sql.len) {
+            const rest_sql = query.sql[i + 1 ..];
+            for (query.params, 0..) |param, param_idx| {
+                if (param.name.len == 0 or !std.mem.startsWith(u8, rest_sql, param.name)) continue;
+                const after = i + 1 + param.name.len;
+                if (after < query.sql.len and (std.ascii.isAlphanumeric(query.sql[after]) or query.sql[after] == '_')) continue;
+                if (backend_type == .postgresql) {
+                    try translated.print(alloc, "${d}", .{param_idx + 1});
+                } else {
+                    try translated.append(alloc, '?');
+                }
+                i += 1 + param.name.len;
+                break;
+            } else {
+                try translated.append(alloc, query.sql[i]);
+                i += 1;
+            }
+        } else {
+            try translated.append(alloc, query.sql[i]);
+            i += 1;
+        }
+    }
+    return translated.toOwnedSlice(alloc);
+}
+
+/// 只准备语句，不 step / execute，避免 check 读出真实数据或产生写入副作用。
+fn validateConfiguredQueries(alloc: std.mem.Allocator, database: *db.Client, queries: []const config.QueryConfig) !void {
+    const c = @import("c");
+    for (queries) |*query| {
+        if (database.backend_type == .rocksdb) return error.UnsupportedOperation;
+        const sql = try translateConfiguredQuerySql(alloc, query, database.backend_type);
+        defer alloc.free(sql);
+
+        switch (database.backend_type) {
+            .sqlite => {
+                const connection = database.getReadDb();
+                var stmt: ?*c.sqlite3_stmt = null;
+                if (c.sqlite3_prepare_v2(connection, sql.ptr, @intCast(sql.len), &stmt, null) != c.SQLITE_OK) {
+                    log.err("查询 {s} SQL 准备失败: {s}", .{ query.name, std.mem.sliceTo(c.sqlite3_errmsg(connection), 0) });
+                    return error.PrepareFailed;
+                }
+                if (stmt == null) {
+                    log.err("查询 {s} SQL 为空", .{query.name});
+                    return error.PrepareFailed;
+                }
+                defer _ = c.sqlite3_finalize(stmt);
+                const placeholder_count = c.sqlite3_bind_parameter_count(stmt);
+                if (placeholder_count < 0 or @as(usize, @intCast(placeholder_count)) != query.params.len) {
+                    log.err("查询 {s} 参数个数不符: SQL 占位符 {d} 个，配置声明 {d} 个", .{ query.name, placeholder_count, query.params.len });
+                    return error.QueryParamMismatch;
+                }
+            },
+            .postgresql => {
+                if (comptime build_options.postgres) {
+                    const sql_z = try alloc.allocSentinel(u8, sql.len, 0);
+                    defer alloc.free(sql_z);
+                    @memcpy(sql_z, sql);
+                    const result = c.PQprepare(database.pgconn.?.conn, "", sql_z.ptr, @intCast(query.params.len), null);
+                    if (result == null) return error.PrepareFailed;
+                    defer c.PQclear(result);
+                    if (c.PQresultStatus(result) != c.PGRES_COMMAND_OK) {
+                        log.err("查询 {s} PostgreSQL SQL 准备失败: {s}", .{ query.name, std.mem.sliceTo(c.PQresultErrorMessage(result), 0) });
+                        return error.PrepareFailed;
+                    }
+                    const placeholder_count = c.PQnparams(result);
+                    if (placeholder_count < 0 or @as(usize, @intCast(placeholder_count)) != query.params.len) {
+                        log.err("查询 {s} 参数个数不符: SQL 占位符 {d} 个，配置声明 {d} 个", .{ query.name, placeholder_count, query.params.len });
+                        return error.QueryParamMismatch;
+                    }
+                } else {
+                    return error.PostgresSupportNotCompiled;
+                }
+            },
+            .rocksdb => unreachable,
+        }
+    }
+}
+
 fn cmdCheck(alloc: std.mem.Allocator, io: std.Io, config_path: []const u8) !void {
     try log.init(alloc, io, "info", null);
     defer log.deinit(alloc, io);
@@ -632,6 +734,12 @@ fn cmdCheck(alloc: std.mem.Allocator, io: std.Io, config_path: []const u8) !void
     };
     defer resolved.deinit();
     log.info("✓ [4/4] 所有 {d} 个合约 ABI 解析正常", .{resolved.contracts.len});
+
+    validateConfiguredQueries(alloc, &database, cfg.queries) catch |err| {
+        log.err("✗ [4/4] [[queries]] SQL 干跑校验失败: {any}", .{err});
+        return error.CheckFailed;
+    };
+    if (cfg.queries.len > 0) log.info("✓ [4/4] {d} 条自定义查询 SQL 准备校验通过（未取数）", .{cfg.queries.len});
 
     log.info("🎉 校验全部完成，系统具备启动条件！", .{});
 }
@@ -720,20 +828,16 @@ fn cmdAddScript(alloc: std.mem.Allocator, io: std.Io, name: []const u8, is_json:
         \\ * 由 `zponder add-script` 自动生成
         \\ */
         \\
-        \\ponder.on("PancakePair:Swap", async ({{ event, context }}) => {{
+        \\ponder.on("PancakePair:Swap", async (event) => {{
         \\  const {{ sender, amount0In, amount1Out }} = event.args;
         \\  const blockNumber = event.block.number;
         \\
         \\  console.log(`[{s}] Event triggered at block #${{blockNumber}} | Sender: ${{sender}}`);
         \\
-        \\  // 示例 1: 异步 Webhook POST 通知
-        \\  // await context.webhook.post("http://127.0.0.1:3000/api/alerts", {{ sender, blockNumber }});
-        \\
-        \\  // 示例 2: SSE 实时长连接推流至 Web 前端大屏
-        \\  // context.sse.broadcast({{ type: "{s}_EVENT", sender, blockNumber }});
+        \\  // 业务投影写法见 examples/handlers/erc20_projection.js（ponder.db.exec / query）。
         \\}});
         \\
-    , .{ name, name, name });
+    , .{ name, name });
     defer alloc.free(content);
 
     const file = std.Io.Dir.cwd().createFile(io, filename, .{}) catch |err| {
@@ -1312,4 +1416,26 @@ test "启动顺序: RocksDB 校验早于任何索引器启动（携转约束 2 �
     var probe_ok = StartupProbe{};
     try validateThenStartIndexers(&sqlite, &probe_ok, StartupProbe.startOne, 3);
     try std.testing.expectEqual(@as(usize, 3), probe_ok.starts);
+}
+
+test "check 查询干跑: SQLite 准备阶段拒绝错误列名" {
+    const alloc = std.testing.allocator;
+    var cfg = try config.loadFromString(alloc,
+        \\[database]
+        \\type = "sqlite"
+        \\db_name = ":memory:"
+        \\[[queries]]
+        \\name = "broken"
+        \\path = "/queries/broken"
+        \\sql = "SELECT missing_column FROM sync_state"
+        \\params = []
+        \\
+    );
+    defer cfg.deinit(alloc);
+
+    var database = try db.Client.init(alloc, &cfg.database);
+    defer database.deinit();
+    try database.migrate();
+
+    try std.testing.expectError(error.PrepareFailed, validateConfiguredQueries(alloc, &database, cfg.queries));
 }
