@@ -337,6 +337,12 @@ pub fn main(init: std.process.Init) !void {
     // 7. 初始化索引器
     // 模板的合成 ContractConfig 必须比索引器活得久（Indexer 只存指针），故在 indexers
     // 之前声明：defer 先注册后执行 → 先停/释索引器，再释放模板配置（顺序颠倒会 UAF）。
+    // 自动获取的缓存路径由独立列表持有；其余字段仍借用 cfg，不能逐个 deinit 合成配置。
+    var template_abi_paths: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (template_abi_paths.items) |path| alloc.free(path);
+        template_abi_paths.deinit(alloc);
+    }
     var template_contracts: std.ArrayList(config.ContractConfig) = .empty;
     defer template_contracts.deinit(alloc);
 
@@ -378,17 +384,44 @@ pub fn main(init: std.process.Init) !void {
         // 先把所有模板配置装进 template_contracts（此后不再 append，元素地址才稳定），
         // 再逐个建索引器——索引器只存 `*const ContractConfig`，指向数组元素。
         for (cfg.templates) |t| {
+            const selection = selectTemplateAbi(t.abi_path, t.abi_address, cfg.global.etherscan_api_key) catch |e| {
+                log.err("模板 {s} ABI 配置无效: {any}", .{ t.name, e });
+                return e;
+            };
+            const abi_path = switch (selection) {
+                .existing_path => |path| path,
+                .fetch_address => |address| fetch: {
+                    // EIP-1167 clone 通常可由代表地址取得实现 ABI；若浏览器返回代理空 ABI，
+                    // abi_address 应改填实现合约地址。
+                    const chain = etherscan.Chain.fromString(cfg.global.chain) orelse .ethereum;
+                    const abi_json = etherscan.fetchAbi(alloc, init.io, chain, cfg.global.etherscan_api_key, address) catch |e| {
+                        log.err("获取模板 {s} 的代表地址 {s} ABI 失败: {any}", .{ t.name, address, e });
+                        return e;
+                    };
+                    defer alloc.free(abi_json);
+                    const cached_path = etherscan.cacheAbi(alloc, init.io, t.name, abi_json) catch |e| {
+                        log.err("缓存模板 {s} ABI 失败: {any}", .{ t.name, e });
+                        return e;
+                    };
+                    template_abi_paths.append(alloc, cached_path) catch |e| {
+                        alloc.free(cached_path);
+                        return e;
+                    };
+                    log.info("模板 {s}: ABI 已获取 → {s}", .{ t.name, cached_path });
+                    break :fetch cached_path;
+                },
+            };
             try template_contracts.append(alloc, .{
                 .name = t.name,
                 .address = "",
-                .abi_path = t.abi_path,
+                .abi_path = abi_path,
                 .events = t.events,
                 .from_block = t.from_block,
                 .start_block = null,
                 .poll_interval_ms = t.poll_interval_ms,
                 .max_reorg_depth = null,
                 .block_batch_size = t.block_batch_size,
-                .filters = &.{},
+                .filters = t.filters,
             });
         }
         const template_base = indexers.items.len;
@@ -413,7 +446,7 @@ pub fn main(init: std.process.Init) !void {
             const idx_ptr = &indexers.items[indexers.items.len - 1];
             // 硬约束：先 setTemplateMode(true) 再 loadTemplateAddresses()（携转约束 1）
             try enableTemplateRuntime(idx_ptr, t.name, t.max_addresses_per_request);
-            log.info("模板索引器: {s} (abi={s}) 起始={d} 事件={d}", .{ t.name, t.abi_path, t.from_block, t.events.len });
+            log.info("模板索引器: {s} (abi={s}) 起始={d} 事件={d}", .{ t.name, tc.abi_path, t.from_block, t.events.len });
         }
         // 全部 append 完成后才取指针（ArrayList 增长会搬移元素）
         for (cfg.templates, 0..) |t, ti| {
@@ -1050,6 +1083,17 @@ const ResolvedConfig = struct {
     }
 };
 
+const TemplateAbiSelection = union(enum) {
+    existing_path: []const u8,
+    fetch_address: []const u8,
+};
+
+fn selectTemplateAbi(abi_path: []const u8, abi_address: []const u8, etherscan_api_key: []const u8) error{TemplateAbiUnavailable}!TemplateAbiSelection {
+    if (abi_path.len > 0) return .{ .existing_path = abi_path };
+    if (abi_address.len == 0 or etherscan_api_key.len == 0) return error.TemplateAbiUnavailable;
+    return .{ .fetch_address = abi_address };
+}
+
 /// ABI 是硬依赖而非可选装饰：Indexer 拿不到 ABI 时既不建事件表，`processLog`
 /// 也会整条跳过该合约的所有日志（连 raw_logs 死信表都不写）——"只 WARN 然后继续"
 /// 等于静默丢数据，而且 `check` 仍会报"ABI 解析正常"。故 start / check 两个入口
@@ -1142,6 +1186,24 @@ fn resolveEvents(alloc: std.mem.Allocator, io: std.Io, cfg: *const config.Config
     }
 
     return .{ .contracts = resolved, .owned = owned, .alloc = alloc };
+}
+
+test "模板 ABI 选择: 显式路径优先，缺参报错，齐备时选择自动获取" {
+    const direct = try selectTemplateAbi("./abis/curve.abi", "0xclone", "");
+    switch (direct) {
+        .existing_path => |path| try std.testing.expectEqualStrings("./abis/curve.abi", path),
+        .fetch_address => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectError(error.TemplateAbiUnavailable, selectTemplateAbi("", "", ""));
+    try std.testing.expectError(error.TemplateAbiUnavailable, selectTemplateAbi("", "0xclone", ""));
+    try std.testing.expectError(error.TemplateAbiUnavailable, selectTemplateAbi("", "", "test-key"));
+
+    const automatic = try selectTemplateAbi("", "0xclone", "test-key");
+    switch (automatic) {
+        .existing_path => return error.TestUnexpectedResult,
+        .fetch_address => |address| try std.testing.expectEqualStrings("0xclone", address),
+    }
 }
 
 // ============================================================================

@@ -175,6 +175,8 @@ pub const FactoryConfig = struct {
 pub const TemplateConfig = struct {
     name: []const u8,
     abi_path: []const u8,
+    /// abi_path 为空时，用该代表地址从 etherscan 获取 ABI。
+    abi_address: []const u8 = "",
     events: []const []const u8,
     factory_name: []const u8,
     discovery_event: []const u8,
@@ -182,6 +184,7 @@ pub const TemplateConfig = struct {
     from_block: u64,
     poll_interval_ms: ?u32,
     block_batch_size: ?u32,
+    filters: []const EventFilter = &.{},
     /// 主 sweep 单次 `eth_getLogs` 携带的最大 clone 地址数（null = 运行期默认值，
     /// 见 `Indexer.setMaxAddressesPerRequest`）。地址数达数千时必须分块，
     /// 否则一次请求必然超 RPC 上限。
@@ -190,11 +193,14 @@ pub const TemplateConfig = struct {
     fn deinit(self: *const TemplateConfig, alloc: std.mem.Allocator) void {
         alloc.free(self.name);
         alloc.free(self.abi_path);
+        alloc.free(self.abi_address);
         for (self.events) |e| alloc.free(e);
         alloc.free(self.events);
         alloc.free(self.factory_name);
         alloc.free(self.discovery_event);
         alloc.free(self.discovery_address_field);
+        for (self.filters) |*f| f.deinit(alloc);
+        alloc.free(self.filters);
     }
 };
 
@@ -815,6 +821,7 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
                 current_template = TemplateConfig{
                     .name = try alloc.dupe(u8, ""),
                     .abi_path = try alloc.dupe(u8, ""),
+                    .abi_address = try alloc.dupe(u8, ""),
                     .events = try alloc.alloc([]const u8, 0),
                     .factory_name = try alloc.dupe(u8, ""),
                     .discovery_event = try alloc.dupe(u8, ""),
@@ -822,6 +829,7 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
                     .from_block = 0,
                     .poll_interval_ms = null,
                     .block_batch_size = null,
+                    .filters = &.{},
                     .max_addresses_per_request = null,
                 };
             } else {
@@ -878,6 +886,9 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
             } else if (std.mem.eql(u8, key, "abi_path")) {
                 if (ct.abi_path.len > 0) alloc.free(ct.abi_path);
                 ct.abi_path = try unquote(alloc, value);
+            } else if (std.mem.eql(u8, key, "abi_address")) {
+                if (ct.abi_address.len > 0) alloc.free(ct.abi_address);
+                ct.abi_address = try unquote(alloc, value);
             } else if (std.mem.eql(u8, key, "events")) {
                 ct.events = try parseEvents(alloc, value);
             } else if (std.mem.eql(u8, key, "factory_name")) {
@@ -891,6 +902,8 @@ pub fn loadFromString(alloc: std.mem.Allocator, content: []const u8) !Config {
                 ct.discovery_address_field = try unquote(alloc, value);
             } else if (std.mem.eql(u8, key, "from_block")) {
                 ct.from_block = try parseU64(value);
+            } else if (std.mem.eql(u8, key, "filters")) {
+                ct.filters = try parseFilters(alloc, value);
             } else if (std.mem.eql(u8, key, "poll_interval_ms")) {
                 ct.poll_interval_ms = try parseU32(value);
             } else if (std.mem.eql(u8, key, "block_batch_size")) {
@@ -1447,8 +1460,8 @@ pub fn validate(cfg: *const Config) !void {
                 break;
             }
         }
-        if (t.abi_path.len == 0) {
-            log.err("配置错误: 模板 {s} 的 abi_path 不能为空", .{t.name});
+        if (t.abi_path.len == 0 and (t.abi_address.len == 0 or cfg.global.etherscan_api_key.len == 0)) {
+            log.err("配置错误: 模板 {s} 缺少 abi_path，且 abi_address 与 etherscan_api_key 未同时配置", .{t.name});
             errors += 1;
         }
         for (cfg.contracts) |c| {
@@ -2262,6 +2275,48 @@ test "config factories from_template 解析与校验" {
         defer cfg.deinit(alloc);
         try std.testing.expectError(error.InvalidConfig, validate(&cfg));
     }
+}
+
+test "config templates 解析 filters 与 abi_address" {
+    const alloc = std.testing.allocator;
+    var cfg = try loadTemplateFixture(alloc, "",
+        \\abi_address = "0x1111111111111111111111111111111111111111"
+        \\filters = ["Buy:amount:gte:100", "Sell:amount:lt:500"]
+    );
+    defer cfg.deinit(alloc);
+
+    try std.testing.expectEqualStrings("0x1111111111111111111111111111111111111111", cfg.templates[0].abi_address);
+    try std.testing.expectEqual(@as(usize, 2), cfg.templates[0].filters.len);
+    try std.testing.expectEqualStrings("Buy", cfg.templates[0].filters[0].event);
+    try std.testing.expectEqualStrings("amount", cfg.templates[0].filters[0].field);
+    try std.testing.expectEqualStrings("gte", cfg.templates[0].filters[0].op);
+    try std.testing.expectEqualStrings("100", cfg.templates[0].filters[0].value);
+    try std.testing.expectEqualStrings("Sell", cfg.templates[0].filters[1].event);
+
+    var defaults = try loadTemplateFixture(alloc, "", "");
+    defer defaults.deinit(alloc);
+    try std.testing.expectEqualStrings("", defaults.templates[0].abi_address);
+    try std.testing.expectEqual(@as(usize, 0), defaults.templates[0].filters.len);
+}
+
+test "config validate: 模板仅在 abi_address 与 etherscan key 齐备时允许省略 abi_path" {
+    const alloc = std.testing.allocator;
+
+    var no_key = try loadTemplateFixture(alloc, "", "abi_path = \"\"\nabi_address = \"0x1111111111111111111111111111111111111111\"\n");
+    defer no_key.deinit(alloc);
+    try std.testing.expectError(error.InvalidConfig, validate(&no_key));
+
+    var no_address = try loadTemplateFixture(alloc, "", "abi_path = \"\"\n");
+    defer no_address.deinit(alloc);
+    alloc.free(no_address.global.etherscan_api_key);
+    no_address.global.etherscan_api_key = try alloc.dupe(u8, "test-key");
+    try std.testing.expectError(error.InvalidConfig, validate(&no_address));
+
+    var automatic = try loadTemplateFixture(alloc, "", "abi_path = \"\"\nabi_address = \"0x1111111111111111111111111111111111111111\"\n");
+    defer automatic.deinit(alloc);
+    alloc.free(automatic.global.etherscan_api_key);
+    automatic.global.etherscan_api_key = try alloc.dupe(u8, "test-key");
+    try validate(&automatic);
 }
 
 test "config templates 解析 max_addresses_per_request（缺省 null，运行期落默认值）" {
