@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1] - 2026-11-06
+
+### Added
+- **`[[templates]]` 支持 `filters`**（与 `[[contracts]]` 同语法），作用于该模板地址集合
+  里的全部事件；不能按单个 clone 分别过滤。
+- **模板 ABI 可经 Etherscan 自动获取**：可选 `abi_address` + `global.etherscan_api_key`，
+  在 `abi_path` 为空时拉取该"代表地址"的 ABI 并缓存（EIP-1167 代理若只返回空 ABI，
+  请改填实现地址）。
+- **Ponder 兼容别名**：`event.transaction.hash`、`event.log.logIndex`，与扁平的
+  `transactionHash` / `logIndex` 并存，从 Ponder 迁移的 handler 可直接使用。
+- **SSE 载荷新增 `block_timestamp`**；`/health` 增加 `ready` 与每个索引器的 `lag_blocks`；
+  `/metrics` 增加 `zponder_indexer_running` 与 `zponder_dead_letters`。
+- `zponder check` 对 `[[queries]]` 的 SQL 做 prepare-only 干跑（不取数），列名写错、
+  参数个数与占位符不符、别名误用提前到校验期暴露。
+- npm `postinstall` 安装后实跑 `zponder version`，装到坏包直接失败并给出提示。
+- CI：`test.yml` 增加 macOS job 与 ReleaseFast 构建（push/PR 触发；ReleaseFast 构建能
+  抓住测试构建不分析 `main()` 而漏掉的类型错误）。
+- 新增端到端 `examples/local-demo/reorg-wss-demo`（真实分叉回滚 + WSS 断线重连），
+  launchpad demo 断言扩到 A13（SSE 字段、health、metrics）。
+
+### Fixed
+- **链尖块漏扫**：主循环把 `current >= latest_block` 当追平，而 `current_block` 是
+  "下一个待同步块"，导致 tip 块在链静止时永远不被索引（e2e 实测 4 个事件只落 3 个），
+  切 WSS 也提前一块。现与 `bridgeToTip` 共用 `cursor <= latest` 判定。
+- 启动 RPC 不可达从「warn 后继续」改为「4 次退避重试后中止」（此前会 running 但零索引）。
+- 启动失败回卷时也会停止工厂子索引器（此前只在优雅退出分支停止）。
+- `add-script` 生成的模板删掉并不存在的 `context.webhook` / `context.sse` 示例
+  （handler 只接收 `event` 一个参数），改为真实 `ponder.db` 示例。
+
 ## [0.9.0] - 2026-10-21
 
 ### Added
