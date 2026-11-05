@@ -43,3 +43,33 @@ jobs:
             sleep 10
           done
           echo "::error::连续 3 次测试失败"; exit 1
+
+      # 顺手验证发布形态的二进制能编出来（不发布、不建 Release）。
+      - name: Build release
+        run: zig build -Doptimize=ReleaseFast -Drocksdb=false -Dpostgres=false
+
+  # 与 Linux 互补：macOS 上也跑一遍，避免"只在 Linux 绿"的情况。
+  test-macos:
+    name: test macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        run: |
+          TRIPLET="zig-aarch64-macos"
+          URL="https://ziglang.org/download/${ZIG_VERSION}/${TRIPLET}-${ZIG_VERSION}.tar.xz"
+          curl -fsSL "$URL" -o zig.tar.xz
+          tar -xJf zig.tar.xz
+          ZIG_DIR="$GITHUB_WORKSPACE/${TRIPLET}-${ZIG_VERSION}"
+          echo "$ZIG_DIR" >> "$GITHUB_PATH"
+          "$ZIG_DIR/zig" version
+
+      - name: Install deps
+        run: brew install sqlite3
+
+      - name: Test
+        run: zig build test -Drocksdb=false -Dpostgres=false
+
+      - name: Build release
+        run: zig build -Doptimize=ReleaseFast -Drocksdb=false -Dpostgres=false

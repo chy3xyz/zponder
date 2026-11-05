@@ -17,7 +17,7 @@
 | `build.zig` + `build.zig.zon` | Complete (embeds QuickJS-ng v0.17.0 + zgraphql v0.8.0, vendored) |
 | `src/` source files     | 22+ Zig files |
 | `config.toml`           | Complete (`ws_url` / `ws_urls` optional) |
-| Unit tests              | 288 passing |
+| Unit tests              | 300+ passing |
 | QuickJS Script Engine   | Production (Ponder-style `ponder.on` JS API) |
 | 业务投影 (ponder.db)     | Production (`exec`/`query` 参数化写库 + `proj_` 表重组级联回滚) |
 | Async Webhook Queue     | Production   |
@@ -74,10 +74,11 @@
   `child_address_field`. `validate()` enforces the pairing: a factory's
   `template_name` must point back at the template whose `factory_name` names it,
   and duplicate factory addresses are rejected.
-- Discovery sources: a `[[factories]]` entry takes **either** `address` (a concrete
-  contract: the factory contract whose events announce children) **or**
-  `from_template = "<name>"` (a template's address set — for addresses only the
-  discovered contract knows, e.g. a clone emitting `Migrated(pair)`). The two are
+- Discovery sources: template events can themselves feed downstream discovery. A
+  `[[factories]]` entry takes **either** `address` (a concrete contract: the factory
+  contract whose events announce children) **or** `from_template = "<name>"`
+  (a template's address set — for addresses only the discovered contract knows,
+  e.g. a clone emitting `Migrated(pair)`). The two are
   mutually exclusive; `from_template` requires `template_name`, forbids
   `child_abi_path` and cannot point at its own target. One source may carry
   several rules (`Indexer.factory_idxs` is a list); the source indexer must have

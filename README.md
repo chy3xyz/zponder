@@ -76,6 +76,39 @@ ponder.on("ERC20:Transfer", (event) => {
 });
 ```
 
+## Template-to-template discovery
+
+A `[[factories]]` entry chooses exactly one discovery source:
+
+- `address` listens to a concrete factory contract.
+- `from_template` listens to events emitted by the clones of an existing template. This source can only feed another template through `template_name`; it cannot use `child_abi_path` or point at itself.
+- One source can carry multiple `[[factories]]` rules. The source template must include each rule's `creation_event` in its `events` list so the event can be decoded.
+
+For example, when a curve clone emits `LiquidityMigrated(pair)`, feed the pair address into a downstream pair template:
+
+```toml
+[[templates]]
+name = "curve"
+abi_path = "./abis/Curve.abi"
+events = ["Buy", "LiquidityMigrated"]
+factory_name = "launchpad_factory"
+from_block = 0
+
+[[factories]]
+name = "pair_discovery"
+from_template = "curve"
+creation_event = "LiquidityMigrated"
+child_address_field = "pair"
+template_name = "pair"
+
+[[templates]]
+name = "pair"
+abi_path = "./abis/Pair.abi"
+events = ["Swap"]
+factory_name = "pair_discovery"
+from_block = 0
+```
+
 ## Documentation
 
 Published site: [https://chy3xyz.github.io/zponder/](https://chy3xyz.github.io/zponder/)

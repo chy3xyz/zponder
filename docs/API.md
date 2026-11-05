@@ -50,7 +50,7 @@ event: connected
 data: {"status":"connected","service":"zponder SSE real-time stream"}
 
 event: log
-data: {"contract":"PancakePair","contract_address":"0xabc...","block_number":20123456,"tx_hash":"0xdef...","log_index":12,"fields":{"amount0In":"0x0","amount1Out":"0x1f4"}}
+data: {"contract":"PancakePair","contract_address":"0xabc...","block_number":20123456,"block_timestamp":1719244800,"tx_hash":"0xdef...","log_index":12,"fields":{"amount0In":"0x0","amount1Out":"0x1f4"}}
 ```
 
 ### `GET /version`

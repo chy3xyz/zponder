@@ -18,6 +18,8 @@ ponder.on("ContractName:EventName", (event) => {
 });
 ```
 
+- Each handler receives exactly one argument, `event`; no `context` object is passed. Use `ponder.db` and `ponder.http` directly.
+- The QuickJS runtime does not provide host APIs such as `setTimeout`, `fetch`, or a JavaScript `webhook` function. Use the declarative `.json` rules below for outbound webhooks.
 - `uint` and `int` values in `event.args` are `0x`-prefixed hex strings; parse them with `BigInt(...)`.
 - `address` is a `"0x..."` hex string; `bool` is `"true"` or `"false"`.
 - Fixed arrays, dynamic arrays, and Solidity `tuple` structs are JSON array strings (`["0x...","0x..."]`).
