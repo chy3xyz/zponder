@@ -1,0 +1,1 @@
+[{"anonymous":false,"inputs":[{"indexed":false,"internalType":"uint256","name":"n","type":"uint256"}],"name":"Ping","type":"event"},{"inputs":[{"internalType":"uint256","name":"n","type":"uint256"}],"name":"ping","outputs":[],"stateMutability":"nonpayable","type":"function"}]
