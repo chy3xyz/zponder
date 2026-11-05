@@ -761,7 +761,11 @@ pub const Indexer = struct {
                     log.info("合约 {s} 重放窗口完成", .{self.contract.name});
                 }
             }
-            if (current >= latest_block) {
+            // 游标是「下一个待同步块」（cursorAfterBlock = done+1），所以等于 tip 的
+            // 那一块**还没扫过**——只有 current > latest 才算真追平。
+            // 与 bridgeToTip 共用 bridgeNeedsScan（cursor <= latest 就要扫），
+            // 避免主循环与 WSS 桥接各写一套判定、在链尖漏掉一个块。
+            if (!bridgeNeedsScan(current, latest_block)) {
                 if (self.state.load(.monotonic) == .replaying) {
                     self.replay_limit = 0;
                     self.state.store(.running, .monotonic);
@@ -3059,6 +3063,91 @@ test "template 模板模式 API 接线（真实调用，杜绝惰性分析漏编
     idx.setTemplateMode(true);
     try std.testing.expectEqual(@as(u64, 123), idx.getCurrentBlock());
     try std.testing.expectEqual(@as(u64, 123), idx.last_tip.load(.monotonic));
+}
+
+test "template 模式 filters 拦截不匹配事件并放行匹配事件" {
+    const alloc = std.testing.allocator;
+    const db_cfg = db.DatabaseConfig{ .db_type = "sqlite", .db_name = ":memory:", .wal_mode = true, .busy_timeout_ms = 5000, .max_connections = 10 };
+    var database = try db.Client.init(alloc, &db_cfg);
+    defer database.deinit();
+    try database.migrate();
+
+    var rpc_cfg = config.RpcConfig{ .url = "", .retry_count = 0, .retry_delay_ms = 0, .request_timeout_ms = 0, .max_concurrent = 0 };
+    var rpc = eth_rpc.Client.init(alloc, undefined, &rpc_cfg);
+    defer rpc.deinit();
+
+    const filters = [_]config.EventFilter{.{
+        .event = "CurveCreated",
+        .field = "curve",
+        .op = "gt",
+        .value = "500",
+    }};
+    const contract = config.ContractConfig{
+        .name = "curve",
+        .address = "",
+        .abi_path = "",
+        .from_block = 0,
+        .events = &.{"CurveCreated"},
+        .start_block = null,
+        .block_batch_size = null,
+        .poll_interval_ms = null,
+        .max_reorg_depth = null,
+        .filters = &filters,
+    };
+    const inputs = try alloc.alloc(abi.AbiEventInput, 1);
+    inputs[0] = .{ .name = try alloc.dupe(u8, "curve"), .type = try alloc.dupe(u8, "uint256"), .indexed = false };
+    const events = try alloc.alloc(abi.AbiEvent, 1);
+    events[0] = .{ .name = try alloc.dupe(u8, "CurveCreated"), .inputs = inputs, .signature = std.mem.zeroes([32]u8) };
+    var ac = abi.AbiContract{ .events = events, .functions = try alloc.alloc(abi.AbiFunction, 0) };
+    try database.autoMigrateContract("curve", &ac, &.{"CurveCreated"}, "");
+
+    var idx = testIndexerWithDb(alloc, &database, &rpc, &contract);
+    defer idx.deinit();
+    idx.setTemplateMode(true);
+    idx.abi_contract = ac;
+
+    var topic0_buf: [66]u8 = undefined;
+    @memset(&topic0_buf, '0');
+    topic0_buf[0] = '0';
+    topic0_buf[1] = 'x';
+    var topics = [_][]const u8{&topic0_buf};
+    var skip_data: [66]u8 = @splat('0');
+    skip_data[0] = '0';
+    skip_data[1] = 'x';
+    skip_data[64] = '6';
+    skip_data[65] = '4';
+    var pass_data: [66]u8 = @splat('0');
+    pass_data[0] = '0';
+    pass_data[1] = 'x';
+    pass_data[63] = '3';
+    pass_data[64] = 'e';
+    pass_data[65] = '8';
+
+    const skipped: eth_rpc.Log = .{
+        .address = "0xabcdef0123456789abcdef0123456789abcdef01",
+        .topics = &topics,
+        .data = &skip_data,
+        .block_number = 7,
+        .transaction_hash = "0xskip",
+        .log_index = 0,
+    };
+    try idx.processLog(skipped);
+    const skipped_rows = try database.ponderQuery("SELECT COUNT(*) AS n FROM event_curve_CurveCreated;", &.{});
+    defer database.freeQueryRows(skipped_rows);
+    try std.testing.expectEqual(@as(i64, 0), skipped_rows[0].values[0].integer);
+
+    const passed: eth_rpc.Log = .{
+        .address = "0xabcdef0123456789abcdef0123456789abcdef01",
+        .topics = &topics,
+        .data = &pass_data,
+        .block_number = 8,
+        .transaction_hash = "0xpass",
+        .log_index = 1,
+    };
+    try idx.processLog(passed);
+    const passed_rows = try database.ponderQuery("SELECT COUNT(*) AS n FROM event_curve_CurveCreated;", &.{});
+    defer database.freeQueryRows(passed_rows);
+    try std.testing.expectEqual(@as(i64, 1), passed_rows[0].values[0].integer);
 }
 
 // 事件回调必须携带"日志来源地址"（Task 10 的第一跳）：真实走 processLog 的解码→落库→回调，
