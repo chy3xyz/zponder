@@ -576,6 +576,16 @@ pub const JsEngine = struct {
         _ = c.JS_SetPropertyStr(ctx, event_obj, "transactionHash", th);
         const li = c.JS_NewInt64(ctx, @intCast(log_index));
         _ = c.JS_SetPropertyStr(ctx, event_obj, "logIndex", li);
+        // 这是 Ponder 兼容别名，便于从 Ponder 迁移的 handler 直接用
+        // event.transaction.hash / event.log.logIndex。
+        const transaction_obj = c.JS_NewObject(ctx);
+        const transaction_hash = c.JS_NewStringLen(ctx, tx_hash.ptr, tx_hash.len);
+        _ = c.JS_SetPropertyStr(ctx, transaction_obj, "hash", transaction_hash);
+        _ = c.JS_SetPropertyStr(ctx, event_obj, "transaction", transaction_obj);
+        const log_obj = c.JS_NewObject(ctx);
+        const nested_log_index = c.JS_NewInt64(ctx, @intCast(log_index));
+        _ = c.JS_SetPropertyStr(ctx, log_obj, "logIndex", nested_log_index);
+        _ = c.JS_SetPropertyStr(ctx, event_obj, "log", log_obj);
         const block_obj = c.JS_NewObject(ctx);
         const bn = c.JS_NewInt64(ctx, @intCast(block_number));
         _ = c.JS_SetPropertyStr(ctx, block_obj, "number", bn);
@@ -1102,5 +1112,32 @@ test "js engine event.transactionHash / logIndex 注入" {
     try engine.evalScript(
         \\if (th !== "0xabc0000000000000000000000000000000000000000000000000000000000001") throw new Error('th=' + th);
         \\if (li !== 7) throw new Error('li=' + li);
+    , "check.js");
+}
+
+test "js engine event.transaction.hash / log.logIndex Ponder 嵌套别名" {
+    const alloc = std.testing.allocator;
+    var engine = try JsEngine.init(alloc, undefined);
+    defer engine.deinit();
+
+    try engine.evalScript(
+        \\var nested_th = null, nested_li = null, flat_th = null, flat_li = null;
+        \\ponder.on("Transfer", function(event) {
+        \\  nested_th = event.transaction.hash;
+        \\  nested_li = event.log.logIndex;
+        \\  flat_th = event.transactionHash;
+        \\  flat_li = event.logIndex;
+        \\});
+    , "test.js");
+
+    const fields = [_]db.DecodedField{.{ .name = "value", .value = "1" }};
+    const tx = "0xabc0000000000000000000000000000000000000000000000000000000000001";
+    _ = engine.handleEvent("curve", "Transfer", &fields, 5, 1700000123, "0xCLONE", tx, 7);
+
+    try engine.evalScript(
+        \\if (nested_th !== "0xabc0000000000000000000000000000000000000000000000000000000000001") throw new Error('nested_th=' + nested_th);
+        \\if (nested_li !== 7) throw new Error('nested_li=' + nested_li);
+        \\if (flat_th !== nested_th) throw new Error('flat_th=' + flat_th);
+        \\if (flat_li !== nested_li) throw new Error('flat_li=' + flat_li);
     , "check.js");
 }
